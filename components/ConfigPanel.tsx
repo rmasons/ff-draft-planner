@@ -3,6 +3,7 @@
 import type { RosterConfig, ScoringConfig } from "@/lib/types";
 import { ROSTER_PRESETS, SCORING_PRESETS } from "@/lib/presets";
 import { BASELINE_LABELS, type BaselineMethod } from "@/lib/vbd";
+import LeagueImport from "./LeagueImport";
 
 interface Props {
   scoring: ScoringConfig;
@@ -11,6 +12,7 @@ interface Props {
   setScoring: (s: ScoringConfig) => void;
   setRoster: (r: RosterConfig) => void;
   setMethod: (m: BaselineMethod) => void;
+  onKeepersMerge: (ids: string[]) => void;
 }
 
 const METHOD_HELP: Record<BaselineMethod, string> = {
@@ -50,12 +52,21 @@ export default function ConfigPanel({
   setScoring,
   setRoster,
   setMethod,
+  onKeepersMerge,
 }: Props) {
   const s = (patch: Partial<ScoringConfig>) => setScoring({ ...scoring, ...patch });
   const r = (patch: Partial<RosterConfig>) => setRoster({ ...roster, ...patch });
 
   return (
     <aside className="flex w-full flex-col gap-6 lg:w-72 lg:shrink-0">
+      {/* League import from Sleeper */}
+      <LeagueImport
+        currentScoring={scoring}
+        setScoring={setScoring}
+        setRoster={setRoster}
+        onKeepersMerge={onKeepersMerge}
+      />
+
       {/* VOR baseline method */}
       <section className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-300">

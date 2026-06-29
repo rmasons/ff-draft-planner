@@ -111,6 +111,9 @@ export default function DraftBoard() {
         setScoring={setScoring}
         setRoster={setRoster}
         setMethod={setMethod}
+        onKeepersMerge={(ids) =>
+          setDrafted((prev) => [...new Set([...prev, ...ids])])
+        }
       />
 
       <main className="min-w-0 flex-1">
