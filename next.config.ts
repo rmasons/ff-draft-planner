@@ -5,6 +5,8 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: __dirname,
   },
+  // Allow LAN access so browser automation testing works (dev only).
+  allowedDevOrigins: ["192.168.1.215"],
 };
 
 export default nextConfig;

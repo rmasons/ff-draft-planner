@@ -1,15 +1,16 @@
 import type {
   Player,
   Position,
+  SkillPosition,
   RankedPlayer,
   RosterConfig,
   ScoringConfig,
 } from "./types";
-import { POSITIONS } from "./types";
+import { POSITIONS, ALL_POSITIONS } from "./types";
 import { fantasyPoints } from "./scoring";
 
-const FLEX_POS: Position[] = ["RB", "WR", "TE"];
-const ALL_POS: Position[] = ["QB", "RB", "WR", "TE"];
+const FLEX_POS: SkillPosition[] = ["RB", "WR", "TE"];
+const SKILL_POS_ALL: SkillPosition[] = ["QB", "RB", "WR", "TE"];
 
 /** Where VOR sets the "replacement" baseline.
  *  - VOLS: Value Over Last Starter — baseline = first player past all starters.
@@ -36,7 +37,7 @@ export interface RankingResult {
 }
 
 /**
- * Replacement level per position via greedy slot assignment.
+ * Replacement level per skill position via greedy slot assignment.
  *
  * Starters first: dedicated slots, then FLEX (RB/WR/TE), then SUPERFLEX
  * (QB/RB/WR/TE), each handed to the best remaining player by projected points.
@@ -47,25 +48,25 @@ export interface RankingResult {
  * value-over-last-starter (not raw points) so we don't over-draft high-scoring
  * QBs to the bench in 1-QB leagues.
  */
-function computeBaselines(
-  pointsByPos: Record<Position, number[]>, // each sorted desc
+function computeSkillBaselines(
+  pointsByPos: Record<SkillPosition, number[]>, // each sorted desc
   roster: RosterConfig,
   method: BaselineMethod
-): Baselines {
+): Record<SkillPosition, Baseline> {
   const t = roster.teams;
-  const started: Record<Position, number> = {
+  const started: Record<SkillPosition, number> = {
     QB: roster.qb * t,
     RB: roster.rb * t,
     WR: roster.wr * t,
     TE: roster.te * t,
   };
 
-  const ptsAt = (pos: Position, i: number) =>
+  const ptsAt = (pos: SkillPosition, i: number) =>
     i < pointsByPos[pos].length ? pointsByPos[pos][i] : -Infinity;
 
-  const fill = (slots: number, pool: Position[], value: (pos: Position) => number) => {
+  const fill = (slots: number, pool: SkillPosition[], value: (pos: SkillPosition) => number) => {
     for (let i = 0; i < slots; i++) {
-      let best: Position | null = null;
+      let best: SkillPosition | null = null;
       let bestV = -Infinity;
       for (const pos of pool) {
         const v = value(pos);
@@ -81,11 +82,11 @@ function computeBaselines(
 
   // Starters: flex then superflex, by raw projected points of the next player.
   fill(roster.flex * t, FLEX_POS, (pos) => ptsAt(pos, started[pos]));
-  fill(roster.superflex * t, ALL_POS, (pos) => ptsAt(pos, started[pos]));
+  fill(roster.superflex * t, SKILL_POS_ALL, (pos) => ptsAt(pos, started[pos]));
 
   if (method === "VORP") {
     // Value-over-last-starter of each position's next available player.
-    const volsBase: Record<Position, number> = {
+    const volsBase: Record<SkillPosition, number> = {
       QB: ptsAt("QB", started.QB),
       RB: ptsAt("RB", started.RB),
       WR: ptsAt("WR", started.WR),
@@ -94,12 +95,12 @@ function computeBaselines(
     // Bench picks prioritized by VOR, not raw points.
     fill(
       roster.bench * t,
-      ALL_POS,
+      SKILL_POS_ALL,
       (pos) => ptsAt(pos, started[pos]) - volsBase[pos]
     );
   }
 
-  const baselines = {} as Baselines;
+  const baselines = {} as Record<SkillPosition, Baseline>;
   for (const pos of POSITIONS) {
     const arr = pointsByPos[pos];
     const idx = started[pos];
@@ -142,6 +143,10 @@ function assignTiers(sortedPoints: number[]): number[] {
 /**
  * Rank all players: projected points, VOR, positional tiers, overall rank, and
  * the replacement baselines used. Pure function — safe to recompute on change.
+ *
+ * Overall rank order: skill positions (by VBD descending), then K, then DEF.
+ * K/DEF are appended at the bottom regardless of VBD so draft advice stays
+ * conventional — take skill positions before kickers and defenses.
  */
 export function rankPlayers(
   players: Player[],
@@ -155,24 +160,38 @@ export function rankPlayers(
   }));
 
   const byPos: Record<Position, { player: Player; points: number }[]> = {
-    QB: [],
-    RB: [],
-    WR: [],
-    TE: [],
+    QB: [], RB: [], WR: [], TE: [], K: [], DEF: [],
   };
   for (const wp of withPoints) byPos[wp.player.position].push(wp);
-  for (const pos of POSITIONS) byPos[pos].sort((a, b) => b.points - a.points);
+  for (const pos of ALL_POSITIONS) byPos[pos].sort((a, b) => b.points - a.points);
 
-  const pointsByPos: Record<Position, number[]> = {
+  const pointsByPos: Record<SkillPosition, number[]> = {
     QB: byPos.QB.map((x) => x.points),
     RB: byPos.RB.map((x) => x.points),
     WR: byPos.WR.map((x) => x.points),
     TE: byPos.TE.map((x) => x.points),
   };
 
-  const baselines = computeBaselines(pointsByPos, roster, method);
+  const skillBaselines = computeSkillBaselines(pointsByPos, roster, method);
+
+  // K/DEF baseline: 1 starter per team (simple, no greedy flex assignment).
+  const kPoints = byPos.K.map((x) => x.points);
+  const defPoints = byPos.DEF.map((x) => x.points);
+  const baselines: Baselines = {
+    ...skillBaselines,
+    K: {
+      rank: Math.min(roster.teams, kPoints.length),
+      points: kPoints[roster.teams - 1] ?? kPoints[kPoints.length - 1] ?? 0,
+    },
+    DEF: {
+      rank: Math.min(roster.teams, defPoints.length),
+      points: defPoints[roster.teams - 1] ?? defPoints[defPoints.length - 1] ?? 0,
+    },
+  };
 
   const ranked: RankedPlayer[] = [];
+
+  // Skill positions first, sorted by VBD later.
   for (const pos of POSITIONS) {
     const tiers = assignTiers(pointsByPos[pos]);
     byPos[pos].forEach((x, i) => {
@@ -187,8 +206,27 @@ export function rankPlayers(
     });
   }
 
+  // Sort skill players by VBD descending and assign overall rank.
   ranked.sort((a, b) => b.vbd - a.vbd);
-  ranked.forEach((p, i) => (p.overallRank = i + 1));
+  let rank = 1;
+  for (const p of ranked) p.overallRank = rank++;
+
+  // K and DEF appended after all skill positions (already sorted by points desc).
+  for (const pos of ["K", "DEF"] as const) {
+    const pts = byPos[pos].map((x) => x.points);
+    const tiers = assignTiers(pts);
+    byPos[pos].forEach((x, i) => {
+      const rp: RankedPlayer = {
+        ...x.player,
+        points: x.points,
+        vbd: Math.round((x.points - baselines[pos].points) * 10) / 10,
+        tier: tiers[i] ?? 1,
+        posRank: i + 1,
+        overallRank: rank++,
+      };
+      ranked.push(rp);
+    });
+  }
 
   return { players: ranked, baselines, method };
 }

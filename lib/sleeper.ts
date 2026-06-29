@@ -1,5 +1,5 @@
 import type { Player, Position, RawStats } from "./types";
-import { POSITIONS } from "./types";
+import { ALL_POSITIONS } from "./types";
 import { byeFor } from "./byes";
 
 export const SEASON = "2026";
@@ -7,7 +7,7 @@ export const SEASON = "2026";
 const SLEEPER_URL =
   `https://api.sleeper.com/projections/nfl/${SEASON}` +
   `?season_type=regular&order_by=pts_ppr` +
-  POSITIONS.map((p) => `&position[]=${p}`).join("");
+  ALL_POSITIONS.map((p) => `&position[]=${p}`).join("");
 
 // Shape of a single Sleeper projection record (only fields we use).
 interface SleeperRecord {
@@ -28,7 +28,7 @@ interface SleeperRecord {
 function pickPosition(rec: SleeperRecord): Position | null {
   const cand = [rec.player.position, ...(rec.player.fantasy_positions ?? [])];
   for (const c of cand) {
-    if (c && (POSITIONS as string[]).includes(c)) return c as Position;
+    if (c && (ALL_POSITIONS as string[]).includes(c)) return c as Position;
   }
   return null;
 }
@@ -47,6 +47,7 @@ const STAT_KEYS: (keyof RawStats)[] = [
   "rec_2pt",
   "fum_lost",
   "gp",
+  "pts_std", // K/DEF: precomputed season total
 ];
 
 function normalize(rec: SleeperRecord): Player | null {
@@ -55,9 +56,10 @@ function normalize(rec: SleeperRecord): Player | null {
 
   const s = rec.stats ?? {};
   const ptsPpr = s.pts_ppr ?? 0;
+  const ptsStd = s.pts_std ?? 0;
   const adpPpr = s.adp_ppr ?? 999;
-  // Draftable universe only: must have projected points or a real ADP.
-  if (ptsPpr <= 0 && adpPpr >= 999) return null;
+  // DEF has pts_std > 0 but pts_ppr ≈ 0; include if any scoring projection exists.
+  if (ptsPpr <= 0 && ptsStd <= 0 && adpPpr >= 999) return null;
 
   const stats: RawStats = {};
   for (const k of STAT_KEYS) {
@@ -84,6 +86,7 @@ function normalize(rec: SleeperRecord): Player | null {
       half: s.adp_half_ppr ?? 999,
       std: s.adp_std ?? 999,
       superflex: s.adp_2qb ?? 999,
+      espn: 999, // filled in server-side by /api/players after ESPN fetch
     },
   };
 }

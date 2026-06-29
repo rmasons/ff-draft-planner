@@ -3,6 +3,11 @@ import type { Player, ScoringConfig } from "./types";
 /** Projected fantasy points for a player under a given scoring config.
  * Computed from raw stat projections so any scoring system works. */
 export function fantasyPoints(p: Player, s: ScoringConfig): number {
+  // K and DEF don't have per-stat breakdowns — Sleeper precomputes pts_std.
+  if (p.position === "K" || p.position === "DEF") {
+    return Math.round((p.stats.pts_std ?? 0) * 10) / 10;
+  }
+
   const st = p.stats;
   let pts = 0;
 

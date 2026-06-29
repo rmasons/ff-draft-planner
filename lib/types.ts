@@ -1,7 +1,10 @@
 // Core domain types for the draft planner.
 
-export type Position = "QB" | "RB" | "WR" | "TE";
-export const POSITIONS: Position[] = ["QB", "RB", "WR", "TE"];
+export type SkillPosition = "QB" | "RB" | "WR" | "TE";
+export const POSITIONS: SkillPosition[] = ["QB", "RB", "WR", "TE"];
+
+export type Position = SkillPosition | "K" | "DEF";
+export const ALL_POSITIONS: Position[] = ["QB", "RB", "WR", "TE", "K", "DEF"];
 
 /** Raw projected season stat totals from Sleeper. All optional. */
 export interface RawStats {
@@ -18,6 +21,7 @@ export interface RawStats {
   rec_2pt?: number;
   fum_lost?: number;
   gp?: number;
+  pts_std?: number; // K/DEF: precomputed season total (no per-stat breakdown)
 }
 
 /** ADP across the formats Sleeper exposes (lower = drafted earlier). */
@@ -26,6 +30,7 @@ export interface Adp {
   half: number;
   std: number;
   superflex: number; // Sleeper's adp_2qb
+  espn: number;     // ESPN PPR ADP (999 = not available)
 }
 
 /** A normalized, draftable player. Derived values (points/VBD/tier) are
