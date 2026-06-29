@@ -8,6 +8,18 @@ type Mode = "cheat-sheet" | "mock-draft";
 
 export default function AppShell() {
   const [mode, setMode] = useState<Mode>("cheat-sheet");
+  const [draftActive, setDraftActive] = useState(false);
+
+  function handleModeChange(next: Mode) {
+    if (next === mode) return;
+    if (
+      draftActive &&
+      !window.confirm("Leave the mock draft? Your current progress will be lost.")
+    ) {
+      return;
+    }
+    setMode(next);
+  }
 
   return (
     <>
@@ -25,7 +37,7 @@ export default function AppShell() {
           {(["cheat-sheet", "mock-draft"] as Mode[]).map((m) => (
             <button
               key={m}
-              onClick={() => setMode(m)}
+              onClick={() => handleModeChange(m)}
               className={`rounded-md px-4 py-2 text-sm font-medium transition ${
                 mode === m
                   ? "bg-emerald-500 text-zinc-950"
@@ -37,7 +49,11 @@ export default function AppShell() {
           ))}
         </div>
       </header>
-      {mode === "cheat-sheet" ? <DraftBoard /> : <MockDraft />}
+      {mode === "cheat-sheet" ? (
+        <DraftBoard />
+      ) : (
+        <MockDraft onActiveChange={setDraftActive} />
+      )}
     </>
   );
 }

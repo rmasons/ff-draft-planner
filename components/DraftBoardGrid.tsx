@@ -1,5 +1,6 @@
 "use client";
 
+import { memo, useMemo } from "react";
 import type { Position, RankedPlayer } from "@/lib/types";
 
 export interface BoardPick {
@@ -47,7 +48,7 @@ function lastNameOf(name: string): string {
   return parts.length > 1 ? parts.slice(1).join(" ") : name;
 }
 
-export default function DraftBoardGrid({
+function DraftBoardGrid({
   picks,
   tradedPicks,
   numTeams,
@@ -57,18 +58,20 @@ export default function DraftBoardGrid({
   playerById,
   draftMode,
 }: Props) {
-  // Build lookup: pickNumber → pick
-  const pickByNum = new Map<number, BoardPick>();
-  for (const p of picks) pickByNum.set(p.pickNumber, p);
+  const pickByNum = useMemo(() => {
+    const m = new Map<number, BoardPick>();
+    for (const p of picks) m.set(p.pickNumber, p);
+    return m;
+  }, [picks]);
 
-  // Build traded pick lookup: "round-originalSlot" → currentSlot
-  const tradedByCell = new Map<string, number>();
-  for (const tp of tradedPicks) {
-    tradedByCell.set(`${tp.round}-${tp.originalSlot}`, tp.currentSlot);
-  }
+  const tradedByCell = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const tp of tradedPicks) m.set(`${tp.round}-${tp.originalSlot}`, tp.currentSlot);
+    return m;
+  }, [tradedPicks]);
 
-  const slots = Array.from({ length: numTeams }, (_, i) => i + 1);
-  const rounds = Array.from({ length: numRounds }, (_, i) => i + 1);
+  const slots = useMemo(() => Array.from({ length: numTeams }, (_, i) => i + 1), [numTeams]);
+  const rounds = useMemo(() => Array.from({ length: numRounds }, (_, i) => i + 1), [numRounds]);
 
   return (
     <div className="overflow-x-auto rounded-xl border border-zinc-800">
@@ -199,3 +202,5 @@ export default function DraftBoardGrid({
     </div>
   );
 }
+
+export default memo(DraftBoardGrid);

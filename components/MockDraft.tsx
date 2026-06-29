@@ -97,7 +97,7 @@ function SortTh({
   );
 }
 
-export default function MockDraft() {
+export default function MockDraft({ onActiveChange }: { onActiveChange?: (active: boolean) => void }) {
   const [players, setPlayers] = useState<Player[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -135,6 +135,11 @@ export default function MockDraft() {
   const [sortDir, setSortDir] = useState<1 | -1>(1);
 
   const logRef = useRef<HTMLDivElement>(null);
+  const pickingRef = useRef(false);
+
+  useEffect(() => {
+    onActiveChange?.(started || picks.length > 0);
+  }, [started, picks.length, onActiveChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -291,11 +296,14 @@ export default function MockDraft() {
 
   function pickPlayer(playerId: string) {
     if (!started || !isUserTurn || isDone || currentTeamSlot === null) return;
+    if (pickingRef.current) return;
+    pickingRef.current = true;
     const teamSlot = draftMode === "manual" ? currentTeamSlot : userSlot;
     setPicks((prev) => [
       ...prev,
       { pickNumber: prev.length + 1, teamSlot, playerId },
     ]);
+    requestAnimationFrame(() => { pickingRef.current = false; });
   }
 
   function resetDraft() {
@@ -312,6 +320,9 @@ export default function MockDraft() {
     setDraftId("");
     setTradedPicks([]);
     setViewMode("players");
+    setSleeperUserId(null);
+    setUserDrafts([]);
+    setUserLookupError(null);
   }
 
   async function handleLookupUser() {
@@ -329,7 +340,6 @@ export default function MockDraft() {
       const user = await userRes.json();
       if (!user?.user_id) throw new Error(`User "${uname}" not found on Sleeper`);
       const userId: string = user.user_id;
-      setSleeperUserId(userId);
 
       // Try current season, fall back to prior
       let draftsData: SleeperDraft[] | null = null;
@@ -365,6 +375,7 @@ export default function MockDraft() {
         label: `${season} · ${d.settings?.teams ?? "?"}T / ${d.settings?.rounds ?? "?"}R · ${d.status}`,
       }));
 
+      setSleeperUserId(userId);
       setUserDrafts(draftList);
 
       // Auto-fill if only one draft
@@ -430,23 +441,30 @@ export default function MockDraft() {
       }
 
       // Parse traded picks: convert roster_id → draft slot via inverted slot_to_roster_id
+      let tradedPickNote = "";
       if (Array.isArray(rawTradedPicks) && rawTradedPicks.length > 0) {
-        const slotToRoster = draft.slot_to_roster_id ?? {};
-        // Invert: roster_id → slot (number)
-        const rosterToSlot = new Map<number, number>();
-        for (const [slotStr, rosterId] of Object.entries(slotToRoster)) {
-          rosterToSlot.set(rosterId as number, Number(slotStr));
-        }
-
-        const parsed: TradedPick[] = [];
-        for (const tp of rawTradedPicks) {
-          const origSlot = rosterToSlot.get(tp.roster_id);
-          const currSlot = rosterToSlot.get(tp.owner_id);
-          if (origSlot && currSlot && tp.round) {
-            parsed.push({ round: tp.round, originalSlot: origSlot, currentSlot: currSlot });
+        const slotToRoster = draft.slot_to_roster_id;
+        if (!slotToRoster) {
+          // Draft slot assignments not yet set; can't resolve traded picks
+          tradedPickNote = " · traded picks unavailable (draft not fully configured)";
+          setTradedPicks([]);
+        } else {
+          // Invert: roster_id → slot (number)
+          const rosterToSlot = new Map<number, number>();
+          for (const [slotStr, rosterId] of Object.entries(slotToRoster)) {
+            rosterToSlot.set(rosterId as number, Number(slotStr));
           }
+
+          const parsed: TradedPick[] = [];
+          for (const tp of rawTradedPicks) {
+            const origSlot = rosterToSlot.get(tp.roster_id);
+            const currSlot = rosterToSlot.get(tp.owner_id);
+            if (origSlot && currSlot && tp.round) {
+              parsed.push({ round: tp.round, originalSlot: origSlot, currentSlot: currSlot });
+            }
+          }
+          setTradedPicks(parsed);
         }
-        setTradedPicks(parsed);
       } else {
         setTradedPicks([]);
       }
@@ -460,7 +478,7 @@ export default function MockDraft() {
           : "pre-draft";
       const keeperNote = keeperCount > 0 ? ` · ${keeperCount} keepers` : "";
       setImportSummary(
-        `Imported ${imported.length} picks from a ${teams}-team ${rounds}-round draft (${statusLabel}${keeperNote})`
+        `Imported ${imported.length} picks from a ${teams}-team ${rounds}-round draft (${statusLabel}${keeperNote})${tradedPickNote}`
       );
     } catch (e) {
       setImportError(e instanceof Error ? e.message : String(e));
@@ -626,7 +644,7 @@ export default function MockDraft() {
 
           <button
             onClick={() => setStarted(true)}
-            disabled={!players}
+            disabled={!players || players.length === 0}
             className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
           >
             {picks.length > 0
