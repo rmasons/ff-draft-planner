@@ -1,0 +1,125 @@
+import type { Player, Position, RawStats } from "./types";
+import { POSITIONS } from "./types";
+import { byeFor } from "./byes";
+
+export const SEASON = "2026";
+
+const SLEEPER_URL =
+  `https://api.sleeper.com/projections/nfl/${SEASON}` +
+  `?season_type=regular&order_by=pts_ppr` +
+  POSITIONS.map((p) => `&position[]=${p}`).join("");
+
+// Shape of a single Sleeper projection record (only fields we use).
+interface SleeperRecord {
+  player_id: string;
+  stats: Record<string, number | undefined>;
+  player: {
+    first_name?: string;
+    last_name?: string;
+    position?: string;
+    fantasy_positions?: string[];
+    team?: string | null;
+    team_abbr?: string | null;
+    years_exp?: number | null;
+    injury_status?: string | null;
+  };
+}
+
+function pickPosition(rec: SleeperRecord): Position | null {
+  const cand = [rec.player.position, ...(rec.player.fantasy_positions ?? [])];
+  for (const c of cand) {
+    if (c && (POSITIONS as string[]).includes(c)) return c as Position;
+  }
+  return null;
+}
+
+const STAT_KEYS: (keyof RawStats)[] = [
+  "pass_yd",
+  "pass_td",
+  "pass_int",
+  "pass_2pt",
+  "rush_yd",
+  "rush_td",
+  "rush_2pt",
+  "rec",
+  "rec_yd",
+  "rec_td",
+  "rec_2pt",
+  "fum_lost",
+  "gp",
+];
+
+function normalize(rec: SleeperRecord): Player | null {
+  const position = pickPosition(rec);
+  if (!position) return null;
+
+  const s = rec.stats ?? {};
+  const ptsPpr = s.pts_ppr ?? 0;
+  const adpPpr = s.adp_ppr ?? 999;
+  // Draftable universe only: must have projected points or a real ADP.
+  if (ptsPpr <= 0 && adpPpr >= 999) return null;
+
+  const stats: RawStats = {};
+  for (const k of STAT_KEYS) {
+    const v = s[k];
+    if (typeof v === "number") stats[k] = v;
+  }
+
+  const team = rec.player.team_abbr ?? rec.player.team ?? null;
+  const name = `${rec.player.first_name ?? ""} ${
+    rec.player.last_name ?? ""
+  }`.trim();
+
+  return {
+    id: rec.player_id,
+    name: name || "Unknown",
+    position,
+    team,
+    yearsExp: rec.player.years_exp ?? null,
+    injuryStatus: rec.player.injury_status ?? null,
+    bye: byeFor(team),
+    stats,
+    adp: {
+      ppr: s.adp_ppr ?? 999,
+      half: s.adp_half_ppr ?? 999,
+      std: s.adp_std ?? 999,
+      superflex: s.adp_2qb ?? 999,
+    },
+  };
+}
+
+// The raw Sleeper response is ~3.9MB (over Next's 2MB fetch-cache limit), so we
+// fetch uncached and memoize the much smaller normalized result in-module.
+const TTL_MS = 60 * 60 * 12 * 1000; // 12h
+let memo: { at: number; data: Player[] } | null = null;
+
+async function fetchAndNormalize(): Promise<Player[]> {
+  const res = await fetch(SLEEPER_URL, {
+    cache: "no-store",
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw new Error(`Sleeper request failed: ${res.status} ${res.statusText}`);
+  }
+  const data: SleeperRecord[] = await res.json();
+  const players: Player[] = [];
+  const seen = new Set<string>();
+  for (const rec of data) {
+    const p = normalize(rec);
+    // De-dupe by id (the feed occasionally repeats a player across roles).
+    if (p && !seen.has(p.id)) {
+      seen.add(p.id);
+      players.push(p);
+    }
+  }
+  return players;
+}
+
+/** Fetch + normalize the draftable player pool, memoized for 12h. */
+export async function fetchPlayers(): Promise<Player[]> {
+  const now = Date.now();
+  if (memo && now - memo.at < TTL_MS) return memo.data;
+  const data = await fetchAndNormalize();
+  memo = { at: now, data };
+  return data;
+}
