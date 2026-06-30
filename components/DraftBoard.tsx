@@ -12,6 +12,7 @@ import {
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
+import PlayerCompare from "./PlayerCompare";
 
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
@@ -75,6 +76,7 @@ export default function DraftBoard() {
   const [hideDrafted, setHideDrafted] = useState(true);
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
+  const [compareIds, setCompareIds] = useState<string[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -172,6 +174,18 @@ export default function DraftBoard() {
     setDrafted((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
+
+  // Toggle a player in/out of the compare panel (max 3).
+  // When a removal would leave fewer than 2 players, clear the list (closes modal).
+  const toggleCompare = (id: string) =>
+    setCompareIds((prev) => {
+      if (prev.includes(id)) {
+        const next = prev.filter((x) => x !== id);
+        return next.length < 2 ? [] : next;
+      }
+      if (prev.length >= 3) return prev;
+      return [...prev, id];
+    });
 
   // Tier dividers and replacement line only make sense on the default rank sort.
   const isRankSort = sortKey === "rank" && sortDir === 1;
@@ -365,6 +379,8 @@ export default function DraftBoard() {
                       tierBreak={tierBreak}
                       replBreak={replBreak}
                       onToggle={() => toggleDrafted(p.id)}
+                      inCompare={compareIds.includes(p.id)}
+                      onCompare={() => toggleCompare(p.id)}
                     />
                   );
                 })}
@@ -387,6 +403,19 @@ export default function DraftBoard() {
           </p>
         )}
       </main>
+
+      {compareIds.length >= 2 && (
+        <PlayerCompare
+          players={ranked.filter((p) => compareIds.includes(p.id))}
+          onClose={() => setCompareIds([])}
+          onRemove={(id) =>
+            setCompareIds((prev) => {
+              const next = prev.filter((x) => x !== id);
+              return next.length < 2 ? [] : next;
+            })
+          }
+        />
+      )}
     </div>
   );
 }
@@ -402,6 +431,8 @@ function Row({
   tierBreak,
   replBreak,
   onToggle,
+  inCompare,
+  onCompare,
 }: {
   p: RankedPlayer;
   rank: number;
@@ -413,6 +444,8 @@ function Row({
   tierBreak: boolean;
   replBreak: boolean;
   onToggle: () => void;
+  inCompare: boolean;
+  onCompare: () => void;
 }) {
   const riskColor =
     risk >= 7 ? "text-rose-400" : risk >= 4 ? "text-amber-400" : "text-emerald-400";
@@ -531,16 +564,27 @@ function Row({
           {risk}
         </td>
         <td className="px-2 py-2 text-center">
-          <button
-            onClick={onToggle}
-            className={`rounded-md border px-2 py-1 text-xs transition ${
-              isDrafted
-                ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
-                : "border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
-            }`}
-          >
-            {isDrafted ? "Undo" : "Draft"}
-          </button>
+          <div className="flex items-center justify-center gap-1.5">
+            <button
+              onClick={onToggle}
+              className={`rounded-md border px-2 py-1 text-xs transition ${
+                isDrafted
+                  ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
+                  : "border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
+              }`}
+            >
+              {isDrafted ? "Undo" : "Draft"}
+            </button>
+            <button
+              onClick={onCompare}
+              title={inCompare ? "Remove from compare" : "Add to compare"}
+              className={`text-base leading-none transition ${
+                inCompare ? "text-sky-400" : "text-zinc-600 hover:text-sky-400"
+              }`}
+            >
+              ⊕
+            </button>
+          </div>
         </td>
       </tr>
     </>
