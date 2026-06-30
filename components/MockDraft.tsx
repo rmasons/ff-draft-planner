@@ -1081,7 +1081,15 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                           ) : p.yearsExp !== null ? (
                             <span className="text-zinc-600"> · Yr {p.yearsExp + 1}</span>
                           ) : null}
-                          {p.injuryStatus ? <span className="ml-1 text-amber-500">{p.injuryStatus}</span> : null}
+                          {p.injuryStatus ? (
+                            <span className="ml-1 text-amber-500">
+                              {[
+                                p.injuryStatus,
+                                p.injuryBody && p.injuryBody !== "Undisclosed" ? p.injuryBody : null,
+                                p.injuryNotes,
+                              ].filter(Boolean).join(" · ")}
+                            </span>
+                          ) : null}
                         </div>
                       </td>
                       <td className="px-2 py-2 text-center">

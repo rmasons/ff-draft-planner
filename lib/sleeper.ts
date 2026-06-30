@@ -22,6 +22,8 @@ interface SleeperRecord {
     team_abbr?: string | null;
     years_exp?: number | null;
     injury_status?: string | null;
+    injury_body_part?: string | null;
+    injury_notes?: string | null;
   };
 }
 
@@ -79,6 +81,8 @@ function normalize(rec: SleeperRecord): Player | null {
     team,
     yearsExp: rec.player.years_exp ?? null,
     injuryStatus: rec.player.injury_status ?? null,
+    injuryBody: rec.player.injury_body_part ?? null,
+    injuryNotes: rec.player.injury_notes ?? null,
     bye: byeFor(team),
     stats,
     adp: {
