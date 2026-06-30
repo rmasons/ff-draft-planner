@@ -373,6 +373,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [myPicks, playerById]
   );
 
+  // Position availability counts for the draft strip
+  const positionCounts = useMemo(
+    () =>
+      (["QB", "RB", "WR", "TE"] as Position[]).map((pos) => {
+        const total = ranked.filter((p) => p.position === pos).length;
+        const gone = ranked.filter((p) => p.position === pos && draftedIds.has(p.id)).length;
+        return { pos, gone, left: total - gone, pctGone: total > 0 ? gone / total : 0 };
+      }),
+    [ranked, draftedIds]
+  );
+
   // Structured roster view: only in CPU mode when a league was imported
   const myRosterSlots = useMemo((): RosterSlot[] | null => {
     if (!leagueRosterPositions.length || draftMode !== "cpu") return null;
@@ -973,6 +984,27 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             Reset
           </button>
         </div>
+      </div>
+
+      {/* Position availability strip */}
+      <div className="flex items-center gap-4 rounded-lg border border-zinc-800/50 bg-zinc-900/20 px-4 py-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-600">Available</span>
+        <div className="flex items-center gap-4">
+          {positionCounts.map(({ pos, gone, left, pctGone }) => (
+            <div key={pos} className="flex items-center gap-1.5 text-xs">
+              <span className={`rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[pos]}`}>{pos}</span>
+              <span className={`tabular-nums font-medium ${pctGone >= 0.6 ? "text-amber-400" : "text-zinc-300"}`}>
+                {left}
+              </span>
+              <span className="text-zinc-700">/ {gone + left}</span>
+            </div>
+          ))}
+        </div>
+        {!isDone && (
+          <span className="ml-auto text-[10px] text-zinc-700">
+            {picks.length} of {numTeams * numRounds} picks made
+          </span>
+        )}
       </div>
 
       {/* Main layout */}
