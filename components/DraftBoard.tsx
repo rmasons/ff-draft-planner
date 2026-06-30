@@ -175,7 +175,6 @@ export default function DraftBoard() {
 
   // Tier dividers and replacement line only make sense on the default rank sort.
   const isRankSort = sortKey === "rank" && sortDir === 1;
-  const showTierDividers = filter !== "ALL" && !query.trim() && isRankSort;
   const replRank =
     filter !== "ALL" && !query.trim() && isRankSort && baselines
       ? baselines[filter].rank
@@ -329,8 +328,15 @@ export default function DraftBoard() {
               <tbody>
                 {rows.map((p, i) => {
                   const prev = rows[i - 1];
+                  // Single-position: break on any tier change (including first row).
+                  // ALL positions: break only when consecutive same-position players
+                  // change tier — avoids spurious breaks across different positions.
                   const tierBreak =
-                    showTierDividers && (!prev || prev.tier !== p.tier);
+                    !query.trim() &&
+                    isRankSort &&
+                    (filter !== "ALL"
+                      ? !prev || prev.tier !== p.tier
+                      : !!prev && prev.position === p.position && prev.tier !== p.tier);
                   const replBreak =
                     replRank !== null &&
                     p.posRank > replRank &&
@@ -425,14 +431,9 @@ function Row({
         <tr>
           <td
             colSpan={10}
-            className="border-l-2 px-3 py-1 text-xs font-semibold uppercase tracking-wide"
-            style={{
-              color: tierColor(p.tier),
-              borderColor: tierColor(p.tier),
-              backgroundColor: `${tierColor(p.tier)}12`,
-            }}
+            className="bg-zinc-950 px-3 py-0.5 text-[10px] uppercase tracking-widest text-zinc-700"
           >
-            Tier {p.tier}
+            — {p.position} · Tier {p.tier} —
           </td>
         </tr>
       )}
