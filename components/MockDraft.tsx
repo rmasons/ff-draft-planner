@@ -7,6 +7,7 @@ import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { useLocalStorage } from "./useLocalStorage";
 import DraftBoardGrid from "./DraftBoardGrid";
+import ScarcityChart from "./ScarcityChart";
 import { SEASON } from "@/lib/sleeper";
 
 interface MockPick {
@@ -215,7 +216,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [copiedRoster, setCopiedRoster] = useState(false);
 
   // View and filter state
-  const [viewMode, setViewMode] = useState<"players" | "board">("players");
+  const [viewMode, setViewMode] = useState<"players" | "board" | "scarcity">("players");
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("rank");
@@ -1381,7 +1382,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             </span>
           )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
-            {(["players", "board"] as const).map((v) => (
+            {(["players", "board", "scarcity"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setViewMode(v)}
@@ -1389,7 +1390,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                   viewMode === v ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300"
                 }`}
               >
-                {v === "players" ? "Players" : "Board"}
+                {v === "players" ? "Players" : v === "board" ? "Board" : "Scarcity"}
               </button>
             ))}
           </div>
@@ -1492,7 +1493,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
       {/* Main layout */}
       <div className="flex gap-4">
-        {/* Left: board or player table */}
+        {/* Left: board, player table, or scarcity chart */}
         {viewMode === "board" ? (
           <div className="min-w-0 flex-1 overflow-x-auto">
             <DraftBoardGrid
@@ -1505,6 +1506,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               playerById={playerById}
               draftMode={draftMode}
               teamNames={teamNames}
+            />
+          </div>
+        ) : viewMode === "scarcity" ? (
+          <div className="min-w-0 flex-1">
+            <ScarcityChart
+              ranked={ranked}
+              draftedIds={draftedIds}
+              numTeams={numTeams}
+              numRounds={numRounds}
+              currentPickNum={currentPickNum}
             />
           </div>
         ) : (
