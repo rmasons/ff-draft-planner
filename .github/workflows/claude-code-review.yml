@@ -1,0 +1,47 @@
+name: Claude Code Review
+
+# Advisory fresh-context review on feature -> dev PRs only.
+# Promotion PRs (dev -> test, test -> main) are handled by promotion-review.yml.
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [dev]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          prompt: |
+            Review this pull request with fresh eyes. You have NOT seen the
+            conversation or reasoning that produced this code — judge it on its
+            merits, do not assume the author's intent was correct.
+
+            Focus on, in priority order:
+            - Correctness and bugs (logic errors, off-by-one, wrong assumptions)
+            - Security (injection, hardcoded secrets, auth gaps, unsafe input)
+            - Error handling and edge cases
+            - Performance problems that matter
+            - Readability and consistency with the surrounding code
+
+            The PR branch is already checked out in the working directory.
+            Use the inline comment tool (confirmed: true) to flag specific lines,
+            and `gh pr comment` for one short top-level summary. Be concrete and
+            concise: skip nitpicks, style-only opinions, and praise. If the PR
+            looks clean, say so briefly rather than inventing issues.
+          claude_args: |
+            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

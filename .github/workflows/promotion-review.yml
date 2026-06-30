@@ -1,0 +1,116 @@
+name: Promotion Review
+
+# BLOCKING fresh-context review for PROMOTIONS only: dev -> test and test -> main.
+# The runner starts clean, so Claude judges the diff on its merits. Unlike the
+# advisory review on feature -> dev, this one FAILS the check (and therefore
+# blocks the merge, via branch protection) if it finds ANY substantive issue.
+#
+# Pair this with branch protection on `test` and `main` that requires the
+# `promotion-review` check — see PIPELINE.md.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [test, main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  promotion-review:
+    name: promotion-review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the review can see the real diff base
+
+      - name: Claude promotion review
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Auth: exactly ONE of these must exist as a repo secret (see PIPELINE.md).
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the BLOCKING promotion gate for this project, reviewing
+            pull request #${{ github.event.pull_request.number }}, which promotes
+            code toward production (base branch: ${{ github.base_ref }}). You have
+            NOT seen the conversation that produced it — review with fresh eyes and
+            do not assume the author's intent was correct.
+
+            This runs non-interactively in CI: do NOT ask the user anything, do
+            NOT run `gh pr list`, and review ONLY PR #${{ github.event.pull_request.number }}.
+            Get the diff with:
+              gh pr diff ${{ github.event.pull_request.number }}
+            and read changed files in the checked-out working tree as needed.
+            Review thoroughly, in priority order:
+              1. Correctness — logic errors, off-by-one, wrong assumptions, broken
+                 control flow, data-shape mismatches between server and client.
+              2. Security — injection, secrets, auth/authorization gaps, unsafe
+                 input, missing ownership checks on writes.
+              3. Data integrity — cache key/versioning, race conditions, money/
+                 score math, anything that could corrupt or mis-attribute data.
+              4. Error handling & edge cases — empty states, nulls, failed calls,
+                 first-run, boundary values.
+              5. Performance problems that actually matter at this app's scale.
+
+            Severity decides whether a finding BLOCKS the promotion:
+              - critical / high → BLOCKS. Reserve for concrete correctness,
+                security, or data-integrity defects that would harm production.
+              - medium / low → ADVISORY only (does NOT block): test-coverage
+                gaps, minor edge cases, polish, borderline concerns. Still post
+                them as inline comments so they're visible.
+            Do NOT raise style, formatting, naming, praise, or speculation you
+            cannot ground in the diff — at any severity.
+
+            For EACH real finding: post an inline comment on the exact line
+            (confirmed: true) explaining the problem and the fix.
+
+            Then you MUST write your machine-readable verdict to a file named
+            review-verdict.json in the repository root (use the Write tool), with
+            EXACTLY this schema:
+              {
+                "verdict": "pass" | "block",
+                "findings": [
+                  { "severity": "critical|high|medium|low",
+                    "file": "path", "line": 0, "issue": "one sentence" }
+                ]
+              }
+            Rules for the verdict:
+              - findings: include ALL findings you raised, each with an accurate
+                severity (critical/high/medium/low).
+              - verdict: "block" if ANY finding is high or critical, else "pass".
+                (The gate enforces this from severities regardless.)
+            Finally post ONE short top-level summary with
+              gh pr comment ${{ github.event.pull_request.number }} --body "..."
+            (the verdict and a one-line rationale). Writing review-verdict.json is
+            mandatory — write it even when there are ZERO findings
+            ({"verdict":"pass","findings":[]}). It must be your final action.
+          claude_args: |
+            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*)"
+
+      - name: Enforce verdict
+        run: |
+          if [ ! -f review-verdict.json ]; then
+            # No verdict file. Distinguish a real model error (fail closed) from a
+            # clean review that simply didn't write the file (pass).
+            OUT="$RUNNER_TEMP/claude-execution-output.json"
+            if [ -f "$OUT" ] && [ "$(jq -r 'if type=="array" then ([.[]|select(.type=="result")][-1].is_error) else .is_error end // "true"' "$OUT" 2>/dev/null)" = "true" ]; then
+              echo "::error::Review could not run (model error) — failing closed."
+              exit 1
+            fi
+            echo "::warning::No verdict file, but the review ran without error — treating as pass."
+            exit 0
+          fi
+          echo "Verdict file:" && cat review-verdict.json
+          blocking=$(jq -r '[(.findings // [])[] | select(.severity=="high" or .severity=="critical")] | length' review-verdict.json)
+          total=$(jq -r '(.findings // []) | length' review-verdict.json)
+          echo "blocking(high/critical)=$blocking advisory=$((total - blocking))"
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error::Promotion blocked: $blocking high/critical finding(s). Address the inline comments and push."
+            exit 1
+          fi
+          [ "$total" -gt 0 ] && echo "::warning::$total advisory (medium/low) finding(s) — not blocking."
+          echo "Promotion review passed."
