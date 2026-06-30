@@ -16,6 +16,13 @@ import ConfigPanel from "./ConfigPanel";
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
 
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface AdpSnapshot {
+  ts: number;
+  data: Record<string, number>;
+}
+
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1,   // asc: lower = better
   proj: -1,  // desc: more points = better
@@ -69,6 +76,10 @@ export default function DraftBoard() {
   const [roster, setRoster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
   const [method, setMethod] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
   const [drafted, setDrafted] = useLocalStorage<string[]>("ffdp.drafted", []);
+  const [snapshot, setSnapshot, snapshotHydrated] = useLocalStorage<AdpSnapshot | null>(
+    "ffdp.adp-snapshot",
+    null,
+  );
 
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
@@ -94,6 +105,50 @@ export default function DraftBoard() {
     };
   }, []);
 
+  const adpKey = adpKeyFor(scoring, roster);
+
+  // Seed or refresh the ADP snapshot used for trend indicators.
+  // Uses a functional update so we never need `snapshot` in the dependency
+  // array — avoiding a read-during-write loop.
+  useEffect(() => {
+    if (!players || !snapshotHydrated) return;
+    setSnapshot((prev) => {
+      const now = Date.now();
+      if (prev && now - prev.ts <= SEVEN_DAYS_MS) return prev; // still fresh
+      // Build a new baseline from the current consensus ADP.
+      const data: Record<string, number> = {};
+      for (const p of players) {
+        const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
+        const es = p.adp.espn >= 999 ? null : p.adp.espn;
+        const srcs = [sl, es].filter((x): x is number => x !== null);
+        if (srcs.length > 0) {
+          data[p.id] = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+        }
+      }
+      return { ts: now, data };
+    });
+  }, [players, snapshotHydrated, adpKey, setSnapshot]);
+
+  // Map player_id → trend delta (positive = rising, negative = falling).
+  // Only populated when a fresh (≤7 day old) snapshot exists from a prior load.
+  const trendMap = useMemo<Record<string, number>>(() => {
+    if (!players || !snapshot || !snapshotHydrated) return {};
+    if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
+    const map: Record<string, number> = {};
+    for (const p of players) {
+      const snapAdp = snapshot.data[p.id];
+      if (snapAdp === undefined) continue;
+      const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
+      const es = p.adp.espn >= 999 ? null : p.adp.espn;
+      const srcs = [sl, es].filter((x): x is number => x !== null);
+      if (srcs.length === 0) continue;
+      const currentConsensus = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      // Positive → snapshotAdp was higher → player is now drafted earlier → rising
+      map[p.id] = snapAdp - currentConsensus;
+    }
+    return map;
+  }, [players, snapshot, snapshotHydrated, adpKey]);
+
   const { ranked, baselines } = useMemo(() => {
     if (!players) return { ranked: [] as RankedPlayer[], baselines: null as Baselines | null };
     const res = rankPlayers(players, scoring, roster, method);
@@ -101,7 +156,6 @@ export default function DraftBoard() {
   }, [players, scoring, roster, method]);
 
   const draftedSet = useMemo(() => new Set(drafted), [drafted]);
-  const adpKey = adpKeyFor(scoring, roster);
 
   function handleSort(key: SortKey) {
     if (key === sortKey) {
@@ -352,6 +406,7 @@ export default function DraftBoard() {
                     : null;
                   const value = consensusAdp !== null ? consensusAdp - p.overallRank : null;
                   const risk = riskScore(p);
+                  const trend = trendMap[p.id] ?? 0;
                   return (
                     <Row
                       key={p.id}
@@ -361,6 +416,7 @@ export default function DraftBoard() {
                       espnAdp={espnAdp}
                       value={value}
                       risk={risk}
+                      trend={trend}
                       isDrafted={isDrafted}
                       tierBreak={tierBreak}
                       replBreak={replBreak}
@@ -398,6 +454,7 @@ function Row({
   espnAdp,
   value,
   risk,
+  trend,
   isDrafted,
   tierBreak,
   replBreak,
@@ -409,6 +466,7 @@ function Row({
   espnAdp: number | null;
   value: number | null;
   risk: number;
+  trend: number;
   isDrafted: boolean;
   tierBreak: boolean;
   replBreak: boolean;
@@ -447,6 +505,12 @@ function Row({
         <td className="px-3 py-2">
           <div className={`font-medium text-zinc-100 ${isDrafted ? "line-through" : ""}`}>
             {p.name}
+            {trend > 2 && (
+              <span className="ml-1 text-[11px] text-emerald-400" title="Rising ADP">↑</span>
+            )}
+            {trend < -2 && (
+              <span className="ml-1 text-[11px] text-rose-400" title="Falling ADP">↓</span>
+            )}
           </div>
           <div className="text-xs text-zinc-500">
             {p.team ?? "FA"}
