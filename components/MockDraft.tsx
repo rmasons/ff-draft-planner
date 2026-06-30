@@ -478,6 +478,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       .slice(0, 8);
   }, [ranked, keeperSearch, keeperPlayerId, pendingKeepers, draftedIds]);
 
+  // Keeper value analysis (setup screen only)
+  const keeperAnalysis = useMemo(() => {
+    if (pendingKeepers.length === 0 || ranked.length === 0) return [];
+    return pendingKeepers.map((k) => {
+      const player = playerById.get(k.playerId);
+      const pickEquivalent = (k.round - 1) * numTeams + userSlot;
+      const srcs = player
+        ? [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn].filter(
+            (v): v is number => v < 999
+          )
+        : [];
+      const consensusAdp = srcs.length ? srcs.reduce((a, b) => a + b, 0) / srcs.length : null;
+      const surplus = consensusAdp === null ? null : pickEquivalent - consensusAdp;
+      let verdict: "keep" | "borderline" | "cut" | null = null;
+      if (surplus !== null) {
+        if (surplus > 8) verdict = "keep";
+        else if (surplus >= 0) verdict = "borderline";
+        else verdict = "cut";
+      }
+      return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
+    });
+  }, [pendingKeepers, ranked, playerById, numTeams, userSlot]);
+
   // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
     if (!started || draftMode !== "cpu" || isUserTurn || isDone || ranked.length === 0) return;
@@ -1148,6 +1171,55 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               </div>
             )}
           </div>
+
+          {/* Keeper Value Analysis */}
+          {keeperAnalysis.length > 0 && (
+            <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-900/30 p-4">
+              <h3 className="mb-3 text-sm font-semibold text-zinc-300">Keeper Value Analysis</h3>
+              <div className="space-y-2">
+                {keeperAnalysis.map(({ keeper, player, pickEquivalent, consensusAdp, surplus, verdict }, i) => {
+                  const pos = player?.position;
+                  const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
+                  const verdictIcon = verdict === "keep" ? "🟢" : verdict === "borderline" ? "🟡" : "🔴";
+                  const verdictLabel = verdict === "keep" ? "Keep" : verdict === "borderline" ? "Borderline" : "Cut";
+                  return (
+                    <div key={i} className="rounded-lg border border-zinc-700/50 bg-zinc-950/60 px-3 py-2.5">
+                      <div className="mb-1.5 flex items-center gap-2">
+                        {pos && (
+                          <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}>{pos}</span>
+                        )}
+                        <span className="font-medium text-zinc-100">{player?.name ?? keeper.playerId}</span>
+                        {verdict && (
+                          <span className="ml-auto flex items-center gap-1 text-xs font-medium">
+                            {verdictIcon}{" "}
+                            <span className={verdict === "keep" ? "text-emerald-400" : verdict === "borderline" ? "text-amber-400" : "text-rose-400"}>
+                              {verdictLabel}
+                            </span>
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs">
+                        <span className="text-zinc-500">Keep cost</span>
+                        <span className="text-zinc-300">Round {keeper.round}</span>
+                        <span className="text-zinc-500">Pick equivalent</span>
+                        <span className="text-zinc-300">#{pickEquivalent}</span>
+                        <span className="text-zinc-500">ADP</span>
+                        <span className="text-zinc-300">{consensusAdp !== null ? consensusAdp.toFixed(1) : "—"}</span>
+                        <span className="text-zinc-500">VOR surplus</span>
+                        <span className={surplus === null ? "text-zinc-500" : surplus > 0 ? "text-emerald-400" : "text-rose-400"}>
+                          {surplus !== null
+                            ? surplus > 0
+                              ? `+${surplus.toFixed(1)} picks of value`
+                              : `${surplus.toFixed(1)} picks`
+                            : "—"}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Draft mode */}
           <div className="mb-4">
