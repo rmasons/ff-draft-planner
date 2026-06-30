@@ -27,6 +27,7 @@ interface Props {
   currentPickNum: number;
   playerById: Map<string, RankedPlayer>;
   draftMode: "cpu" | "manual";
+  teamNames?: Record<number, string>;
 }
 
 const POS_BADGE: Record<Position, string> = {
@@ -121,6 +122,7 @@ function DraftBoardGrid({
   currentPickNum,
   playerById,
   draftMode,
+  teamNames,
 }: Props) {
   const pickByNum = useMemo(() => {
     const m = new Map<number, BoardPick>();
@@ -145,20 +147,26 @@ function DraftBoardGrid({
             <th className="sticky left-0 z-10 bg-zinc-900/80 px-2 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-zinc-600 whitespace-nowrap">
               Rd
             </th>
-            {slots.map((slot) => (
-              <th
-                key={slot}
-                className={`px-1 py-2 text-center text-[10px] font-semibold uppercase tracking-wide whitespace-nowrap ${
-                  draftMode === "cpu" && slot === userSlot ? "text-emerald-400" : "text-zinc-500"
-                }`}
-              >
-                {draftMode === "cpu" && slot === userSlot ? (
-                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5">T{slot} ★</span>
-                ) : (
-                  `T${slot}`
-                )}
-              </th>
-            ))}
+            {slots.map((slot) => {
+              const name = teamNames?.[slot];
+              const label = name ?? `T${slot}`;
+              const isUser = draftMode === "cpu" && slot === userSlot;
+              return (
+                <th
+                  key={slot}
+                  title={name}
+                  className={`px-1 py-2 text-center text-[10px] font-semibold uppercase tracking-wide ${
+                    isUser ? "text-emerald-400" : "text-zinc-500"
+                  }`}
+                >
+                  {isUser ? (
+                    <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 whitespace-nowrap">{label} ★</span>
+                  ) : (
+                    <span className="block max-w-[96px] overflow-hidden text-ellipsis whitespace-nowrap">{label}</span>
+                  )}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>

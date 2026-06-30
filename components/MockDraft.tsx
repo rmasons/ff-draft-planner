@@ -34,6 +34,7 @@ interface SleeperDraft {
   type: string;
   sport: string;
   status: string;
+  league_id?: string;
   settings?: { teams?: number; rounds?: number };
   draft_order?: Record<string, number> | null;
   slot_to_roster_id?: Record<string, number> | null;
@@ -129,6 +130,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [importedRounds, setImportedRounds] = useState<number | null>(null);
   const [importSummary, setImportSummary] = useState<string | null>(null);
   const [tradedPicks, setTradedPicks] = useState<TradedPick[]>([]);
+  const [teamNames, setTeamNames] = useState<Record<number, string>>({});
 
   // Keeper setup (for fresh mock drafts before start)
   const [pendingKeepers, setPendingKeepers] = useState<PendingKeeper[]>([]);
@@ -163,6 +165,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         if (d.userSlot) setUserSlot(d.userSlot);
         if (d.tradedPicks?.length) setTradedPicks(d.tradedPicks);
         if (d.importSummary) setImportSummary(d.importSummary);
+        if (d.teamNames) setTeamNames(d.teamNames);
       } catch { /* ignore malformed storage */ }
     }
     const rawKeepers = sessionStorage.getItem(KEEPER_SETUP_KEY);
@@ -229,6 +232,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
   const currentTeamSlot = isDone ? null : teamSlotForPick(currentPickNum, numTeams);
   const isUserTurn = !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
+
+  const teamLabel = (slot: number) => teamNames[slot] || `T${slot}`;
 
   const draftedIds = useMemo(() => new Set(picks.map((p) => p.playerId)), [picks]);
 
@@ -402,6 +407,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setUserLookupError(null);
     setPendingKeepers([]);
     setBoardFilter("ALL");
+    setTeamNames({});
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
   }
@@ -489,6 +495,23 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const sleeperPicks: SleeperPick[] = await picksRes.json();
       const rawTradedPicks = tradedRes.ok ? await tradedRes.json() : [];
 
+      // Fetch team names from league users (non-critical — silently ignored on failure)
+      let slotToName: Record<number, string> = {};
+      if (draft.league_id && draft.draft_order) {
+        try {
+          const usersRes = await fetch(`https://api.sleeper.app/v1/league/${draft.league_id}/users`);
+          if (usersRes.ok) {
+            const users: Array<{ user_id: string; display_name?: string; metadata?: { team_name?: string } }> = await usersRes.json();
+            for (const u of users) {
+              const slot = draft.draft_order![u.user_id];
+              if (typeof slot === "number") {
+                slotToName[slot] = u.metadata?.team_name || u.display_name || "";
+              }
+            }
+          }
+        } catch { /* team names are non-critical */ }
+      }
+
       if (draft.type !== "snake") throw new Error(`Only snake drafts are supported (got "${draft.type}")`);
       if (draft.sport !== "nfl") throw new Error(`Only NFL drafts are supported`);
 
@@ -547,6 +570,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       setUserSlot(newUserSlot);
       setTradedPicks(parsedTradedPicks);
       setImportSummary(summary);
+      setTeamNames(slotToName);
 
       // Persist so tab switches don't lose the setup
       sessionStorage.setItem(
@@ -561,6 +585,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           userSlot: newUserSlot,
           tradedPicks: parsedTradedPicks,
           importSummary: summary,
+          teamNames: slotToName,
         })
       );
     } catch (e) {
@@ -777,7 +802,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
               >
                 {Array.from({ length: numTeams }, (_, i) => i + 1).map((n) => (
-                  <option key={n} value={n}>Slot {n} of {numTeams}</option>
+                  <option key={n} value={n}>
+                    {teamNames[n] ? `${teamNames[n]} (Slot ${n})` : `Slot ${n} of ${numTeams}`}
+                  </option>
                 ))}
               </select>
             </div>
@@ -826,11 +853,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               Round {currentRound} · Pick {currentPickNum} of {numTeams * numRounds}
             </span>
             {draftMode === "manual" ? (
-              <span className="font-semibold text-emerald-400">Team {currentTeamSlot} — click a player to pick</span>
+              <span className="font-semibold text-emerald-400">{teamLabel(currentTeamSlot!)} — click a player to pick</span>
             ) : isUserTurn ? (
               <span className="font-semibold text-emerald-400">⚡ YOU&apos;RE ON THE CLOCK — click a player to draft</span>
             ) : (
-              <span className="text-sm text-zinc-400">Team {currentTeamSlot} picking…</span>
+              <span className="text-sm text-zinc-400">{teamLabel(currentTeamSlot!)} picking…</span>
             )}
           </>
         )}
@@ -871,6 +898,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               currentPickNum={currentPickNum}
               playerById={playerById}
               draftMode={draftMode}
+              teamNames={teamNames}
             />
           </div>
         ) : (
@@ -1078,8 +1106,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs ${isMe ? "bg-emerald-500/10" : ""}`}
                       >
                         <span className="w-5 shrink-0 text-right tabular-nums text-zinc-600">{pick.pickNumber}.</span>
-                        <span className={`shrink-0 ${isMe ? "font-medium text-emerald-400" : "text-zinc-500"}`}>
-                          {isMe ? "You" : `T${pick.teamSlot}`}
+                        <span className={`shrink-0 max-w-[80px] truncate ${isMe ? "font-medium text-emerald-400" : "text-zinc-500"}`}
+                              title={!isMe ? teamLabel(pick.teamSlot) : undefined}>
+                          {isMe ? "You" : teamLabel(pick.teamSlot)}
                         </span>
                         {pos && (
                           <span className={`shrink-0 rounded border px-1 py-0.5 text-[9px] font-semibold ${badgeClass}`}>{pos}</span>
