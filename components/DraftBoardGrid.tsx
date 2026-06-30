@@ -48,6 +48,70 @@ function lastNameOf(name: string): string {
   return parts.length > 1 ? parts.slice(1).join(" ") : name;
 }
 
+interface CellProps {
+  pickNum: number;
+  pick: BoardPick | undefined;
+  tradedTo: number | undefined;
+  isCurrent: boolean;
+  isUserCol: boolean;
+  playerById: Map<string, RankedPlayer>;
+}
+
+const BoardCell = memo(function BoardCell({ pickNum, pick, tradedTo, isCurrent, isUserCol, playerById }: CellProps) {
+  if (pick) {
+    const player = playerById.get(pick.playerId);
+    const name = player?.name ?? pick.playerName ?? pick.playerId;
+    const pos = (player?.position ?? pick.playerPos) as Position | undefined;
+    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : undefined;
+    const displayName = lastNameOf(name);
+
+    return (
+      <td className={`min-w-[88px] max-w-[110px] px-1.5 py-1.5 align-top ${isUserCol ? "bg-emerald-500/5" : ""}`}>
+        <div className="flex flex-col gap-0.5">
+          <div className="flex items-center gap-1">
+            {pos && badgeClass && (
+              <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}>
+                {pos}
+              </span>
+            )}
+            {pick.isKeeper && (
+              <span className="shrink-0 rounded border border-amber-400/40 bg-amber-400/10 px-1 py-px text-[9px] font-bold text-amber-300">
+                K
+              </span>
+            )}
+          </div>
+          <span
+            className={`truncate leading-tight ${
+              pick.isKeeper ? "italic text-amber-200" : isUserCol ? "font-medium text-emerald-200" : "text-zinc-200"
+            }`}
+            title={name}
+          >
+            {displayName}
+          </span>
+        </div>
+      </td>
+    );
+  }
+
+  return (
+    <td
+      className={`min-w-[88px] max-w-[110px] px-1.5 py-1.5 ${
+        isCurrent ? "ring-1 ring-inset ring-emerald-500/60 bg-emerald-500/5" : isUserCol ? "bg-emerald-500/5" : ""
+      }`}
+    >
+      <div className="flex h-9 items-center justify-center">
+        {tradedTo ? (
+          <span className="text-[10px] font-medium text-zinc-500">→T{tradedTo}</span>
+        ) : isCurrent ? (
+          <span className="text-[10px] font-medium text-emerald-500">●</span>
+        ) : (
+          <span className="text-[10px] text-zinc-800">{pickNum}</span>
+        )}
+      </div>
+    </td>
+  );
+});
+
 function DraftBoardGrid({
   picks,
   tradedPicks,
@@ -85,15 +149,11 @@ function DraftBoardGrid({
               <th
                 key={slot}
                 className={`px-1 py-2 text-center text-[10px] font-semibold uppercase tracking-wide whitespace-nowrap ${
-                  draftMode === "cpu" && slot === userSlot
-                    ? "text-emerald-400"
-                    : "text-zinc-500"
+                  draftMode === "cpu" && slot === userSlot ? "text-emerald-400" : "text-zinc-500"
                 }`}
               >
                 {draftMode === "cpu" && slot === userSlot ? (
-                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5">
-                    T{slot} ★
-                  </span>
+                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5">T{slot} ★</span>
                 ) : (
                   `T${slot}`
                 )}
@@ -113,86 +173,16 @@ function DraftBoardGrid({
                 const tradedTo = tradedByCell.get(`${round}-${slot}`);
                 const isCurrent = pickNum === currentPickNum;
                 const isUserCol = draftMode === "cpu" && slot === userSlot;
-
-                if (pick) {
-                  const player = playerById.get(pick.playerId);
-                  const name =
-                    player?.name ?? pick.playerName ?? pick.playerId;
-                  const pos =
-                    (player?.position ?? pick.playerPos) as Position | undefined;
-                  const badgeClass =
-                    pos && pos in POS_BADGE ? POS_BADGE[pos] : undefined;
-                  const displayName = lastNameOf(name);
-
-                  return (
-                    <td
-                      key={slot}
-                      className={`min-w-[88px] max-w-[110px] px-1.5 py-1.5 align-top ${
-                        isUserCol
-                          ? "bg-emerald-500/5"
-                          : ""
-                      }`}
-                    >
-                      <div className="flex flex-col gap-0.5">
-                        <div className="flex items-center gap-1">
-                          {pos && badgeClass && (
-                            <span
-                              className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}
-                            >
-                              {pos}
-                            </span>
-                          )}
-                          {pick.isKeeper && (
-                            <span className="shrink-0 rounded border border-amber-400/40 bg-amber-400/10 px-1 py-px text-[9px] font-bold text-amber-300">
-                              K
-                            </span>
-                          )}
-                        </div>
-                        <span
-                          className={`truncate leading-tight ${
-                            pick.isKeeper
-                              ? "italic text-amber-200"
-                              : isUserCol
-                              ? "font-medium text-emerald-200"
-                              : "text-zinc-200"
-                          }`}
-                          title={name}
-                        >
-                          {displayName}
-                        </span>
-                      </div>
-                    </td>
-                  );
-                }
-
-                // Empty cell
                 return (
-                  <td
+                  <BoardCell
                     key={slot}
-                    className={`min-w-[88px] max-w-[110px] px-1.5 py-1.5 ${
-                      isCurrent
-                        ? "ring-1 ring-inset ring-emerald-500/60 bg-emerald-500/5"
-                        : isUserCol
-                        ? "bg-emerald-500/5"
-                        : ""
-                    }`}
-                  >
-                    <div className="flex h-9 items-center justify-center">
-                      {tradedTo && tradedTo !== slot ? (
-                        <span className="text-[10px] font-medium text-zinc-500">
-                          →T{tradedTo}
-                        </span>
-                      ) : isCurrent ? (
-                        <span className="text-[10px] font-medium text-emerald-500">
-                          ●
-                        </span>
-                      ) : (
-                        <span className="text-[10px] text-zinc-800">
-                          {pickNum}
-                        </span>
-                      )}
-                    </div>
-                  </td>
+                    pickNum={pickNum}
+                    pick={pick}
+                    tradedTo={tradedTo}
+                    isCurrent={isCurrent}
+                    isUserCol={isUserCol}
+                    playerById={playerById}
+                  />
                 );
               })}
             </tr>

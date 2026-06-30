@@ -65,6 +65,7 @@ const POS_BADGE: Record<Position, string> = {
 
 const UNKNOWN_BADGE = "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
+const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
 
 function teamSlotForPick(pickNum: number, numTeams: number): number {
   const round = Math.ceil(pickNum / numTeams);
@@ -147,28 +148,40 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
 
-  // Report active state to parent (for tab-switch guard)
-  useEffect(() => {
-    onActiveChange?.(started || picks.length > 0);
-  }, [started, picks.length, onActiveChange]);
-
   // Restore import settings from sessionStorage on mount
   useEffect(() => {
     const raw = sessionStorage.getItem(DRAFT_SETUP_KEY);
-    if (!raw) return;
-    try {
-      const d = JSON.parse(raw);
-      if (d.draftId) setDraftId(d.draftId);
-      if (d.sleeperUsername) setSleeperUsername(d.sleeperUsername);
-      if (d.sleeperUserId) setSleeperUserId(d.sleeperUserId);
-      if (d.importedTeams) setImportedTeams(d.importedTeams);
-      if (d.importedRounds) setImportedRounds(d.importedRounds);
-      if (d.picks?.length) setPicks(d.picks);
-      if (d.userSlot) setUserSlot(d.userSlot);
-      if (d.tradedPicks?.length) setTradedPicks(d.tradedPicks);
-      if (d.importSummary) setImportSummary(d.importSummary);
-    } catch { /* ignore malformed storage */ }
+    if (raw) {
+      try {
+        const d = JSON.parse(raw);
+        if (d.draftId) setDraftId(d.draftId);
+        if (d.sleeperUsername) setSleeperUsername(d.sleeperUsername);
+        if (d.sleeperUserId) setSleeperUserId(d.sleeperUserId);
+        if (d.importedTeams) setImportedTeams(d.importedTeams);
+        if (d.importedRounds) setImportedRounds(d.importedRounds);
+        if (d.picks?.length) setPicks(d.picks);
+        if (d.userSlot) setUserSlot(d.userSlot);
+        if (d.tradedPicks?.length) setTradedPicks(d.tradedPicks);
+        if (d.importSummary) setImportSummary(d.importSummary);
+      } catch { /* ignore malformed storage */ }
+    }
+    const rawKeepers = sessionStorage.getItem(KEEPER_SETUP_KEY);
+    if (rawKeepers) {
+      try {
+        const ks = JSON.parse(rawKeepers);
+        if (Array.isArray(ks)) setPendingKeepers(ks);
+      } catch { /* ignore */ }
+    }
   }, []);
+
+  // Persist manual keepers across tab switches
+  useEffect(() => {
+    if (pendingKeepers.length > 0) {
+      sessionStorage.setItem(KEEPER_SETUP_KEY, JSON.stringify(pendingKeepers));
+    } else {
+      sessionStorage.removeItem(KEEPER_SETUP_KEY);
+    }
+  }, [pendingKeepers]);
 
   // Fetch player projections
   useEffect(() => {
@@ -207,6 +220,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }, [pickedNums, numTeams, numRounds]);
 
   const isDone = currentPickNum > numTeams * numRounds;
+
+  // Report active state to parent (for tab-switch guard; only while draft is actively in progress)
+  useEffect(() => {
+    onActiveChange?.(started && !isDone);
+  }, [started, isDone, onActiveChange]);
+
   const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
   const currentTeamSlot = isDone ? null : teamSlotForPick(currentPickNum, numTeams);
   const isUserTurn = !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
@@ -280,14 +299,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const keeperSearchResults = useMemo(() => {
     if (!keeperSearch.trim() || keeperPlayerId) return [] as RankedPlayer[];
     const q = keeperSearch.toLowerCase();
+    const keeperIds = new Set(pendingKeepers.map((k) => k.playerId));
     return ranked
       .filter(
         (p) =>
-          !pendingKeepers.some((k) => k.playerId === p.id) &&
+          !draftedIds.has(p.id) &&
+          !keeperIds.has(p.id) &&
           (p.name.toLowerCase().includes(q) || (p.team ?? "").toLowerCase().includes(q))
       )
       .slice(0, 8);
-  }, [ranked, keeperSearch, keeperPlayerId, pendingKeepers]);
+  }, [ranked, keeperSearch, keeperPlayerId, pendingKeepers, draftedIds]);
 
   // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
@@ -296,34 +317,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const available = ranked.filter((p) => !draftedIds.has(p.id));
       if (available.length === 0 || currentTeamSlot === null) return;
 
-      // Build position counts for the team currently on the clock
-      const posCount: Record<string, number> = { QB: 0, RB: 0, WR: 0, TE: 0 };
-      for (const cp of picks) {
-        if (cp.teamSlot !== currentTeamSlot) continue;
-        const pos = playerById.get(cp.playerId)?.position ?? cp.playerPos;
-        if (pos && pos in posCount) posCount[pos]++;
-      }
-
-      const isSuperFlex = roster.superflex > 0;
-
       const best = available
         .map((p) => {
           const adpVal = p.adp[adpKey] < 999 ? p.adp[adpKey] : p.overallRank + 100;
           const jitter = (Math.random() - 0.5) * 8; // ±4 pick variance
-          let need = 0;
-          if (p.position === "QB") {
-            if (isSuperFlex && posCount.QB === 0) need = -20;
-            else if (!isSuperFlex && posCount.QB === 0 && currentRound >= 7) need = -15;
-            else if (posCount.QB >= 1) need = 30;
-          } else if (p.position === "RB" && posCount.RB < 2) {
-            need = -5;
-          } else if (p.position === "WR" && posCount.WR < 2) {
-            need = -5;
-          } else if (p.position === "TE") {
-            if (posCount.TE === 0 && currentRound >= 6) need = -10;
-            else if (posCount.TE >= 1) need = 20;
-          }
-          return { p, score: adpVal + jitter + need };
+          return { p, score: adpVal + jitter };
         })
         .sort((a, b) => a.score - b.score)[0]?.p;
 
@@ -337,7 +335,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => clearTimeout(timer);
   }, [
     started, draftMode, isUserTurn, isDone, ranked, draftedIds,
-    currentTeamSlot, currentPickNum, currentRound, adpKey, playerById, picks, roster,
+    currentTeamSlot, currentPickNum, adpKey,
   ]);
 
   useEffect(() => {
@@ -354,28 +352,33 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (pickingRef.current) return;
     pickingRef.current = true;
     const teamSlot = draftMode === "manual" ? currentTeamSlot : userSlot;
-    const pickNum = currentPickNum;
-    setPicks((prev) => [...prev, { pickNumber: pickNum, teamSlot, playerId }]);
+    setPicks((prev) => {
+      const taken = new Set(prev.map((p) => p.pickNumber));
+      let pickNum = 1;
+      while (taken.has(pickNum)) pickNum++;
+      return [...prev, { pickNumber: pickNum, teamSlot, playerId }];
+    });
     requestAnimationFrame(() => { pickingRef.current = false; });
   }
 
   function startDraft() {
-    // Pre-populate keeper picks for fresh drafts (no import)
-    if (pendingKeepers.length > 0 && picks.length === 0) {
-      const keeperPicks: MockPick[] = pendingKeepers
-        .map((k) => {
-          const player = playerById.get(k.playerId);
-          return {
-            pickNumber: pickNumForCell(k.round, k.teamSlot, numTeams),
-            teamSlot: k.teamSlot,
-            playerId: k.playerId,
-            playerName: player?.name,
-            playerPos: player?.position,
-            isKeeper: true as const,
-          };
-        })
-        .sort((a, b) => a.pickNumber - b.pickNumber);
-      setPicks(keeperPicks);
+    if (pendingKeepers.length > 0) {
+      const keeperPicks: MockPick[] = pendingKeepers.map((k) => {
+        const player = playerById.get(k.playerId);
+        return {
+          pickNumber: pickNumForCell(k.round, k.teamSlot, numTeams),
+          teamSlot: k.teamSlot,
+          playerId: k.playerId,
+          playerName: player?.name,
+          playerPos: player?.position,
+          isKeeper: true as const,
+        };
+      });
+      setPicks((prev) => {
+        const merged = new Map(prev.map((p) => [p.pickNumber, p]));
+        for (const kp of keeperPicks) merged.set(kp.pickNumber, kp);
+        return [...merged.values()].sort((a, b) => a.pickNumber - b.pickNumber);
+      });
     }
     setStarted(true);
   }
@@ -400,6 +403,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setPendingKeepers([]);
     setBoardFilter("ALL");
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
+    sessionStorage.removeItem(KEEPER_SETUP_KEY);
   }
 
   function addKeeper() {
