@@ -211,6 +211,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [keeperSlot, setKeeperSlot] = useState(1);
   const [keeperRound, setKeeperRound] = useState(1);
 
+  // Export / copy state
+  const [copiedRoster, setCopiedRoster] = useState(false);
+
   // View and filter state
   const [viewMode, setViewMode] = useState<"players" | "board">("players");
   const [filter, setFilter] = useState<Filter>("ALL");
@@ -432,6 +435,34 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [watchlist, draftedIds]
   );
 
+  // Unfilled starter slots (excludes bench). Only meaningful in CPU mode with a Sleeper import.
+  const unfilledStarterSlots = useMemo((): RosterSlot[] => {
+    if (!myRosterSlots) return [];
+    return myRosterSlots.filter((s) => s.slotType !== "BN" && s.pick === null);
+  }, [myRosterSlots]);
+
+  // Best available pick suggestion, weighted by VOR. Requires roster structure from a Sleeper import.
+  const bestPickSuggestion = useMemo((): { player: RankedPlayer; isBench: boolean } | null => {
+    if (!isUserTurn || draftMode !== "cpu" || !myRosterSlots) return null;
+    const available = ranked.filter((p) => !draftedIds.has(p.id));
+    if (available.length === 0) return null;
+    const byVor = [...available].sort((a, b) => b.vbd - a.vbd);
+
+    if (unfilledStarterSlots.length > 0) {
+      for (const player of byVor) {
+        for (const slot of unfilledStarterSlots) {
+          const eligible = SLOT_ELIGIBLE[slot.slotType] ?? [];
+          if (eligible.includes(player.position)) {
+            return { player, isBench: false };
+          }
+        }
+      }
+    }
+
+    // All starters filled — suggest the highest-VOR bench pick
+    return { player: byVor[0], isBench: true };
+  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots]);
+
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
     if (!keeperSearch.trim() || keeperPlayerId) return [] as RankedPlayer[];
@@ -446,6 +477,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       )
       .slice(0, 8);
   }, [ranked, keeperSearch, keeperPlayerId, pendingKeepers, draftedIds]);
+
+  // Keeper value analysis (setup screen only)
+  const keeperAnalysis = useMemo(() => {
+    if (pendingKeepers.length === 0 || ranked.length === 0) return [];
+    return pendingKeepers.map((k) => {
+      const player = playerById.get(k.playerId);
+      const pickEquivalent = (k.round - 1) * numTeams + userSlot;
+      const srcs = player
+        ? [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn].filter(
+            (v): v is number => v < 999
+          )
+        : [];
+      const consensusAdp = srcs.length ? srcs.reduce((a, b) => a + b, 0) / srcs.length : null;
+      const surplus = consensusAdp === null ? null : pickEquivalent - consensusAdp;
+      let verdict: "keep" | "borderline" | "cut" | null = null;
+      if (surplus !== null) {
+        if (surplus > 8) verdict = "keep";
+        else if (surplus >= 0) verdict = "borderline";
+        else verdict = "cut";
+      }
+      return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
+    });
+  }, [pendingKeepers, ranked, playerById, numTeams, userSlot]);
 
   // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
@@ -558,6 +612,82 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setWatchlist(new Set());
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
+  }
+
+  function exportCsv() {
+    const header = "Pick,Round,Team,Player,Position,Team (NFL),Projected Points,VOR,Avg ADP,Value";
+    const escape = (s: string) =>
+      s.includes(",") || s.includes('"') || s.includes("\n")
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+
+    const sortedPicks = [...picks].sort((a, b) => a.pickNumber - b.pickNumber);
+    const csvRows = sortedPicks.map((pick) => {
+      const player = playerById.get(pick.playerId);
+      const round = Math.ceil(pick.pickNumber / numTeams);
+      const team = teamLabel(pick.teamSlot);
+      const playerName = player?.name ?? pick.playerName ?? pick.playerId;
+      const position = player?.position ?? pick.playerPos ?? "";
+      const nflTeam = player?.team ?? "";
+      const projPts = player ? player.points.toFixed(1) : "";
+      const vor = player
+        ? (player.vbd > 0 ? "+" : "") + player.vbd.toFixed(1)
+        : "";
+
+      let avgAdpStr = "";
+      let valueStr = "";
+      if (player) {
+        const sl = player.adp[adpKey] >= 999 ? null : player.adp[adpKey];
+        const es = player.adp.espn >= 999 ? null : player.adp.espn;
+        const srcs = [sl, es].filter((x): x is number => x !== null);
+        if (srcs.length > 0) {
+          const avg = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+          avgAdpStr = avg.toFixed(1);
+          const val = avg - player.overallRank;
+          valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
+        }
+      }
+
+      return [
+        pick.pickNumber,
+        round,
+        escape(team),
+        escape(playerName),
+        position,
+        escape(nflTeam),
+        projPts,
+        vor,
+        avgAdpStr,
+        valueStr,
+      ].join(",");
+    });
+
+    const csv = [header, ...csvRows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `mock-draft-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function copyRoster() {
+    const sortedMyPicks = [...myPicks].sort((a, b) => a.pickNumber - b.pickNumber);
+    const lines = ["Your Draft Results:"];
+    for (const pick of sortedMyPicks) {
+      const player = playerById.get(pick.playerId);
+      const name = player?.name ?? pick.playerName ?? pick.playerId;
+      const pos = player?.position ?? pick.playerPos ?? "?";
+      const round = Math.ceil(pick.pickNumber / numTeams);
+      lines.push(`Rd ${round} (Pk ${pick.pickNumber}): ${name} — ${pos}`);
+    }
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      setCopiedRoster(true);
+      setTimeout(() => setCopiedRoster(false), 2000);
+    });
   }
 
   function addKeeper() {
@@ -1042,6 +1172,55 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             )}
           </div>
 
+          {/* Keeper Value Analysis */}
+          {keeperAnalysis.length > 0 && (
+            <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-900/30 p-4">
+              <h3 className="mb-3 text-sm font-semibold text-zinc-300">Keeper Value Analysis</h3>
+              <div className="space-y-2">
+                {keeperAnalysis.map(({ keeper, player, pickEquivalent, consensusAdp, surplus, verdict }, i) => {
+                  const pos = player?.position;
+                  const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
+                  const verdictIcon = verdict === "keep" ? "🟢" : verdict === "borderline" ? "🟡" : "🔴";
+                  const verdictLabel = verdict === "keep" ? "Keep" : verdict === "borderline" ? "Borderline" : "Cut";
+                  return (
+                    <div key={i} className="rounded-lg border border-zinc-700/50 bg-zinc-950/60 px-3 py-2.5">
+                      <div className="mb-1.5 flex items-center gap-2">
+                        {pos && (
+                          <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}>{pos}</span>
+                        )}
+                        <span className="font-medium text-zinc-100">{player?.name ?? keeper.playerId}</span>
+                        {verdict && (
+                          <span className="ml-auto flex items-center gap-1 text-xs font-medium">
+                            {verdictIcon}{" "}
+                            <span className={verdict === "keep" ? "text-emerald-400" : verdict === "borderline" ? "text-amber-400" : "text-rose-400"}>
+                              {verdictLabel}
+                            </span>
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs">
+                        <span className="text-zinc-500">Keep cost</span>
+                        <span className="text-zinc-300">Round {keeper.round}</span>
+                        <span className="text-zinc-500">Pick equivalent</span>
+                        <span className="text-zinc-300">#{pickEquivalent}</span>
+                        <span className="text-zinc-500">ADP</span>
+                        <span className="text-zinc-300">{consensusAdp !== null ? consensusAdp.toFixed(1) : "—"}</span>
+                        <span className="text-zinc-500">VOR surplus</span>
+                        <span className={surplus === null ? "text-zinc-500" : surplus > 0 ? "text-emerald-400" : "text-rose-400"}>
+                          {surplus !== null
+                            ? surplus > 0
+                              ? `+${surplus.toFixed(1)} picks of value`
+                              : `${surplus.toFixed(1)} picks`
+                            : "—"}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Draft mode */}
           <div className="mb-4">
             <label className="mb-1.5 block text-sm font-medium text-zinc-400">Draft mode</label>
@@ -1152,6 +1331,22 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           </>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {isDone && (
+            <>
+              <button
+                onClick={exportCsv}
+                className="rounded-md border border-zinc-700 px-3 py-1 text-xs text-zinc-400 transition hover:text-zinc-200"
+              >
+                Export CSV
+              </button>
+              <button
+                onClick={copyRoster}
+                className="rounded-md border border-zinc-700 px-3 py-1 text-xs text-zinc-400 transition hover:text-zinc-200"
+              >
+                {copiedRoster ? "Copied!" : "Copy Roster"}
+              </button>
+            </>
+          )}
           {watchlistRemaining > 0 && (
             <span className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-400">
               ★ {watchlistRemaining} target{watchlistRemaining !== 1 ? "s" : ""}
@@ -1335,6 +1530,55 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 className="min-w-40 flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
               />
             </div>
+
+            {/* Roster need indicator + best pick — CPU mode, user's turn, league imported */}
+            {draftMode === "cpu" && isUserTurn && myRosterSlots && (
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                {unfilledStarterSlots.length > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Need:</span>
+                    {unfilledStarterSlots.map((slot, i) => {
+                      const badgeClass =
+                        slot.slotType in POS_BADGE
+                          ? POS_BADGE[slot.slotType as Position]
+                          : UNKNOWN_BADGE;
+                      return (
+                        <span
+                          key={i}
+                          className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${badgeClass}`}
+                        >
+                          {slot.label}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {bestPickSuggestion && (
+                  <button
+                    onClick={() => pickPlayer(bestPickSuggestion.player.id)}
+                    className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-1 text-xs transition hover:bg-emerald-500/15"
+                  >
+                    <span className="text-zinc-500">
+                      {bestPickSuggestion.isBench ? "Bench Pick:" : "Best Pick:"}
+                    </span>
+                    <span className="font-medium text-zinc-100">{bestPickSuggestion.player.name}</span>
+                    <span
+                      className={`rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[bestPickSuggestion.player.position]}`}
+                    >
+                      {bestPickSuggestion.player.position}
+                    </span>
+                    <span
+                      className={`tabular-nums font-medium ${
+                        bestPickSuggestion.player.vbd > 0 ? "text-emerald-400" : "text-zinc-500"
+                      }`}
+                    >
+                      {bestPickSuggestion.player.vbd > 0 ? "+" : ""}
+                      {bestPickSuggestion.player.vbd.toFixed(1)}
+                    </span>
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className="overflow-hidden rounded-xl border border-zinc-800">
               <table className="w-full text-sm">
