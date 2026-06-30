@@ -1076,6 +1076,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         <div className="text-xs text-zinc-500">
                           {p.team ?? "FA"}
                           {p.bye ? ` · Bye ${p.bye}` : ""}
+                          {p.yearsExp === 0 ? (
+                            <span className="text-amber-400/70"> · Rookie</span>
+                          ) : p.yearsExp !== null ? (
+                            <span className="text-zinc-600"> · Yr {p.yearsExp + 1}</span>
+                          ) : null}
                           {p.injuryStatus ? <span className="ml-1 text-amber-500">{p.injuryStatus}</span> : null}
                         </div>
                       </td>
