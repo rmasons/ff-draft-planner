@@ -42,6 +42,8 @@ export interface Player {
   team: string | null;
   yearsExp: number | null;
   injuryStatus: string | null;
+  injuryBody: string | null;   // e.g. "Knee - ACL", "Shoulder"
+  injuryNotes: string | null;  // e.g. "Surgery", "Soreness"
   bye: number | null;
   stats: RawStats;
   adp: Adp;
