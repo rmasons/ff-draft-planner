@@ -373,6 +373,30 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [myPicks, playerById]
   );
 
+  const draftGrade = useMemo(() => {
+    if (!isDone || draftMode !== "cpu") return null;
+    const graded = myPicks.flatMap((pick) => {
+      const player = playerById.get(pick.playerId);
+      if (!player) return [];
+      const srcs = [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn]
+        .filter((v): v is number => v < 999);
+      if (srcs.length === 0) return [];
+      const avgAdp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      const value = avgAdp - player.overallRank;
+      return [{ pick, player, value }];
+    });
+    if (graded.length === 0) return null;
+    const avgValue = graded.reduce((a, b) => a + b.value, 0) / graded.length;
+    let letter: "A" | "B" | "C" | "D" | "F";
+    if (avgValue > 5) letter = "A";
+    else if (avgValue >= 2) letter = "B";
+    else if (avgValue > -2) letter = "C";
+    else if (avgValue >= -5) letter = "D";
+    else letter = "F";
+    const sorted = [...graded].sort((a, b) => b.value - a.value);
+    return { letter, avgValue, sorted };
+  }, [isDone, draftMode, myPicks, playerById]);
+
   // Position availability counts for the draft strip
   const positionCounts = useMemo(
     () =>
@@ -1006,6 +1030,73 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           </span>
         )}
       </div>
+
+      {/* Draft grade panel (CPU mode only, shown after draft completes) */}
+      {isDone && draftMode === "cpu" && draftGrade && (
+        <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4">
+          <div className="flex items-start gap-6">
+            {/* Letter grade */}
+            <div className="flex shrink-0 flex-col items-center">
+              <span
+                className={`text-6xl font-bold leading-none ${
+                  draftGrade.letter === "A"
+                    ? "text-emerald-400"
+                    : draftGrade.letter === "B"
+                    ? "text-sky-400"
+                    : draftGrade.letter === "C"
+                    ? "text-zinc-300"
+                    : draftGrade.letter === "D"
+                    ? "text-amber-400"
+                    : "text-rose-400"
+                }`}
+              >
+                {draftGrade.letter}
+              </span>
+              <span className="mt-1 text-xs font-medium text-zinc-500">Your Draft Grade</span>
+            </div>
+
+            {/* Summary + pick list */}
+            <div className="min-w-0 flex-1">
+              <p className="mb-3 text-sm text-zinc-400">
+                Avg pick value:{" "}
+                <span
+                  className={
+                    draftGrade.avgValue >= 0 ? "font-medium text-emerald-400" : "font-medium text-rose-400"
+                  }
+                >
+                  {draftGrade.avgValue >= 0 ? "+" : ""}
+                  {draftGrade.avgValue.toFixed(1)} picks{" "}
+                  {draftGrade.avgValue >= 0 ? "ahead of" : "behind"} ADP
+                </span>
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {draftGrade.sorted.map(({ pick, player, value }) => (
+                  <div
+                    key={pick.pickNumber}
+                    className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950/60 px-2 py-1 text-xs"
+                  >
+                    <span className="tabular-nums text-zinc-600">#{pick.pickNumber}</span>
+                    <span
+                      className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[player.position]}`}
+                    >
+                      {player.position}
+                    </span>
+                    <span className="text-zinc-200">{player.name}</span>
+                    <span
+                      className={`tabular-nums font-medium ${
+                        value >= 0 ? "text-emerald-400" : "text-rose-400"
+                      }`}
+                    >
+                      {value >= 0 ? "+" : ""}
+                      {value.toFixed(1)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main layout */}
       <div className="flex gap-4">
