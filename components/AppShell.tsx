@@ -3,8 +3,15 @@
 import { useState } from "react";
 import DraftBoard from "./DraftBoard";
 import MockDraft from "./MockDraft";
+import AuctionDraft from "./AuctionDraft";
 
-type Mode = "cheat-sheet" | "mock-draft";
+type Mode = "cheat-sheet" | "mock-draft" | "auction";
+
+const MODE_LABELS: Record<Mode, string> = {
+  "cheat-sheet": "Cheat Sheet",
+  "mock-draft": "Mock Draft",
+  auction: "Auction",
+};
 
 export default function AppShell() {
   const [mode, setMode] = useState<Mode>("cheat-sheet");
@@ -34,7 +41,7 @@ export default function AppShell() {
           </p>
         </div>
         <div className="flex rounded-lg border border-zinc-800 p-0.5">
-          {(["cheat-sheet", "mock-draft"] as Mode[]).map((m) => (
+          {(["cheat-sheet", "mock-draft", "auction"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => handleModeChange(m)}
@@ -44,15 +51,17 @@ export default function AppShell() {
                   : "text-zinc-400 hover:text-zinc-100"
               }`}
             >
-              {m === "cheat-sheet" ? "Cheat Sheet" : "Mock Draft"}
+              {MODE_LABELS[m]}
             </button>
           ))}
         </div>
       </header>
       {mode === "cheat-sheet" ? (
         <DraftBoard />
-      ) : (
+      ) : mode === "mock-draft" ? (
         <MockDraft onActiveChange={setDraftActive} />
+      ) : (
+        <AuctionDraft />
       )}
     </>
   );
