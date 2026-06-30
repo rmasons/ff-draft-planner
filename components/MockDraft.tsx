@@ -218,6 +218,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
+  const [watchlist, setWatchlist] = useState<Set<string>>(new Set());
 
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
@@ -326,6 +327,10 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       );
     }
     return [...list].sort((a, b) => {
+      // Watchlisted players float to the top
+      const aWatched = watchlist.has(a.id) ? 0 : 1;
+      const bWatched = watchlist.has(b.id) ? 0 : 1;
+      if (aWatched !== bWatched) return aWatched - bWatched;
       switch (sortKey) {
         case "rank": return (a.overallRank - b.overallRank) * sortDir;
         case "proj": return (a.points - b.points) * sortDir;
@@ -355,7 +360,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         default: return 0;
       }
     });
-  }, [ranked, draftedIds, filter, query, sortKey, sortDir, adpKey]);
+  }, [ranked, draftedIds, filter, query, sortKey, sortDir, adpKey, watchlist]);
 
   // Compact available-player list for board view sidebar
   const boardAvailable = useMemo(() => {
@@ -390,6 +395,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const slots = leagueRosterPositions.filter((p) => SHOW_SLOTS.has(p));
     return assignRoster(slots, myPicks, playerById);
   }, [leagueRosterPositions, myPicks, playerById, draftMode]);
+
+  // Watchlist: remaining targets still on the board
+  const watchlistRemaining = useMemo(
+    () => Array.from(watchlist).filter((id) => !draftedIds.has(id)).length,
+    [watchlist, draftedIds]
+  );
 
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
@@ -500,6 +511,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setBoardFilter("ALL");
     setTeamNames({});
     setLeagueRosterPositions([]);
+    setWatchlist(new Set());
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
   }
@@ -933,7 +945,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }
 
   // ── Draft screen ──────────────────────────────────────────────────────────
-  const colSpan = isUserTurn ? 7 : 6;
+  const colSpan = isUserTurn ? 8 : 7;
 
   return (
     <div className="flex flex-col gap-4">
@@ -964,6 +976,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           </>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {watchlistRemaining > 0 && (
+            <span className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-400">
+              ★ {watchlistRemaining} target{watchlistRemaining !== 1 ? "s" : ""}
+            </span>
+          )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
             {(["players", "board"] as const).map((v) => (
               <button
@@ -1052,6 +1069,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               <table className="w-full text-sm">
                 <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                   <tr>
+                    <th className="w-8 px-2 py-2 text-center font-medium text-zinc-500">★</th>
                     <SortTh label="#" sk="rank" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-left" />
                     <th className="px-3 py-2 text-left font-medium text-zinc-500">Player</th>
                     <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
@@ -1062,14 +1080,36 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((p, i) => (
+                  {rows.map((p, i) => {
+                    const isWatched = watchlist.has(p.id);
+                    return (
                     <tr
                       key={p.id}
                       onClick={() => pickPlayer(p.id)}
                       className={`border-t border-zinc-800/60 transition ${
                         isUserTurn ? "cursor-pointer hover:bg-emerald-500/10" : "opacity-60"
-                      } ${i === 0 && isUserTurn ? "bg-emerald-500/5" : ""}`}
+                      } ${i === 0 && isUserTurn ? "bg-emerald-500/5" : ""} ${
+                        isWatched ? "bg-amber-500/5" : ""
+                      }`}
                     >
+                      <td className={`px-2 py-2 text-center ${isWatched ? "border-l-2 border-amber-400/40" : ""}`}>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setWatchlist((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(p.id)) next.delete(p.id);
+                              else next.add(p.id);
+                              return next;
+                            });
+                          }}
+                          className={`text-base leading-none transition ${
+                            isWatched ? "text-amber-400" : "text-zinc-600 hover:text-amber-400"
+                          }`}
+                        >
+                          {isWatched ? "★" : "☆"}
+                        </button>
+                      </td>
                       <td className="px-3 py-2 text-zinc-500 tabular-nums">{p.overallRank}</td>
                       <td className="px-3 py-2">
                         <div className="font-medium text-zinc-100">{p.name}</div>
@@ -1115,7 +1155,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         </td>
                       )}
                     </tr>
-                  ))}
+                    );
+                  })}
                   {rows.length === 0 && (
                     <tr>
                       <td colSpan={colSpan} className="px-3 py-8 text-center text-zinc-500">
