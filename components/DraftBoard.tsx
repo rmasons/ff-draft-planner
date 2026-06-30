@@ -14,7 +14,7 @@ import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
 
 type Filter = "ALL" | Position;
-type SortKey = "rank" | "proj" | "vor" | "adp" | "value";
+type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1,   // asc: lower = better
@@ -22,7 +22,20 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   vor: -1,   // desc: more VOR = better
   adp: 1,    // asc: earlier ADP = higher consensus value
   value: -1, // desc: bigger steal = better
+  risk: -1,  // desc: higher risk first (surface the most dangerous picks)
 };
+
+function riskScore(p: Player): number {
+  let score = 1;
+  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
+  else if (p.injuryStatus === "Out") score += 5;
+  else if (p.injuryStatus === "Doubtful") score += 4;
+  else if (p.injuryStatus === "Questionable") score += 2;
+  if (p.injuryNotes?.includes("Surgery")) score += 2;
+  if (p.yearsExp === 0) score += 1;
+  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
+  return Math.min(score, 10);
+}
 
 const TIER_COLORS = [
   "#34d399", "#60a5fa", "#c084fc", "#fbbf24",
@@ -145,6 +158,8 @@ export default function DraftBoard() {
           if (vb === null) return -1;
           return (va - vb) * sortDir;
         }
+        case "risk":
+          return (riskScore(a) - riskScore(b)) * sortDir;
         default:
           return 0;
       }
@@ -307,6 +322,7 @@ export default function DraftBoard() {
                   <SortTh label="VOR" sk="vor" className="text-right" />
                   <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
                   <SortTh label="Value" sk="value" className="text-right" />
+                  <SortTh label="Risk" sk="risk" className="text-center" />
                   <th className="px-2 py-2 text-center font-medium text-zinc-500"></th>
                 </tr>
               </thead>
@@ -328,6 +344,7 @@ export default function DraftBoard() {
                     ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
                     : null;
                   const value = consensusAdp !== null ? Math.round(consensusAdp - p.overallRank) : null;
+                  const risk = riskScore(p);
                   return (
                     <Row
                       key={p.id}
@@ -336,6 +353,7 @@ export default function DraftBoard() {
                       adp={adpDisplay}
                       espnAdp={espnAdp}
                       value={value}
+                      risk={risk}
                       isDrafted={isDrafted}
                       tierBreak={tierBreak}
                       replBreak={replBreak}
@@ -345,7 +363,7 @@ export default function DraftBoard() {
                 })}
                 {rows.length === 0 && (
                   <tr>
-                    <td colSpan={9} className="px-3 py-8 text-center text-zinc-500">
+                    <td colSpan={10} className="px-3 py-8 text-center text-zinc-500">
                       No players match.
                     </td>
                   </tr>
@@ -372,6 +390,7 @@ function Row({
   adp,
   espnAdp,
   value,
+  risk,
   isDrafted,
   tierBreak,
   replBreak,
@@ -382,17 +401,20 @@ function Row({
   adp: number | null;
   espnAdp: number | null;
   value: number | null;
+  risk: number;
   isDrafted: boolean;
   tierBreak: boolean;
   replBreak: boolean;
   onToggle: () => void;
 }) {
+  const riskColor =
+    risk >= 7 ? "text-rose-400" : risk >= 4 ? "text-amber-400" : "text-emerald-400";
   return (
     <>
       {replBreak && (
         <tr>
           <td
-            colSpan={9}
+            colSpan={10}
             className="border-y border-dashed border-zinc-600 bg-zinc-800/40 px-3 py-1 text-center text-[11px] font-semibold uppercase tracking-widest text-zinc-400"
           >
             ▼ Replacement level · players below have negative VOR
@@ -402,7 +424,7 @@ function Row({
       {tierBreak && !replBreak && (
         <tr>
           <td
-            colSpan={9}
+            colSpan={10}
             className="border-l-2 px-3 py-1 text-xs font-semibold uppercase tracking-wide"
             style={{
               color: tierColor(p.tier),
@@ -495,6 +517,9 @@ function Row({
           }`}
         >
           {value === null ? "—" : value > 0 ? `+${value}` : String(value)}
+        </td>
+        <td className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
+          {risk}
         </td>
         <td className="px-2 py-2 text-center">
           <button
