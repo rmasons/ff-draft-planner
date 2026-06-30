@@ -26,7 +26,7 @@ interface Props {
   userSlot: number;
   currentPickNum: number;
   playerById: Map<string, RankedPlayer>;
-  draftMode: "cpu" | "manual";
+  draftMode: "cpu" | "manual" | "live";
   teamNames?: Record<number, string>;
 }
 
