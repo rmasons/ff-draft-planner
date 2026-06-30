@@ -320,7 +320,7 @@ export default function DraftBoard() {
                   <SortTh label="Proj" sk="proj" className="text-right" />
                   <SortTh label="VOR" sk="vor" className="text-right" />
                   <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
-                  <SortTh label="Value" sk="value" className="text-right" />
+                  <SortTh label="Val" sk="value" className="text-right" />
                   <SortTh label="Risk" sk="risk" className="text-center" />
                   <th className="px-2 py-2 text-center font-medium text-zinc-500"></th>
                 </tr>
@@ -349,7 +349,7 @@ export default function DraftBoard() {
                   const consensusAdp = adpSources.length > 0
                     ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
                     : null;
-                  const value = consensusAdp !== null ? Math.round(consensusAdp - p.overallRank) : null;
+                  const value = consensusAdp !== null ? consensusAdp - p.overallRank : null;
                   const risk = riskScore(p);
                   return (
                     <Row
@@ -505,19 +505,21 @@ function Row({
         <td
           className={`px-3 py-2 text-right tabular-nums font-medium ${
             value === null
-              ? "text-zinc-600"
-              : value >= 10
+              ? "text-zinc-700"
+              : value > 1
               ? "text-emerald-400"
-              : value >= 1
-              ? "text-emerald-500/70"
-              : value <= -10
+              : value < -1
               ? "text-rose-400"
-              : value <= -1
-              ? "text-rose-500/70"
               : "text-zinc-500"
           }`}
         >
-          {value === null ? "—" : value > 0 ? `+${value}` : String(value)}
+          {value === null
+            ? "—"
+            : value > 1
+            ? `+${value.toFixed(1)}`
+            : value < -1
+            ? value.toFixed(1)
+            : "~0"}
         </td>
         <td className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
           {risk}
