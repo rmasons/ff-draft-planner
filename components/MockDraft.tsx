@@ -13,7 +13,6 @@ interface MockPick {
   pickNumber: number;
   teamSlot: number;
   playerId: string;
-  // Fallback display info for players not found in our ranked list (e.g. from Sleeper import)
   playerName?: string;
   playerPos?: string;
   isKeeper?: boolean;
@@ -25,6 +24,12 @@ interface TradedPick {
   currentSlot: number;
 }
 
+interface PendingKeeper {
+  playerId: string;
+  teamSlot: number;
+  round: number;
+}
+
 interface SleeperDraft {
   type: string;
   sport: string;
@@ -34,15 +39,19 @@ interface SleeperDraft {
   slot_to_roster_id?: Record<string, number> | null;
 }
 
+interface SleeperPick {
+  pick_no: number;
+  draft_slot: number;
+  player_id: string;
+  is_keeper: true | null;
+  metadata?: { first_name?: string; last_name?: string; position?: string };
+}
+
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value";
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
-  rank: 1,
-  proj: -1,
-  vor: -1,
-  adp: 1,
-  value: -1,
+  rank: 1, proj: -1, vor: -1, adp: 1, value: -1,
 };
 
 const POS_BADGE: Record<Position, string> = {
@@ -55,6 +64,7 @@ const POS_BADGE: Record<Position, string> = {
 };
 
 const UNKNOWN_BADGE = "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
+const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 
 function teamSlotForPick(pickNum: number, numTeams: number): number {
   const round = Math.ceil(pickNum / numTeams);
@@ -62,20 +72,17 @@ function teamSlotForPick(pickNum: number, numTeams: number): number {
   return round % 2 === 1 ? pos : numTeams + 1 - pos;
 }
 
+// Also used in DraftBoardGrid; kept here for keeper pick-number computation
+function pickNumForCell(round: number, slot: number, numTeams: number): number {
+  const base = (round - 1) * numTeams;
+  return round % 2 === 1 ? base + slot : base + (numTeams + 1 - slot);
+}
+
 function SortTh({
-  label,
-  sk,
-  sortKey,
-  sortDir,
-  onSort,
-  className,
+  label, sk, sortKey, sortDir, onSort, className,
 }: {
-  label: string;
-  sk: SortKey;
-  sortKey: SortKey;
-  sortDir: 1 | -1;
-  onSort: (k: SortKey) => void;
-  className?: string;
+  label: string; sk: SortKey; sortKey: SortKey; sortDir: 1 | -1;
+  onSort: (k: SortKey) => void; className?: string;
 }) {
   const active = sortKey === sk;
   return (
@@ -87,11 +94,7 @@ function SortTh({
     >
       {label}
       <span className="ml-0.5 text-[10px]">
-        {active ? (
-          sortDir === 1 ? " ↑" : " ↓"
-        ) : (
-          <span className="text-zinc-700"> ⇅</span>
-        )}
+        {active ? (sortDir === 1 ? " ↑" : " ↓") : <span className="text-zinc-700"> ⇅</span>}
       </span>
     </th>
   );
@@ -126,21 +129,48 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [importSummary, setImportSummary] = useState<string | null>(null);
   const [tradedPicks, setTradedPicks] = useState<TradedPick[]>([]);
 
-  // View mode (players table vs board grid)
-  const [viewMode, setViewMode] = useState<"players" | "board">("players");
+  // Keeper setup (for fresh mock drafts before start)
+  const [pendingKeepers, setPendingKeepers] = useState<PendingKeeper[]>([]);
+  const [keeperSearch, setKeeperSearch] = useState("");
+  const [keeperPlayerId, setKeeperPlayerId] = useState<string | null>(null);
+  const [keeperSlot, setKeeperSlot] = useState(1);
+  const [keeperRound, setKeeperRound] = useState(1);
 
+  // View and filter state
+  const [viewMode, setViewMode] = useState<"players" | "board">("players");
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
+  const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
 
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
 
+  // Report active state to parent (for tab-switch guard)
   useEffect(() => {
     onActiveChange?.(started || picks.length > 0);
   }, [started, picks.length, onActiveChange]);
 
+  // Restore import settings from sessionStorage on mount
+  useEffect(() => {
+    const raw = sessionStorage.getItem(DRAFT_SETUP_KEY);
+    if (!raw) return;
+    try {
+      const d = JSON.parse(raw);
+      if (d.draftId) setDraftId(d.draftId);
+      if (d.sleeperUsername) setSleeperUsername(d.sleeperUsername);
+      if (d.sleeperUserId) setSleeperUserId(d.sleeperUserId);
+      if (d.importedTeams) setImportedTeams(d.importedTeams);
+      if (d.importedRounds) setImportedRounds(d.importedRounds);
+      if (d.picks?.length) setPicks(d.picks);
+      if (d.userSlot) setUserSlot(d.userSlot);
+      if (d.tradedPicks?.length) setTradedPicks(d.tradedPicks);
+      if (d.importSummary) setImportSummary(d.importSummary);
+    } catch { /* ignore malformed storage */ }
+  }, []);
+
+  // Fetch player projections
   useEffect(() => {
     let cancelled = false;
     fetch("/api/players")
@@ -151,9 +181,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         else setPlayers(d.players);
       })
       .catch((e) => !cancelled && setError(String(e)));
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   const ranked = useMemo(() => {
@@ -161,38 +189,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return rankPlayers(players, scoring, roster, method).players;
   }, [players, scoring, roster, method]);
 
-  // Imported values override roster config for draft simulation
   const numTeams = importedTeams ?? roster.teams;
   const numRounds =
     importedRounds ??
-    Math.max(
-      10,
-      roster.qb +
-        roster.rb +
-        roster.wr +
-        roster.te +
-        roster.flex +
-        roster.superflex +
-        roster.bench +
-        2
-    );
+    Math.max(10, roster.qb + roster.rb + roster.wr + roster.te + roster.flex + roster.superflex + roster.bench + 2);
   const adpKey = adpKeyFor(scoring, roster);
 
-  const currentPickNum = picks.length + 1;
-  const isDone = picks.length >= numTeams * numRounds;
-  const currentRound = isDone
-    ? numRounds
-    : Math.ceil(currentPickNum / numTeams);
-  const currentTeamSlot = isDone
-    ? null
-    : teamSlotForPick(currentPickNum, numTeams);
-  const isUserTurn =
-    !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
+  // Which pick numbers are already filled (supports non-sequential keeper picks)
+  const pickedNums = useMemo(() => new Set(picks.map((p) => p.pickNumber)), [picks]);
 
-  const draftedIds = useMemo(
-    () => new Set(picks.map((p) => p.playerId)),
-    [picks]
-  );
+  // Next unfilled pick slot
+  const currentPickNum = useMemo(() => {
+    for (let n = 1; n <= numTeams * numRounds; n++) {
+      if (!pickedNums.has(n)) return n;
+    }
+    return numTeams * numRounds + 1;
+  }, [pickedNums, numTeams, numRounds]);
+
+  const isDone = currentPickNum > numTeams * numRounds;
+  const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
+  const currentTeamSlot = isDone ? null : teamSlotForPick(currentPickNum, numTeams);
+  const isUserTurn = !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
+
+  const draftedIds = useMemo(() => new Set(picks.map((p) => p.playerId)), [picks]);
 
   const playerById = useMemo(() => {
     const m = new Map<string, RankedPlayer>();
@@ -206,19 +225,14 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (query.trim()) {
       const q = query.toLowerCase();
       list = list.filter(
-        (p) =>
-          p.name.toLowerCase().includes(q) ||
-          (p.team ?? "").toLowerCase().includes(q)
+        (p) => p.name.toLowerCase().includes(q) || (p.team ?? "").toLowerCase().includes(q)
       );
     }
     return [...list].sort((a, b) => {
       switch (sortKey) {
-        case "rank":
-          return (a.overallRank - b.overallRank) * sortDir;
-        case "proj":
-          return (a.points - b.points) * sortDir;
-        case "vor":
-          return (a.vbd - b.vbd) * sortDir;
+        case "rank": return (a.overallRank - b.overallRank) * sortDir;
+        case "proj": return (a.points - b.points) * sortDir;
+        case "vor": return (a.vbd - b.vbd) * sortDir;
         case "adp": {
           const va = a.adp[adpKey] >= 999 ? null : a.adp[adpKey];
           const vb = b.adp[adpKey] >= 999 ? null : b.adp[adpKey];
@@ -235,51 +249,95 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             if (!srcs.length) return null;
             return srcs.reduce((a, b) => a + b, 0) / srcs.length - p.overallRank;
           };
-          const va = val(a);
-          const vb = val(b);
+          const va = val(a), vb = val(b);
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
           return (va - vb) * sortDir;
         }
-        default:
-          return 0;
+        default: return 0;
       }
     });
   }, [ranked, draftedIds, filter, query, sortKey, sortDir, adpKey]);
 
-  // CPU auto-pick: fires whenever it's not the user's turn (cpu mode only)
+  // Compact available-player list for board view sidebar
+  const boardAvailable = useMemo(() => {
+    let list = ranked.filter((p) => !draftedIds.has(p.id));
+    if (boardFilter !== "ALL") list = list.filter((p) => p.position === boardFilter);
+    return list;
+  }, [ranked, draftedIds, boardFilter]);
+
+  const myPicks = useMemo(
+    () => (draftMode === "cpu" ? picks.filter((p) => p.teamSlot === userSlot) : picks),
+    [picks, draftMode, userSlot]
+  );
+  const myPlayers = useMemo(
+    () => myPicks.map((pick) => ({ player: playerById.get(pick.playerId), pick })),
+    [myPicks, playerById]
+  );
+
+  // Keeper search results (setup screen only)
+  const keeperSearchResults = useMemo(() => {
+    if (!keeperSearch.trim() || keeperPlayerId) return [] as RankedPlayer[];
+    const q = keeperSearch.toLowerCase();
+    return ranked
+      .filter(
+        (p) =>
+          !pendingKeepers.some((k) => k.playerId === p.id) &&
+          (p.name.toLowerCase().includes(q) || (p.team ?? "").toLowerCase().includes(q))
+      )
+      .slice(0, 8);
+  }, [ranked, keeperSearch, keeperPlayerId, pendingKeepers]);
+
+  // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
-    if (
-      !started ||
-      draftMode !== "cpu" ||
-      isUserTurn ||
-      isDone ||
-      ranked.length === 0
-    )
-      return;
+    if (!started || draftMode !== "cpu" || isUserTurn || isDone || ranked.length === 0) return;
     const timer = setTimeout(() => {
-      const best = ranked.find((p) => !draftedIds.has(p.id));
-      if (best && currentTeamSlot !== null) {
+      const available = ranked.filter((p) => !draftedIds.has(p.id));
+      if (available.length === 0 || currentTeamSlot === null) return;
+
+      // Build position counts for the team currently on the clock
+      const posCount: Record<string, number> = { QB: 0, RB: 0, WR: 0, TE: 0 };
+      for (const cp of picks) {
+        if (cp.teamSlot !== currentTeamSlot) continue;
+        const pos = playerById.get(cp.playerId)?.position ?? cp.playerPos;
+        if (pos && pos in posCount) posCount[pos]++;
+      }
+
+      const isSuperFlex = roster.superflex > 0;
+
+      const best = available
+        .map((p) => {
+          const adpVal = p.adp[adpKey] < 999 ? p.adp[adpKey] : p.overallRank + 100;
+          const jitter = (Math.random() - 0.5) * 8; // ±4 pick variance
+          let need = 0;
+          if (p.position === "QB") {
+            if (isSuperFlex && posCount.QB === 0) need = -20;
+            else if (!isSuperFlex && posCount.QB === 0 && currentRound >= 7) need = -15;
+            else if (posCount.QB >= 1) need = 30;
+          } else if (p.position === "RB" && posCount.RB < 2) {
+            need = -5;
+          } else if (p.position === "WR" && posCount.WR < 2) {
+            need = -5;
+          } else if (p.position === "TE") {
+            if (posCount.TE === 0 && currentRound >= 6) need = -10;
+            else if (posCount.TE >= 1) need = 20;
+          }
+          return { p, score: adpVal + jitter + need };
+        })
+        .sort((a, b) => a.score - b.score)[0]?.p;
+
+      if (best) {
         setPicks((prev) => [
           ...prev,
-          {
-            pickNumber: prev.length + 1,
-            teamSlot: currentTeamSlot,
-            playerId: best.id,
-          },
+          { pickNumber: currentPickNum, teamSlot: currentTeamSlot, playerId: best.id },
         ]);
       }
     }, 150);
     return () => clearTimeout(timer);
   }, [
-    started,
-    draftMode,
-    isUserTurn,
-    isDone,
-    ranked,
-    draftedIds,
-    currentTeamSlot,
+    started, draftMode, isUserTurn, isDone, ranked, draftedIds,
+    currentTeamSlot, currentPickNum, currentRound, adpKey, playerById, picks, roster,
   ]);
 
   useEffect(() => {
@@ -288,10 +346,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1));
-    else {
-      setSortKey(key);
-      setSortDir(SORT_DEFAULTS[key]);
-    }
+    else { setSortKey(key); setSortDir(SORT_DEFAULTS[key]); }
   }
 
   function pickPlayer(playerId: string) {
@@ -299,11 +354,30 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (pickingRef.current) return;
     pickingRef.current = true;
     const teamSlot = draftMode === "manual" ? currentTeamSlot : userSlot;
-    setPicks((prev) => [
-      ...prev,
-      { pickNumber: prev.length + 1, teamSlot, playerId },
-    ]);
+    const pickNum = currentPickNum;
+    setPicks((prev) => [...prev, { pickNumber: pickNum, teamSlot, playerId }]);
     requestAnimationFrame(() => { pickingRef.current = false; });
+  }
+
+  function startDraft() {
+    // Pre-populate keeper picks for fresh drafts (no import)
+    if (pendingKeepers.length > 0 && picks.length === 0) {
+      const keeperPicks: MockPick[] = pendingKeepers
+        .map((k) => {
+          const player = playerById.get(k.playerId);
+          return {
+            pickNumber: pickNumForCell(k.round, k.teamSlot, numTeams),
+            teamSlot: k.teamSlot,
+            playerId: k.playerId,
+            playerName: player?.name,
+            playerPos: player?.position,
+            isKeeper: true as const,
+          };
+        })
+        .sort((a, b) => a.pickNumber - b.pickNumber);
+      setPicks(keeperPicks);
+    }
+    setStarted(true);
   }
 
   function resetDraft() {
@@ -323,6 +397,22 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setSleeperUserId(null);
     setUserDrafts([]);
     setUserLookupError(null);
+    setPendingKeepers([]);
+    setBoardFilter("ALL");
+    sessionStorage.removeItem(DRAFT_SETUP_KEY);
+  }
+
+  function addKeeper() {
+    if (!keeperPlayerId) return;
+    const pickNum = pickNumForCell(keeperRound, keeperSlot, numTeams);
+    if (pendingKeepers.some((k) => pickNumForCell(k.round, k.teamSlot, numTeams) === pickNum)) return;
+    if (pendingKeepers.some((k) => k.playerId === keeperPlayerId)) return;
+    setPendingKeepers((prev) => [
+      ...prev,
+      { playerId: keeperPlayerId, teamSlot: keeperSlot, round: keeperRound },
+    ]);
+    setKeeperSearch("");
+    setKeeperPlayerId(null);
   }
 
   async function handleLookupUser() {
@@ -333,28 +423,19 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setUserDrafts([]);
     setSleeperUserId(null);
     try {
-      const userRes = await fetch(
-        `https://api.sleeper.app/v1/user/${encodeURIComponent(uname)}`
-      );
+      const userRes = await fetch(`https://api.sleeper.app/v1/user/${encodeURIComponent(uname)}`);
       if (!userRes.ok) throw new Error(`User "${uname}" not found on Sleeper`);
       const user = await userRes.json();
       if (!user?.user_id) throw new Error(`User "${uname}" not found on Sleeper`);
       const userId: string = user.user_id;
 
-      // Try current season, fall back to prior
       let draftsData: SleeperDraft[] | null = null;
       let season = SEASON;
       for (const s of [SEASON, String(Number(SEASON) - 1)]) {
-        const r = await fetch(
-          `https://api.sleeper.app/v1/user/${userId}/drafts/nfl/${s}`
-        );
+        const r = await fetch(`https://api.sleeper.app/v1/user/${userId}/drafts/nfl/${s}`);
         if (r.ok) {
           const d = await r.json();
-          if (Array.isArray(d) && d.length > 0) {
-            draftsData = d;
-            season = s;
-            break;
-          }
+          if (Array.isArray(d) && d.length > 0) { draftsData = d; season = s; break; }
         }
       }
 
@@ -362,9 +443,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         throw new Error(`No NFL drafts found for "${uname}" in ${SEASON} or ${Number(SEASON) - 1}`);
       }
 
-      const snakeDrafts = (draftsData as (SleeperDraft & { draft_id: string; settings?: { teams?: number; rounds?: number } })[]).filter(
-        (d) => d.type === "snake" && d.sport === "nfl"
-      );
+      const snakeDrafts = (
+        draftsData as (SleeperDraft & { draft_id: string })[]
+      ).filter((d) => d.type === "snake" && d.sport === "nfl");
 
       if (snakeDrafts.length === 0) {
         throw new Error(`No snake NFL drafts found for "${uname}" in ${season}`);
@@ -377,11 +458,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
       setSleeperUserId(userId);
       setUserDrafts(draftList);
-
-      // Auto-fill if only one draft
-      if (draftList.length === 1) {
-        setDraftId(draftList[0].draft_id);
-      }
+      if (draftList.length === 1) setDraftId(draftList[0].draft_id);
     } catch (e) {
       setUserLookupError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -408,12 +485,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const sleeperPicks: SleeperPick[] = await picksRes.json();
       const rawTradedPicks = tradedRes.ok ? await tradedRes.json() : [];
 
-      if (draft.type !== "snake") {
-        throw new Error(`Only snake drafts are supported (got "${draft.type}")`);
-      }
-      if (draft.sport !== "nfl") {
-        throw new Error(`Only NFL drafts are supported`);
-      }
+      if (draft.type !== "snake") throw new Error(`Only snake drafts are supported (got "${draft.type}")`);
+      if (draft.sport !== "nfl") throw new Error(`Only NFL drafts are supported`);
 
       const teams: number = draft.settings?.teams ?? 12;
       const rounds: number = draft.settings?.rounds ?? 15;
@@ -430,55 +503,61 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         isKeeper: sp.is_keeper === true,
       }));
 
-      setImportedTeams(teams);
-      setImportedRounds(rounds);
-      setPicks(imported);
-
-      // Auto-detect user's draft slot from draft_order
+      // Determine user slot from draft_order
+      let newUserSlot = userSlot;
       if (sleeperUserId && draft.draft_order) {
         const slot = draft.draft_order[sleeperUserId];
-        if (typeof slot === "number") setUserSlot(slot);
+        if (typeof slot === "number") newUserSlot = slot;
       }
 
-      // Parse traded picks: convert roster_id → draft slot via inverted slot_to_roster_id
+      // Parse traded picks
+      let parsedTradedPicks: TradedPick[] = [];
       let tradedPickNote = "";
       if (Array.isArray(rawTradedPicks) && rawTradedPicks.length > 0) {
         const slotToRoster = draft.slot_to_roster_id;
         if (!slotToRoster) {
-          // Draft slot assignments not yet set; can't resolve traded picks
           tradedPickNote = " · traded picks unavailable (draft not fully configured)";
-          setTradedPicks([]);
         } else {
-          // Invert: roster_id → slot (number)
           const rosterToSlot = new Map<number, number>();
           for (const [slotStr, rosterId] of Object.entries(slotToRoster)) {
             rosterToSlot.set(rosterId as number, Number(slotStr));
           }
-
-          const parsed: TradedPick[] = [];
           for (const tp of rawTradedPicks) {
             const origSlot = rosterToSlot.get(tp.roster_id);
             const currSlot = rosterToSlot.get(tp.owner_id);
             if (origSlot && currSlot && tp.round) {
-              parsed.push({ round: tp.round, originalSlot: origSlot, currentSlot: currSlot });
+              parsedTradedPicks.push({ round: tp.round, originalSlot: origSlot, currentSlot: currSlot });
             }
           }
-          setTradedPicks(parsed);
         }
-      } else {
-        setTradedPicks([]);
       }
 
       const keeperCount = imported.filter((p) => p.isKeeper).length;
-      const statusLabel =
-        draft.status === "complete"
-          ? "complete"
-          : draft.status === "drafting"
-          ? "in progress"
-          : "pre-draft";
+      const statusLabel = draft.status === "complete" ? "complete" : draft.status === "drafting" ? "in progress" : "pre-draft";
       const keeperNote = keeperCount > 0 ? ` · ${keeperCount} keepers` : "";
-      setImportSummary(
-        `Imported ${imported.length} picks from a ${teams}-team ${rounds}-round draft (${statusLabel}${keeperNote})${tradedPickNote}`
+      const summary = `Imported ${imported.length} picks from a ${teams}-team ${rounds}-round draft (${statusLabel}${keeperNote})${tradedPickNote}`;
+
+      setImportedTeams(teams);
+      setImportedRounds(rounds);
+      setPicks(imported);
+      setUserSlot(newUserSlot);
+      setTradedPicks(parsedTradedPicks);
+      setImportSummary(summary);
+
+      // Persist so tab switches don't lose the setup
+      sessionStorage.setItem(
+        DRAFT_SETUP_KEY,
+        JSON.stringify({
+          draftId: id,
+          sleeperUsername,
+          sleeperUserId,
+          importedTeams: teams,
+          importedRounds: rounds,
+          picks: imported,
+          userSlot: newUserSlot,
+          tradedPicks: parsedTradedPicks,
+          importSummary: summary,
+        })
       );
     } catch (e) {
       setImportError(e instanceof Error ? e.message : String(e));
@@ -487,45 +566,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     }
   }
 
-  const myPicks =
-    draftMode === "cpu" ? picks.filter((p) => p.teamSlot === userSlot) : picks;
-  const myPlayers = myPicks.map((pick) => ({
-    player: playerById.get(pick.playerId),
-    pick,
-  }));
-
   // ── Setup screen ──────────────────────────────────────────────────────────
   if (!started) {
-    const effectiveTeams = importedTeams ?? roster.teams;
-    const effectiveRounds = importedRounds ?? numRounds;
+    const importedKeepers = picks.filter((p) => p.isKeeper);
+    const slotOptions = Array.from({ length: numTeams }, (_, i) => i + 1);
+    const roundOptions = Array.from({ length: numRounds }, (_, i) => i + 1);
 
     return (
       <div className="flex items-start justify-center py-12">
         <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950/80 p-6">
-          <h2 className="mb-1 text-lg font-semibold text-zinc-100">
-            Mock Draft Setup
-          </h2>
+          <h2 className="mb-1 text-lg font-semibold text-zinc-100">Mock Draft Setup</h2>
           <p className="mb-6 text-sm text-zinc-500">
-            {effectiveTeams} teams · {effectiveRounds} rounds · snake order
+            {numTeams} teams · {numRounds} rounds · snake order
           </p>
 
-          {!players && !error && (
-            <p className="mb-4 text-sm text-zinc-500">Loading player data…</p>
-          )}
-          {error && (
-            <p className="mb-4 text-sm text-rose-400">
-              Failed to load players: {error}
-            </p>
-          )}
+          {!players && !error && <p className="mb-4 text-sm text-zinc-500">Loading player data…</p>}
+          {error && <p className="mb-4 text-sm text-rose-400">Failed to load players: {error}</p>}
 
           {/* Sleeper import */}
           <div className="mb-5">
             <label className="mb-1.5 block text-sm font-medium text-zinc-400">
-              Import from Sleeper{" "}
-              <span className="font-normal text-zinc-600">(optional)</span>
+              Import from Sleeper <span className="font-normal text-zinc-600">(optional)</span>
             </label>
 
-            {/* Username lookup */}
             <div className="mb-2 flex gap-2">
               <input
                 placeholder="Sleeper username"
@@ -542,11 +605,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 {lookingUpUser ? "…" : "Find"}
               </button>
             </div>
-            {userLookupError && (
-              <p className="mb-1.5 text-xs text-rose-400">{userLookupError}</p>
-            )}
+            {userLookupError && <p className="mb-1.5 text-xs text-rose-400">{userLookupError}</p>}
 
-            {/* Draft picker (shown after username lookup) */}
             {userDrafts.length > 1 && (
               <div className="mb-2">
                 <select
@@ -556,15 +616,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 >
                   <option value="">Select a draft…</option>
                   {userDrafts.map((d) => (
-                    <option key={d.draft_id} value={d.draft_id}>
-                      {d.label}
-                    </option>
+                    <option key={d.draft_id} value={d.draft_id}>{d.label}</option>
                   ))}
                 </select>
               </div>
             )}
 
-            {/* Manual draft ID (shown when no username or as fallback) */}
             {userDrafts.length === 0 && (
               <div className="mb-2 flex gap-2">
                 <input
@@ -584,30 +641,121 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             >
               {importing ? "Importing…" : "Import Draft"}
             </button>
-            {importError && (
-              <p className="mt-1.5 text-xs text-rose-400">{importError}</p>
-            )}
-            {importSummary && (
-              <p className="mt-1.5 text-xs text-emerald-400">{importSummary}</p>
-            )}
+            {importError && <p className="mt-1.5 text-xs text-rose-400">{importError}</p>}
+            {importSummary && <p className="mt-1.5 text-xs text-emerald-400">{importSummary}</p>}
             <p className="mt-1.5 text-xs text-zinc-600">
               Enter your Sleeper username to find drafts, or paste a draft ID directly.
             </p>
           </div>
 
+          {/* Keepers */}
           <div className="mb-4">
             <label className="mb-1.5 block text-sm font-medium text-zinc-400">
-              Draft mode
+              Keepers <span className="font-normal text-zinc-600">(optional)</span>
             </label>
+
+            {/* Imported keepers from Sleeper (read-only) */}
+            {importedKeepers.length > 0 ? (
+              <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-2">
+                <p className="mb-1.5 text-xs text-zinc-500">{importedKeepers.length} keeper{importedKeepers.length !== 1 ? "s" : ""} from Sleeper import</p>
+                <div className="space-y-0.5">
+                  {importedKeepers.map((k) => {
+                    const rd = Math.ceil(k.pickNumber / numTeams);
+                    const player = playerById.get(k.playerId);
+                    return (
+                      <div key={k.pickNumber} className="flex items-center gap-2 text-xs">
+                        <span className="shrink-0 text-zinc-600">Rd {rd} · T{k.teamSlot}</span>
+                        <span className="truncate text-zinc-300">{player?.name ?? k.playerName ?? k.playerId}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              /* Manual keeper entry (fresh drafts) */
+              <div>
+                {pendingKeepers.length > 0 && (
+                  <div className="mb-2 space-y-1">
+                    {pendingKeepers.map((k, i) => {
+                      const player = playerById.get(k.playerId);
+                      const pickNum = pickNumForCell(k.round, k.teamSlot, numTeams);
+                      return (
+                        <div key={i} className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/50 px-3 py-1.5 text-xs">
+                          <span className="shrink-0 text-zinc-500">Rd {k.round} · T{k.teamSlot} · #{pickNum}</span>
+                          <span className="min-w-0 flex-1 truncate text-zinc-200">{player?.name ?? k.playerId}</span>
+                          <button
+                            onClick={() => setPendingKeepers((prev) => prev.filter((_, j) => j !== i))}
+                            className="shrink-0 text-zinc-600 hover:text-zinc-400"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="relative">
+                  <div className="flex gap-1.5">
+                    <input
+                      placeholder="Search player…"
+                      value={keeperSearch}
+                      onChange={(e) => { setKeeperSearch(e.target.value); setKeeperPlayerId(null); }}
+                      className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none"
+                    />
+                    <select
+                      value={keeperSlot}
+                      onChange={(e) => setKeeperSlot(Number(e.target.value))}
+                      className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                    >
+                      {slotOptions.map((n) => <option key={n} value={n}>T{n}</option>)}
+                    </select>
+                    <select
+                      value={keeperRound}
+                      onChange={(e) => setKeeperRound(Number(e.target.value))}
+                      className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                    >
+                      {roundOptions.map((n) => <option key={n} value={n}>R{n}</option>)}
+                    </select>
+                    <button
+                      onClick={addKeeper}
+                      disabled={!keeperPlayerId}
+                      className="shrink-0 rounded-lg border border-zinc-700 px-3 py-2 text-sm text-zinc-300 transition hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40"
+                    >
+                      Add
+                    </button>
+                  </div>
+
+                  {keeperSearchResults.length > 0 && (
+                    <div className="absolute left-0 right-16 top-full z-10 mt-1 overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl">
+                      {keeperSearchResults.map((p) => (
+                        <button
+                          key={p.id}
+                          onClick={() => { setKeeperPlayerId(p.id); setKeeperSearch(p.name); }}
+                          className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-zinc-800"
+                        >
+                          <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[p.position]}`}>{p.position}</span>
+                          <span className="flex-1 truncate text-zinc-100">{p.name}</span>
+                          <span className="shrink-0 text-xs text-zinc-500">{p.team ?? "FA"}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Draft mode */}
+          <div className="mb-4">
+            <label className="mb-1.5 block text-sm font-medium text-zinc-400">Draft mode</label>
             <div className="flex rounded-lg border border-zinc-700 p-0.5">
               {(["cpu", "manual"] as const).map((m) => (
                 <button
                   key={m}
                   onClick={() => setDraftMode(m)}
                   className={`flex-1 rounded-md py-2 text-sm font-medium transition ${
-                    draftMode === m
-                      ? "bg-emerald-500 text-zinc-950"
-                      : "text-zinc-400 hover:text-zinc-100"
+                    draftMode === m ? "bg-emerald-500 text-zinc-950" : "text-zinc-400 hover:text-zinc-100"
                   }`}
                 >
                   {m === "cpu" ? "vs CPU" : "Manual (fill all picks)"}
@@ -618,37 +766,32 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
           {draftMode === "cpu" && (
             <div className="mb-6">
-              <label className="mb-1.5 block text-sm font-medium text-zinc-400">
-                Your draft slot
-              </label>
+              <label className="mb-1.5 block text-sm font-medium text-zinc-400">Your draft slot</label>
               <select
                 value={userSlot}
                 onChange={(e) => setUserSlot(Number(e.target.value))}
                 className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
               >
-                {Array.from({ length: effectiveTeams }, (_, i) => i + 1).map(
-                  (n) => (
-                    <option key={n} value={n}>
-                      Slot {n} of {effectiveTeams}
-                    </option>
-                  )
-                )}
+                {Array.from({ length: numTeams }, (_, i) => i + 1).map((n) => (
+                  <option key={n} value={n}>Slot {n} of {numTeams}</option>
+                ))}
               </select>
             </div>
           )}
 
           <p className="mb-4 text-xs text-zinc-600">
-            Scoring and roster settings are pulled from your Cheat Sheet
-            configuration.
+            Scoring and roster settings are pulled from your Cheat Sheet configuration.
           </p>
 
           <button
-            onClick={() => setStarted(true)}
+            onClick={startDraft}
             disabled={!players || players.length === 0}
             className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
           >
             {picks.length > 0
               ? `Continue Draft (${picks.length} picks already made)`
+              : pendingKeepers.length > 0
+              ? `Start Draft (${pendingKeepers.length} keeper${pendingKeepers.length !== 1 ? "s" : ""} set)`
               : "Start Mock Draft"}
           </button>
         </div>
@@ -672,41 +815,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         }`}
       >
         {isDone ? (
-          <span className="font-semibold text-zinc-300">
-            Draft complete — {numTeams * numRounds} picks made
-          </span>
+          <span className="font-semibold text-zinc-300">Draft complete — {numTeams * numRounds} picks made</span>
         ) : (
           <>
             <span className="text-sm text-zinc-500">
-              Round {currentRound} · Pick {currentPickNum} of{" "}
-              {numTeams * numRounds}
+              Round {currentRound} · Pick {currentPickNum} of {numTeams * numRounds}
             </span>
             {draftMode === "manual" ? (
-              <span className="font-semibold text-emerald-400">
-                Team {currentTeamSlot} — click a player to pick
-              </span>
+              <span className="font-semibold text-emerald-400">Team {currentTeamSlot} — click a player to pick</span>
             ) : isUserTurn ? (
-              <span className="font-semibold text-emerald-400">
-                ⚡ YOU&apos;RE ON THE CLOCK — click a player to draft
-              </span>
+              <span className="font-semibold text-emerald-400">⚡ YOU&apos;RE ON THE CLOCK — click a player to draft</span>
             ) : (
-              <span className="text-sm text-zinc-400">
-                Team {currentTeamSlot} picking…
-              </span>
+              <span className="text-sm text-zinc-400">Team {currentTeamSlot} picking…</span>
             )}
           </>
         )}
         <div className="ml-auto flex items-center gap-2">
-          {/* Players / Board toggle */}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
             {(["players", "board"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setViewMode(v)}
                 className={`rounded px-2.5 py-1 text-xs font-medium transition ${
-                  viewMode === v
-                    ? "bg-zinc-700 text-zinc-100"
-                    : "text-zinc-500 hover:text-zinc-300"
+                  viewMode === v ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300"
                 }`}
               >
                 {v === "players" ? "Players" : "Board"}
@@ -724,9 +855,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
       {/* Main layout */}
       <div className="flex gap-4">
-        {/* Board view */}
-        {viewMode === "board" && (
-          <div className="min-w-0 flex-1">
+        {/* Left: board or player table */}
+        {viewMode === "board" ? (
+          <div className="min-w-0 flex-1 overflow-x-auto">
             <DraftBoardGrid
               picks={picks}
               tradedPicks={tradedPicks}
@@ -738,274 +869,229 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               draftMode={draftMode}
             />
           </div>
+        ) : (
+          <div className="min-w-0 flex-1">
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <div className="flex rounded-lg border border-zinc-800 p-0.5">
+                {(["ALL", ...ALL_POSITIONS] as Filter[]).map((f) => (
+                  <button
+                    key={f}
+                    onClick={() => setFilter(f)}
+                    className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                      filter === f ? "bg-emerald-500 text-zinc-950" : "text-zinc-400 hover:text-zinc-100"
+                    }`}
+                  >
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <input
+                placeholder="Search player or team…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="min-w-40 flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <div className="overflow-hidden rounded-xl border border-zinc-800">
+              <table className="w-full text-sm">
+                <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
+                  <tr>
+                    <SortTh label="#" sk="rank" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-left" />
+                    <th className="px-3 py-2 text-left font-medium text-zinc-500">Player</th>
+                    <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
+                    <SortTh label="Proj" sk="proj" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                    <SortTh label="VOR" sk="vor" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                    <SortTh label="ADP" sk="adp" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                    {isUserTurn && <th className="px-2 py-2 text-center font-medium text-zinc-500">Pick</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((p, i) => (
+                    <tr
+                      key={p.id}
+                      onClick={() => pickPlayer(p.id)}
+                      className={`border-t border-zinc-800/60 transition ${
+                        isUserTurn ? "cursor-pointer hover:bg-emerald-500/10" : "opacity-60"
+                      } ${i === 0 && isUserTurn ? "bg-emerald-500/5" : ""}`}
+                    >
+                      <td className="px-3 py-2 text-zinc-500 tabular-nums">{p.overallRank}</td>
+                      <td className="px-3 py-2">
+                        <div className="font-medium text-zinc-100">{p.name}</div>
+                        <div className="text-xs text-zinc-500">
+                          {p.team ?? "FA"}
+                          {p.bye ? ` · Bye ${p.bye}` : ""}
+                          {p.injuryStatus ? <span className="ml-1 text-amber-500">{p.injuryStatus}</span> : null}
+                        </div>
+                      </td>
+                      <td className="px-2 py-2 text-center">
+                        <span className={`inline-block rounded border px-1.5 py-0.5 text-xs font-semibold ${POS_BADGE[p.position]}`}>
+                          {p.position}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-zinc-200">{p.points.toFixed(1)}</td>
+                      <td className={`px-3 py-2 text-right tabular-nums font-medium ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
+                        {p.vbd > 0 ? "+" : ""}{p.vbd.toFixed(1)}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums text-zinc-400">
+                        {p.adp[adpKey] < 999 ? p.adp[adpKey].toFixed(1) : "—"}
+                      </td>
+                      {isUserTurn && (
+                        <td className="px-2 py-2 text-center">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); pickPlayer(p.id); }}
+                            className="rounded-md border border-emerald-500/40 px-2 py-1 text-xs text-emerald-400 transition hover:bg-emerald-500/10"
+                          >
+                            Pick
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                  {rows.length === 0 && (
+                    <tr>
+                      <td colSpan={colSpan} className="px-3 py-8 text-center text-zinc-500">
+                        No players available.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         )}
 
-        {/* Available players table */}
-        {viewMode === "players" && <div className="min-w-0 flex-1">
-          <div className="mb-3 flex flex-wrap items-center gap-3">
-            <div className="flex rounded-lg border border-zinc-800 p-0.5">
-              {(["ALL", ...ALL_POSITIONS] as Filter[]).map((f) => (
-                <button
-                  key={f}
-                  onClick={() => setFilter(f)}
-                  className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                    filter === f
-                      ? "bg-emerald-500 text-zinc-950"
-                      : "text-zinc-400 hover:text-zinc-100"
-                  }`}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-            <input
-              placeholder="Search player or team…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              className="min-w-40 flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="overflow-hidden rounded-xl border border-zinc-800">
-            <table className="w-full text-sm">
-              <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
-                <tr>
-                  <SortTh
-                    label="#"
-                    sk="rank"
-                    sortKey={sortKey}
-                    sortDir={sortDir}
-                    onSort={handleSort}
-                    className="text-left"
-                  />
-                  <th className="px-3 py-2 text-left font-medium text-zinc-500">
-                    Player
-                  </th>
-                  <th className="px-2 py-2 text-center font-medium text-zinc-500">
-                    Pos
-                  </th>
-                  <SortTh
-                    label="Proj"
-                    sk="proj"
-                    sortKey={sortKey}
-                    sortDir={sortDir}
-                    onSort={handleSort}
-                    className="text-right"
-                  />
-                  <SortTh
-                    label="VOR"
-                    sk="vor"
-                    sortKey={sortKey}
-                    sortDir={sortDir}
-                    onSort={handleSort}
-                    className="text-right"
-                  />
-                  <SortTh
-                    label="ADP"
-                    sk="adp"
-                    sortKey={sortKey}
-                    sortDir={sortDir}
-                    onSort={handleSort}
-                    className="text-right"
-                  />
-                  {isUserTurn && (
-                    <th className="px-2 py-2 text-center font-medium text-zinc-500">
-                      Pick
-                    </th>
-                  )}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((p, i) => (
-                  <tr
+        {/* Right sidebar — content differs by view mode */}
+        {viewMode === "board" ? (
+          /* Board sidebar: compact available players + roster */
+          <div className="flex w-80 shrink-0 flex-col gap-3">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">Available</h3>
+                <div className="flex gap-0.5">
+                  {(["ALL", "QB", "RB", "WR", "TE", "K", "DEF"] as Filter[]).map((f) => (
+                    <button
+                      key={f}
+                      onClick={() => setBoardFilter(f)}
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition ${
+                        boardFilter === f ? "bg-zinc-700 text-zinc-100" : "text-zinc-600 hover:text-zinc-400"
+                      }`}
+                    >
+                      {f === "ALL" ? "All" : f}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="max-h-[520px] space-y-px overflow-y-auto">
+                {boardAvailable.slice(0, 50).map((p, i) => (
+                  <div
                     key={p.id}
                     onClick={() => pickPlayer(p.id)}
-                    className={`border-t border-zinc-800/60 transition ${
-                      isUserTurn
-                        ? "cursor-pointer hover:bg-emerald-500/10"
-                        : "opacity-60"
+                    className={`flex items-center gap-1.5 rounded px-2 py-1.5 text-xs transition ${
+                      isUserTurn ? "cursor-pointer hover:bg-emerald-500/10" : "pointer-events-none opacity-50"
                     } ${i === 0 && isUserTurn ? "bg-emerald-500/5" : ""}`}
                   >
-                    <td className="px-3 py-2 text-zinc-500 tabular-nums">
-                      {p.overallRank}
-                    </td>
-                    <td className="px-3 py-2">
-                      <div className="font-medium text-zinc-100">{p.name}</div>
-                      <div className="text-xs text-zinc-500">
-                        {p.team ?? "FA"}
-                        {p.bye ? ` · Bye ${p.bye}` : ""}
-                        {p.injuryStatus ? (
-                          <span className="ml-1 text-amber-500">
-                            {p.injuryStatus}
-                          </span>
-                        ) : null}
-                      </div>
-                    </td>
-                    <td className="px-2 py-2 text-center">
-                      <span
-                        className={`inline-block rounded border px-1.5 py-0.5 text-xs font-semibold ${POS_BADGE[p.position]}`}
-                      >
-                        {p.position}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 text-right tabular-nums text-zinc-200">
-                      {p.points.toFixed(1)}
-                    </td>
-                    <td
-                      className={`px-3 py-2 text-right tabular-nums font-medium ${
-                        p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"
-                      }`}
-                    >
-                      {p.vbd > 0 ? "+" : ""}
-                      {p.vbd.toFixed(1)}
-                    </td>
-                    <td className="px-3 py-2 text-right tabular-nums text-zinc-400">
-                      {p.adp[adpKey] < 999 ? p.adp[adpKey].toFixed(1) : "—"}
-                    </td>
-                    {isUserTurn && (
-                      <td className="px-2 py-2 text-center">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            pickPlayer(p.id);
-                          }}
-                          className="rounded-md border border-emerald-500/40 px-2 py-1 text-xs text-emerald-400 transition hover:bg-emerald-500/10"
-                        >
-                          Pick
-                        </button>
-                      </td>
-                    )}
-                  </tr>
+                    <span className="w-5 shrink-0 text-right tabular-nums text-zinc-600">{p.overallRank}</span>
+                    <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[p.position]}`}>
+                      {p.position}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-zinc-200">{p.name}</span>
+                    <span className={`shrink-0 tabular-nums text-[10px] ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
+                      {p.vbd > 0 ? "+" : ""}{p.vbd.toFixed(0)}
+                    </span>
+                  </div>
                 ))}
-                {rows.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={colSpan}
-                      className="px-3 py-8 text-center text-zinc-500"
-                    >
-                      No players available.
-                    </td>
-                  </tr>
+                {boardAvailable.length === 0 && (
+                  <p className="py-4 text-center text-xs text-zinc-600">No players.</p>
                 )}
-              </tbody>
-            </table>
-          </div>
-        </div>}
-
-        {/* Right sidebar */}
-        <div className="flex w-64 shrink-0 flex-col gap-4">
-          {/* Roster / picks panel */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
-              {draftMode === "cpu"
-                ? `Your Roster · Slot ${userSlot}`
-                : "All Picks"}
-            </h3>
-            {myPlayers.length === 0 ? (
-              <p className="text-xs text-zinc-600">No picks yet.</p>
-            ) : (
-              <div className="space-y-1">
-                {myPlayers.map(({ player, pick }, i) => {
-                  const pos = player?.position ?? pick.playerPos;
-                  const badgeClass =
-                    pos && pos in POS_BADGE
-                      ? POS_BADGE[pos as Position]
-                      : UNKNOWN_BADGE;
-                  return (
-                    <div
-                      key={pick.pickNumber}
-                      className="flex items-center gap-2 text-xs"
-                    >
-                      <span className="w-4 shrink-0 text-right text-zinc-600">
-                        {i + 1}.
-                      </span>
-                      {pos && (
-                        <span
-                          className={`shrink-0 rounded border px-1 py-0.5 text-[10px] font-semibold ${badgeClass}`}
-                        >
-                          {pos}
-                        </span>
-                      )}
-                      <span className="truncate text-zinc-200">
-                        {player?.name ?? pick.playerName ?? pick.playerId}
-                      </span>
-                    </div>
-                  );
-                })}
               </div>
-            )}
-          </div>
+            </div>
 
-          {/* Draft log */}
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
-              Draft Log
-            </h3>
-            <div ref={logRef} className="max-h-96 space-y-0.5 overflow-y-auto">
-              {picks.length === 0 ? (
+            {/* Compact roster in board view */}
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                {draftMode === "cpu" ? `Your Roster · Slot ${userSlot}` : "All Picks"}
+              </h3>
+              {myPlayers.length === 0 ? (
                 <p className="text-xs text-zinc-600">No picks yet.</p>
               ) : (
-                picks.map((pick) => {
-                  const player = playerById.get(pick.playerId);
-                  const isMe =
-                    draftMode === "cpu" && pick.teamSlot === userSlot;
-                  const pos = player?.position ?? pick.playerPos;
-                  const badgeClass =
-                    pos && pos in POS_BADGE
-                      ? POS_BADGE[pos as Position]
-                      : UNKNOWN_BADGE;
-                  return (
-                    <div
-                      key={pick.pickNumber}
-                      className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs ${
-                        isMe ? "bg-emerald-500/10" : ""
-                      }`}
-                    >
-                      <span className="w-5 shrink-0 text-right tabular-nums text-zinc-600">
-                        {pick.pickNumber}.
-                      </span>
-                      <span
-                        className={`shrink-0 ${
-                          isMe ? "font-medium text-emerald-400" : "text-zinc-500"
-                        }`}
-                      >
-                        {isMe ? "You" : `T${pick.teamSlot}`}
-                      </span>
-                      {pos && (
-                        <span
-                          className={`shrink-0 rounded border px-1 py-0.5 text-[9px] font-semibold ${badgeClass}`}
-                        >
-                          {pos}
-                        </span>
-                      )}
-                      <span
-                        className={`truncate ${
-                          isMe ? "text-zinc-200" : "text-zinc-400"
-                        }`}
-                      >
-                        {player?.name ?? pick.playerName ?? pick.playerId}
-                      </span>
-                    </div>
-                  );
-                })
+                <div className="space-y-1">
+                  {myPlayers.map(({ player, pick }, i) => {
+                    const pos = player?.position ?? pick.playerPos;
+                    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos as Position] : UNKNOWN_BADGE;
+                    return (
+                      <div key={pick.pickNumber} className="flex items-center gap-2 text-xs">
+                        <span className="w-4 shrink-0 text-right text-zinc-600">{i + 1}.</span>
+                        {pos && <span className={`shrink-0 rounded border px-1 py-0.5 text-[10px] font-semibold ${badgeClass}`}>{pos}</span>}
+                        <span className="truncate text-zinc-200">{player?.name ?? pick.playerName ?? pick.playerId}</span>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
-        </div>
+        ) : (
+          /* Players sidebar: roster + draft log */
+          <div className="flex w-64 shrink-0 flex-col gap-4">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                {draftMode === "cpu" ? `Your Roster · Slot ${userSlot}` : "All Picks"}
+              </h3>
+              {myPlayers.length === 0 ? (
+                <p className="text-xs text-zinc-600">No picks yet.</p>
+              ) : (
+                <div className="space-y-1">
+                  {myPlayers.map(({ player, pick }, i) => {
+                    const pos = player?.position ?? pick.playerPos;
+                    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos as Position] : UNKNOWN_BADGE;
+                    return (
+                      <div key={pick.pickNumber} className="flex items-center gap-2 text-xs">
+                        <span className="w-4 shrink-0 text-right text-zinc-600">{i + 1}.</span>
+                        {pos && <span className={`shrink-0 rounded border px-1 py-0.5 text-[10px] font-semibold ${badgeClass}`}>{pos}</span>}
+                        <span className="truncate text-zinc-200">{player?.name ?? pick.playerName ?? pick.playerId}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+              <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Draft Log</h3>
+              <div ref={logRef} className="max-h-96 space-y-0.5 overflow-y-auto">
+                {picks.length === 0 ? (
+                  <p className="text-xs text-zinc-600">No picks yet.</p>
+                ) : (
+                  picks.map((pick) => {
+                    const player = playerById.get(pick.playerId);
+                    const isMe = draftMode === "cpu" && pick.teamSlot === userSlot;
+                    const pos = player?.position ?? pick.playerPos;
+                    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos as Position] : UNKNOWN_BADGE;
+                    return (
+                      <div
+                        key={pick.pickNumber}
+                        className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs ${isMe ? "bg-emerald-500/10" : ""}`}
+                      >
+                        <span className="w-5 shrink-0 text-right tabular-nums text-zinc-600">{pick.pickNumber}.</span>
+                        <span className={`shrink-0 ${isMe ? "font-medium text-emerald-400" : "text-zinc-500"}`}>
+                          {isMe ? "You" : `T${pick.teamSlot}`}
+                        </span>
+                        {pos && (
+                          <span className={`shrink-0 rounded border px-1 py-0.5 text-[9px] font-semibold ${badgeClass}`}>{pos}</span>
+                        )}
+                        <span className={`truncate ${isMe ? "text-zinc-200" : "text-zinc-400"}`}>
+                          {player?.name ?? pick.playerName ?? pick.playerId}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
-}
-
-// Sleeper draft pick shape (only the fields we need)
-interface SleeperPick {
-  pick_no: number;
-  draft_slot: number;
-  player_id: string;
-  is_keeper: true | null;
-  metadata?: {
-    first_name?: string;
-    last_name?: string;
-    position?: string;
-  };
 }
