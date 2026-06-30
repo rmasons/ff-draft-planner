@@ -211,6 +211,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [keeperSlot, setKeeperSlot] = useState(1);
   const [keeperRound, setKeeperRound] = useState(1);
 
+  // Export / copy state
+  const [copiedRoster, setCopiedRoster] = useState(false);
+
   // View and filter state
   const [viewMode, setViewMode] = useState<"players" | "board">("players");
   const [filter, setFilter] = useState<Filter>("ALL");
@@ -558,6 +561,82 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setWatchlist(new Set());
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
+  }
+
+  function exportCsv() {
+    const header = "Pick,Round,Team,Player,Position,Team (NFL),Projected Points,VOR,Avg ADP,Value";
+    const escape = (s: string) =>
+      s.includes(",") || s.includes('"') || s.includes("\n")
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+
+    const sortedPicks = [...picks].sort((a, b) => a.pickNumber - b.pickNumber);
+    const csvRows = sortedPicks.map((pick) => {
+      const player = playerById.get(pick.playerId);
+      const round = Math.ceil(pick.pickNumber / numTeams);
+      const team = teamLabel(pick.teamSlot);
+      const playerName = player?.name ?? pick.playerName ?? pick.playerId;
+      const position = player?.position ?? pick.playerPos ?? "";
+      const nflTeam = player?.team ?? "";
+      const projPts = player ? player.points.toFixed(1) : "";
+      const vor = player
+        ? (player.vbd > 0 ? "+" : "") + player.vbd.toFixed(1)
+        : "";
+
+      let avgAdpStr = "";
+      let valueStr = "";
+      if (player) {
+        const sl = player.adp[adpKey] >= 999 ? null : player.adp[adpKey];
+        const es = player.adp.espn >= 999 ? null : player.adp.espn;
+        const srcs = [sl, es].filter((x): x is number => x !== null);
+        if (srcs.length > 0) {
+          const avg = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+          avgAdpStr = avg.toFixed(1);
+          const val = avg - player.overallRank;
+          valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
+        }
+      }
+
+      return [
+        pick.pickNumber,
+        round,
+        escape(team),
+        escape(playerName),
+        position,
+        escape(nflTeam),
+        projPts,
+        vor,
+        avgAdpStr,
+        valueStr,
+      ].join(",");
+    });
+
+    const csv = [header, ...csvRows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `mock-draft-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function copyRoster() {
+    const sortedMyPicks = [...myPicks].sort((a, b) => a.pickNumber - b.pickNumber);
+    const lines = ["Your Draft Results:"];
+    for (const pick of sortedMyPicks) {
+      const player = playerById.get(pick.playerId);
+      const name = player?.name ?? pick.playerName ?? pick.playerId;
+      const pos = player?.position ?? pick.playerPos ?? "?";
+      const round = Math.ceil(pick.pickNumber / numTeams);
+      lines.push(`Rd ${round} (Pk ${pick.pickNumber}): ${name} — ${pos}`);
+    }
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      setCopiedRoster(true);
+      setTimeout(() => setCopiedRoster(false), 2000);
+    });
   }
 
   function addKeeper() {
@@ -1152,6 +1231,22 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           </>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {isDone && (
+            <>
+              <button
+                onClick={exportCsv}
+                className="rounded-md border border-zinc-700 px-3 py-1 text-xs text-zinc-400 transition hover:text-zinc-200"
+              >
+                Export CSV
+              </button>
+              <button
+                onClick={copyRoster}
+                className="rounded-md border border-zinc-700 px-3 py-1 text-xs text-zinc-400 transition hover:text-zinc-200"
+              >
+                {copiedRoster ? "Copied!" : "Copy Roster"}
+              </button>
+            </>
+          )}
           {watchlistRemaining > 0 && (
             <span className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-400">
               ★ {watchlistRemaining} target{watchlistRemaining !== 1 ? "s" : ""}
