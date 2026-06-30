@@ -318,6 +318,7 @@ export default function DraftBoard() {
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Tier</th>
                   <SortTh label="Proj" sk="proj" className="text-right" />
+                  <th className="px-3 py-2 text-right font-medium text-zinc-500">2025</th>
                   <SortTh label="VOR" sk="vor" className="text-right" />
                   <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
                   <SortTh label="Val" sk="value" className="text-right" />
@@ -369,7 +370,7 @@ export default function DraftBoard() {
                 })}
                 {rows.length === 0 && (
                   <tr>
-                    <td colSpan={10} className="px-3 py-8 text-center text-zinc-500">
+                    <td colSpan={11} className="px-3 py-8 text-center text-zinc-500">
                       No players match.
                     </td>
                   </tr>
@@ -420,7 +421,7 @@ function Row({
       {replBreak && (
         <tr>
           <td
-            colSpan={10}
+            colSpan={11}
             className="border-y border-dashed border-zinc-600 bg-zinc-800/40 px-3 py-1 text-center text-[11px] font-semibold uppercase tracking-widest text-zinc-400"
           >
             ▼ Replacement level · players below have negative VOR
@@ -430,7 +431,7 @@ function Row({
       {tierBreak && !replBreak && (
         <tr>
           <td
-            colSpan={10}
+            colSpan={11}
             className="bg-zinc-950 px-3 py-0.5 text-[10px] uppercase tracking-widest text-zinc-700"
           >
             — {p.position} · Tier {p.tier} —
@@ -483,6 +484,11 @@ function Row({
         </td>
         <td className="px-3 py-2 text-right tabular-nums text-zinc-200">
           {p.points.toFixed(1)}
+        </td>
+        <td className="px-3 py-2 text-right tabular-nums">
+          {p.actualPts2025 != null
+            ? <span className="text-zinc-400">{p.actualPts2025.toFixed(1)}</span>
+            : <span className="text-zinc-600">—</span>}
         </td>
         <td
           className={`px-3 py-2 text-right tabular-nums font-medium ${

@@ -47,6 +47,7 @@ export interface Player {
   bye: number | null;
   stats: RawStats;
   adp: Adp;
+  actualPts2025: number | null; // PPR points scored in the 2025 regular season
 }
 
 /** Per-stat point values. Fully configurable. */

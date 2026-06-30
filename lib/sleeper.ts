@@ -92,6 +92,7 @@ function normalize(rec: SleeperRecord): Player | null {
       superflex: s.adp_2qb ?? 999,
       espn: 999, // filled in server-side by /api/players after ESPN fetch
     },
+    actualPts2025: null, // filled in server-side by /api/players after stats fetch
   };
 }
 
@@ -128,5 +129,52 @@ export async function fetchPlayers(): Promise<Player[]> {
   if (memo && now - memo.at < TTL_MS) return memo.data;
   const data = await fetchAndNormalize();
   memo = { at: now, data };
+  return data;
+}
+
+// ── 2025 season actuals ────────────────────────────────────────────────────────
+
+// One bulk request covering all fantasy positions. The stats response is the
+// same size class as projections (~3MB+), so it also exceeds Next's 2MB
+// fetch-cache limit — use cache:"no-store" + in-module memo.
+const STATS_2025_URL =
+  `https://api.sleeper.com/stats/nfl/2025` +
+  `?season_type=regular&order_by=pts_ppr` +
+  ALL_POSITIONS.map((p) => `&position[]=${p}`).join("");
+
+let statsMemo: { at: number; data: Map<string, number> } | null = null;
+
+/**
+ * Returns a map of player_id → 2025 PPR season total.
+ * Falls back to pts_std for positions that have no pts_ppr value.
+ */
+export async function fetch2025ActualPts(): Promise<Map<string, number>> {
+  const now = Date.now();
+  if (statsMemo && now - statsMemo.at < TTL_MS) return statsMemo.data;
+
+  const res = await fetch(STATS_2025_URL, {
+    cache: "no-store",
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Sleeper stats request failed: ${res.status} ${res.statusText}`
+    );
+  }
+
+  const records: Array<{
+    player_id: string;
+    stats: Record<string, number | undefined>;
+  }> = await res.json();
+
+  const data = new Map<string, number>();
+  for (const r of records) {
+    const pts = r.stats?.pts_ppr ?? r.stats?.pts_std;
+    if (typeof pts === "number" && pts > 0) {
+      data.set(r.player_id, pts);
+    }
+  }
+
+  statsMemo = { at: now, data };
   return data;
 }
