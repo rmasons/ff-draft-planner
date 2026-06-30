@@ -183,7 +183,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   const [picks, setPicks] = useState<MockPick[]>([]);
   const [userSlot, setUserSlot] = useState(1);
-  const [draftMode, setDraftMode] = useState<"cpu" | "manual">("cpu");
+  const [draftMode, setDraftMode] = useState<"cpu" | "manual" | "live">("cpu");
   const [started, setStarted] = useState(false);
 
   // Sleeper username lookup
@@ -219,6 +219,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
   const [watchlist, setWatchlist] = useState<Set<string>>(new Set());
+
+  // Live sync
+  const wsRef = useRef<WebSocket | null>(null);
+  const [wsStatus, setWsStatus] = useState<"idle" | "connecting" | "live" | "error" | "disconnected">("idle");
+  const [wsError, setWsError] = useState<string | null>(null);
 
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
@@ -305,7 +310,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
   const currentTeamSlot = isDone ? null : teamSlotForPick(currentPickNum, numTeams);
-  const isUserTurn = !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
+  // In live mode the user watches; no slot is ever "their turn"
+  const isUserTurn = draftMode !== "live" && !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
 
   const teamLabel = (slot: number) => teamNames[slot] || `T${slot}`;
 
@@ -473,6 +479,14 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [picks.length]);
 
+  // Clean up WebSocket on unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close(1000, "unmount");
+      wsRef.current = null;
+    };
+  }, []);
+
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1));
     else { setSortKey(key); setSortDir(SORT_DEFAULTS[key]); }
@@ -515,6 +529,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }
 
   function resetDraft() {
+    if (wsRef.current) {
+      wsRef.current.close(1000, "reset");
+      wsRef.current = null;
+    }
+    setWsStatus("idle");
+    setWsError(null);
     setPicks([]);
     setStarted(false);
     setFilter("ALL");
@@ -551,6 +571,115 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     ]);
     setKeeperSearch("");
     setKeeperPlayerId(null);
+  }
+
+  function connectLiveDraft() {
+    const id = draftId.trim();
+    if (!id) return;
+
+    // Close any stale connection
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    setWsStatus("connecting");
+    setWsError(null);
+
+    // TODO: WS protocol unverified — may need adjustment.
+    // Sleeper appears to use Phoenix channels (Elixir backend).
+    // The host prod.sleeper.app was found via community network inspection and
+    // may not resolve from all environments; try sleeper.app if it fails.
+    // The /websocket?vsn=2.0.0 suffix is the standard Phoenix transport path.
+    // If picks don't stream, the URL, an auth token in query params, or the
+    // event names below may need updating after inspecting Sleeper's network traffic.
+    const wsUrl = "wss://prod.sleeper.app/v1/ws/websocket?vsn=2.0.0";
+
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      setWsStatus("error");
+      setWsError(`Failed to open connection: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    wsRef.current = ws;
+    let hbTimer: ReturnType<typeof setInterval> | null = null;
+    let refCounter = 0;
+
+    ws.addEventListener("open", () => {
+      setWsStatus("live");
+
+      // TODO: WS protocol unverified — Phoenix phx_join message format assumed.
+      // Topic "draft:<id>" and empty payload {} may differ in Sleeper's implementation.
+      refCounter++;
+      ws.send(JSON.stringify([null, String(refCounter), `draft:${id}`, "phx_join", {}]));
+
+      // Phoenix heartbeat: server closes the connection after ~60s without one
+      hbTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          refCounter++;
+          ws.send(JSON.stringify([null, String(refCounter), "phoenix", "heartbeat", {}]));
+        }
+      }, 30_000);
+    });
+
+    ws.addEventListener("message", (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+
+        // TODO: WS protocol unverified — Phoenix v2 wire format assumed:
+        // [join_ref, ref, topic, event_name, payload]
+        if (!Array.isArray(msg) || msg.length < 5) return;
+        const [, , , eventName, payload] = msg as [unknown, unknown, unknown, string, Record<string, unknown>];
+
+        // TODO: WS protocol unverified — confirm the real event name(s).
+        // Common guesses based on Sleeper REST API naming:
+        // "pick_completed", "draft_pick", or simply "pick".
+        if (eventName === "pick_completed" || eventName === "draft_pick" || eventName === "pick") {
+          // TODO: WS protocol unverified — confirm pick nesting.
+          // The pick object may be in payload.pick or directly in payload.
+          const sp = (payload?.pick ?? (payload?.player_id ? payload : null)) as SleeperPick | null;
+          if (!sp || !sp.player_id || sp.pick_no == null) return;
+
+          const mockPick: MockPick = {
+            pickNumber: sp.pick_no,
+            teamSlot: sp.draft_slot,
+            playerId: sp.player_id,
+            playerName:
+              sp.metadata?.first_name && sp.metadata?.last_name
+                ? `${sp.metadata.first_name} ${sp.metadata.last_name}`
+                : sp.player_id,
+            playerPos: sp.metadata?.position ?? undefined,
+            isKeeper: sp.is_keeper === true,
+          };
+
+          setPicks((prev) => {
+            // Deduplicate by pick number so a reconnect-and-replay doesn't double-add
+            if (prev.some((p) => p.pickNumber === mockPick.pickNumber)) return prev;
+            return [...prev, mockPick].sort((a, b) => a.pickNumber - b.pickNumber);
+          });
+        }
+      } catch { /* ignore malformed messages */ }
+    });
+
+    ws.addEventListener("error", () => {
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+      setWsStatus("error");
+      setWsError("WebSocket error — the draft ID may be wrong, or the server requires auth");
+    });
+
+    ws.addEventListener("close", (ev) => {
+      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+      wsRef.current = null;
+      // Codes 1000/1001 = normal close; anything else = unexpected drop
+      setWsStatus(ev.code === 1000 || ev.code === 1001 ? "idle" : "disconnected");
+    });
+
+    // The draft screen mounts as soon as setStarted(true) fires;
+    // existing imported picks are preserved (dedup logic above handles overlap)
+    setStarted(true);
   }
 
   async function handleLookupUser() {
@@ -917,7 +1046,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           <div className="mb-4">
             <label className="mb-1.5 block text-sm font-medium text-zinc-400">Draft mode</label>
             <div className="flex rounded-lg border border-zinc-700 p-0.5">
-              {(["cpu", "manual"] as const).map((m) => (
+              {(["cpu", "manual", "live"] as const).map((m) => (
                 <button
                   key={m}
                   onClick={() => setDraftMode(m)}
@@ -925,10 +1054,15 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                     draftMode === m ? "bg-emerald-500 text-zinc-950" : "text-zinc-400 hover:text-zinc-100"
                   }`}
                 >
-                  {m === "cpu" ? "vs CPU" : "Manual (fill all picks)"}
+                  {m === "cpu" ? "vs CPU" : m === "manual" ? "Manual" : "Live Sync"}
                 </button>
               ))}
             </div>
+            {draftMode === "live" && (
+              <p className="mt-1.5 text-xs text-zinc-500">
+                Connects to a live Sleeper draft via WebSocket — read-only, picks stream in automatically.
+              </p>
+            )}
           </div>
 
           {draftMode === "cpu" && (
@@ -952,17 +1086,33 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             Scoring and roster settings are pulled from your Cheat Sheet configuration.
           </p>
 
-          <button
-            onClick={startDraft}
-            disabled={!players || players.length === 0}
-            className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
-          >
-            {picks.length > 0
-              ? `Continue Draft (${picks.length} picks already made)`
-              : pendingKeepers.length > 0
-              ? `Start Draft (${pendingKeepers.length} keeper${pendingKeepers.length !== 1 ? "s" : ""} set)`
-              : "Start Mock Draft"}
-          </button>
+          {draftMode === "live" ? (
+            <div>
+              <div className="mb-3 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
+                WS protocol unverified — may need adjustment. Picks will stream in read-only; you cannot make selections.
+              </div>
+              <button
+                onClick={connectLiveDraft}
+                disabled={!draftId.trim() || !players || players.length === 0}
+                className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
+              >
+                Connect to Live Draft
+              </button>
+              {wsError && <p className="mt-1.5 text-xs text-rose-400">{wsError}</p>}
+            </div>
+          ) : (
+            <button
+              onClick={startDraft}
+              disabled={!players || players.length === 0}
+              className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
+            >
+              {picks.length > 0
+                ? `Continue Draft (${picks.length} picks already made)`
+                : pendingKeepers.length > 0
+                ? `Start Draft (${pendingKeepers.length} keeper${pendingKeepers.length !== 1 ? "s" : ""} set)`
+                : "Start Mock Draft"}
+            </button>
+          )}
         </div>
       </div>
     );
@@ -990,7 +1140,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             <span className="text-sm text-zinc-500">
               Round {currentRound} · Pick {currentPickNum} of {numTeams * numRounds}
             </span>
-            {draftMode === "manual" ? (
+            {draftMode === "live" ? (
+              <span className="text-sm text-zinc-400">{teamLabel(currentTeamSlot!)} picking (watching live)</span>
+            ) : draftMode === "manual" ? (
               <span className="font-semibold text-emerald-400">{teamLabel(currentTeamSlot!)} — click a player to pick</span>
             ) : isUserTurn ? (
               <span className="font-semibold text-emerald-400">⚡ YOU&apos;RE ON THE CLOCK — click a player to draft</span>
@@ -1003,6 +1155,34 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           {watchlistRemaining > 0 && (
             <span className="flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-400">
               ★ {watchlistRemaining} target{watchlistRemaining !== 1 ? "s" : ""}
+            </span>
+          )}
+          {draftMode === "live" && (
+            <span
+              className={`flex items-center gap-1.5 text-xs font-medium ${
+                wsStatus === "live"
+                  ? "text-emerald-400"
+                  : wsStatus === "connecting"
+                  ? "text-amber-400"
+                  : "text-rose-400"
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  wsStatus === "live"
+                    ? "bg-emerald-400 animate-pulse"
+                    : wsStatus === "connecting"
+                    ? "bg-amber-400 animate-pulse"
+                    : "bg-rose-400"
+                }`}
+              />
+              {wsStatus === "live"
+                ? "Live"
+                : wsStatus === "connecting"
+                ? "Connecting…"
+                : wsStatus === "error"
+                ? "Connection error"
+                : "Disconnected"}
             </span>
           )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
