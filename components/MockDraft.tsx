@@ -65,6 +65,77 @@ const POS_BADGE: Record<Position, string> = {
 };
 
 const UNKNOWN_BADGE = "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
+
+const SLOT_ELIGIBLE: Record<string, string[]> = {
+  QB: ["QB"], RB: ["RB"], WR: ["WR"], TE: ["TE"], K: ["K"], DEF: ["DEF"],
+  FLEX: ["RB", "WR", "TE"],
+  WRRB_FLEX: ["RB", "WR"],
+  REC_FLEX: ["WR", "TE"],
+  SUPER_FLEX: ["QB", "RB", "WR", "TE"],
+  BN: ["QB", "RB", "WR", "TE", "K", "DEF"],
+};
+const SLOT_PRIORITY: Record<string, number> = {
+  K: 0, DEF: 1, QB: 2, RB: 3, WR: 4, TE: 5,
+  WRRB_FLEX: 6, REC_FLEX: 7, FLEX: 8, SUPER_FLEX: 9, BN: 10,
+};
+const SLOT_DISPLAY: Record<string, string> = {
+  WRRB_FLEX: "FLEX", REC_FLEX: "FLEX", SUPER_FLEX: "SF",
+};
+const SHOW_SLOTS = new Set(Object.keys(SLOT_ELIGIBLE));
+
+interface RosterSlot {
+  label: string;
+  slotType: string;
+  pick: MockPick | null;
+  player: RankedPlayer | undefined;
+}
+
+function assignRoster(
+  rosterPositions: string[],
+  myPicks: MockPick[],
+  playerById: Map<string, RankedPlayer>
+): RosterSlot[] {
+  const avail = myPicks.map((pick, idx) => ({
+    idx,
+    pos: playerById.get(pick.playerId)?.position ?? pick.playerPos ?? "",
+    pick,
+  }));
+  const used = new Set<number>();
+  const assigned: Array<MockPick | null> = new Array(rosterPositions.length).fill(null);
+
+  // Sort indices by restrictiveness so leftover players fall to bench
+  const byPriority = rosterPositions
+    .map((_, i) => i)
+    .sort((a, b) =>
+      (SLOT_PRIORITY[rosterPositions[a]] ?? 99) - (SLOT_PRIORITY[rosterPositions[b]] ?? 99)
+    );
+  for (const si of byPriority) {
+    const eligible = new Set(SLOT_ELIGIBLE[rosterPositions[si]] ?? []);
+    for (const av of avail) {
+      if (!used.has(av.idx) && eligible.has(av.pos)) {
+        assigned[si] = av.pick;
+        used.add(av.idx);
+        break;
+      }
+    }
+  }
+
+  // Number duplicate labels (RB1/RB2 etc.; single slots stay unnumbered)
+  const labelCount: Record<string, number> = {};
+  for (const s of rosterPositions) {
+    const lbl = SLOT_DISPLAY[s] ?? s;
+    labelCount[lbl] = (labelCount[lbl] ?? 0) + 1;
+  }
+  const labelSeq: Record<string, number> = {};
+  return rosterPositions.map((slotType, i) => {
+    const base = SLOT_DISPLAY[slotType] ?? slotType;
+    labelSeq[base] = (labelSeq[base] ?? 0) + 1;
+    const label = labelCount[base] > 1 ? `${base}${labelSeq[base]}` : base;
+    const pick = assigned[i];
+    return { label, slotType, pick, player: pick ? playerById.get(pick.playerId) : undefined };
+  });
+}
+
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
 
@@ -131,6 +202,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [importSummary, setImportSummary] = useState<string | null>(null);
   const [tradedPicks, setTradedPicks] = useState<TradedPick[]>([]);
   const [teamNames, setTeamNames] = useState<Record<number, string>>({});
+  const [leagueRosterPositions, setLeagueRosterPositions] = useState<string[]>([]);
 
   // Keeper setup (for fresh mock drafts before start)
   const [pendingKeepers, setPendingKeepers] = useState<PendingKeeper[]>([]);
@@ -166,6 +238,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         if (d.tradedPicks?.length) setTradedPicks(d.tradedPicks);
         if (d.importSummary) setImportSummary(d.importSummary);
         if (d.teamNames) setTeamNames(d.teamNames);
+        if (d.leagueRosterPositions) setLeagueRosterPositions(d.leagueRosterPositions);
       } catch { /* ignore malformed storage */ }
     }
     const rawKeepers = sessionStorage.getItem(KEEPER_SETUP_KEY);
@@ -300,6 +373,13 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [myPicks, playerById]
   );
 
+  // Structured roster view: only in CPU mode when a league was imported
+  const myRosterSlots = useMemo((): RosterSlot[] | null => {
+    if (!leagueRosterPositions.length || draftMode !== "cpu") return null;
+    const slots = leagueRosterPositions.filter((p) => SHOW_SLOTS.has(p));
+    return assignRoster(slots, myPicks, playerById);
+  }, [leagueRosterPositions, myPicks, playerById, draftMode]);
+
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
     if (!keeperSearch.trim() || keeperPlayerId) return [] as RankedPlayer[];
@@ -408,6 +488,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setPendingKeepers([]);
     setBoardFilter("ALL");
     setTeamNames({});
+    setLeagueRosterPositions([]);
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
   }
@@ -495,21 +576,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const sleeperPicks: SleeperPick[] = await picksRes.json();
       const rawTradedPicks = tradedRes.ok ? await tradedRes.json() : [];
 
-      // Fetch team names from league users (non-critical — silently ignored on failure)
+      // Fetch league details + team names in parallel (non-critical — silently ignored on failure)
       let slotToName: Record<number, string> = {};
-      if (draft.league_id && draft.draft_order) {
+      let rosterPositions: string[] = [];
+      if (draft.league_id) {
         try {
-          const usersRes = await fetch(`https://api.sleeper.app/v1/league/${draft.league_id}/users`);
-          if (usersRes.ok) {
+          const leagueFetch = fetch(`https://api.sleeper.app/v1/league/${draft.league_id}`);
+          const usersFetch = draft.draft_order
+            ? fetch(`https://api.sleeper.app/v1/league/${draft.league_id}/users`)
+            : null;
+          const leagueRes = await leagueFetch;
+          const usersRes = usersFetch ? await usersFetch : null;
+          if (leagueRes.ok) {
+            const league = await leagueRes.json();
+            if (Array.isArray(league.roster_positions)) rosterPositions = league.roster_positions as string[];
+          }
+          if (usersRes?.ok && draft.draft_order) {
             const users: Array<{ user_id: string; display_name?: string; metadata?: { team_name?: string } }> = await usersRes.json();
             for (const u of users) {
               const slot = draft.draft_order![u.user_id];
-              if (typeof slot === "number") {
-                slotToName[slot] = u.metadata?.team_name || u.display_name || "";
-              }
+              if (typeof slot === "number") slotToName[slot] = u.metadata?.team_name || u.display_name || "";
             }
           }
-        } catch { /* team names are non-critical */ }
+        } catch { /* non-critical */ }
       }
 
       if (draft.type !== "snake") throw new Error(`Only snake drafts are supported (got "${draft.type}")`);
@@ -571,6 +660,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       setTradedPicks(parsedTradedPicks);
       setImportSummary(summary);
       setTeamNames(slotToName);
+      setLeagueRosterPositions(rosterPositions);
 
       // Persist so tab switches don't lose the setup
       sessionStorage.setItem(
@@ -586,6 +676,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           tradedPicks: parsedTradedPicks,
           importSummary: summary,
           teamNames: slotToName,
+          leagueRosterPositions: rosterPositions,
         })
       );
     } catch (e) {
@@ -1042,9 +1133,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             {/* Compact roster in board view */}
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
               <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                {draftMode === "cpu" ? `Your Roster · Slot ${userSlot}` : "All Picks"}
+                {draftMode === "cpu" ? `Your Roster · ${teamLabel(userSlot)}` : "All Picks"}
               </h3>
-              {myPlayers.length === 0 ? (
+              {myRosterSlots ? (
+                <div className="space-y-px">
+                  {myRosterSlots.map((slot, i) => {
+                    const pos = (slot.player?.position ?? slot.pick?.playerPos) as Position | undefined;
+                    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
+                    return (
+                      <div key={i} className="flex items-center gap-2 text-xs">
+                        <span className="w-8 shrink-0 text-right text-[10px] text-zinc-600">{slot.label}</span>
+                        {slot.pick ? (
+                          <>
+                            {pos && <span className={`shrink-0 rounded border px-1 py-0.5 text-[10px] font-semibold ${badgeClass}`}>{pos}</span>}
+                            <span className="truncate text-zinc-200">{slot.player?.name ?? slot.pick.playerName ?? slot.pick.playerId}</span>
+                          </>
+                        ) : (
+                          <span className="text-[10px] text-zinc-800">—</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : myPlayers.length === 0 ? (
                 <p className="text-xs text-zinc-600">No picks yet.</p>
               ) : (
                 <div className="space-y-1">
@@ -1068,9 +1179,29 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           <div className="flex w-64 shrink-0 flex-col gap-4">
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
               <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                {draftMode === "cpu" ? `Your Roster · Slot ${userSlot}` : "All Picks"}
+                {draftMode === "cpu" ? `Your Roster · ${teamLabel(userSlot)}` : "All Picks"}
               </h3>
-              {myPlayers.length === 0 ? (
+              {myRosterSlots ? (
+                <div className="space-y-px">
+                  {myRosterSlots.map((slot, i) => {
+                    const pos = (slot.player?.position ?? slot.pick?.playerPos) as Position | undefined;
+                    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
+                    return (
+                      <div key={i} className="flex items-center gap-2 text-xs">
+                        <span className="w-8 shrink-0 text-right text-[10px] text-zinc-600">{slot.label}</span>
+                        {slot.pick ? (
+                          <>
+                            {pos && <span className={`shrink-0 rounded border px-1 py-0.5 text-[10px] font-semibold ${badgeClass}`}>{pos}</span>}
+                            <span className="truncate text-zinc-200">{slot.player?.name ?? slot.pick.playerName ?? slot.pick.playerId}</span>
+                          </>
+                        ) : (
+                          <span className="text-[10px] text-zinc-800">—</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : myPlayers.length === 0 ? (
                 <p className="text-xs text-zinc-600">No picks yet.</p>
               ) : (
                 <div className="space-y-1">
