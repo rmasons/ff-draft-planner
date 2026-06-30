@@ -432,6 +432,34 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [watchlist, draftedIds]
   );
 
+  // Unfilled starter slots (excludes bench). Only meaningful in CPU mode with a Sleeper import.
+  const unfilledStarterSlots = useMemo((): RosterSlot[] => {
+    if (!myRosterSlots) return [];
+    return myRosterSlots.filter((s) => s.slotType !== "BN" && s.pick === null);
+  }, [myRosterSlots]);
+
+  // Best available pick suggestion, weighted by VOR. Requires roster structure from a Sleeper import.
+  const bestPickSuggestion = useMemo((): { player: RankedPlayer; isBench: boolean } | null => {
+    if (!isUserTurn || draftMode !== "cpu" || !myRosterSlots) return null;
+    const available = ranked.filter((p) => !draftedIds.has(p.id));
+    if (available.length === 0) return null;
+    const byVor = [...available].sort((a, b) => b.vbd - a.vbd);
+
+    if (unfilledStarterSlots.length > 0) {
+      for (const player of byVor) {
+        for (const slot of unfilledStarterSlots) {
+          const eligible = SLOT_ELIGIBLE[slot.slotType] ?? [];
+          if (eligible.includes(player.position)) {
+            return { player, isBench: false };
+          }
+        }
+      }
+    }
+
+    // All starters filled — suggest the highest-VOR bench pick
+    return { player: byVor[0], isBench: true };
+  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots]);
+
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
     if (!keeperSearch.trim() || keeperPlayerId) return [] as RankedPlayer[];
@@ -1335,6 +1363,55 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 className="min-w-40 flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
               />
             </div>
+
+            {/* Roster need indicator + best pick — CPU mode, user's turn, league imported */}
+            {draftMode === "cpu" && isUserTurn && myRosterSlots && (
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                {unfilledStarterSlots.length > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Need:</span>
+                    {unfilledStarterSlots.map((slot, i) => {
+                      const badgeClass =
+                        slot.slotType in POS_BADGE
+                          ? POS_BADGE[slot.slotType as Position]
+                          : UNKNOWN_BADGE;
+                      return (
+                        <span
+                          key={i}
+                          className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${badgeClass}`}
+                        >
+                          {slot.label}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {bestPickSuggestion && (
+                  <button
+                    onClick={() => pickPlayer(bestPickSuggestion.player.id)}
+                    className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-1 text-xs transition hover:bg-emerald-500/15"
+                  >
+                    <span className="text-zinc-500">
+                      {bestPickSuggestion.isBench ? "Bench Pick:" : "Best Pick:"}
+                    </span>
+                    <span className="font-medium text-zinc-100">{bestPickSuggestion.player.name}</span>
+                    <span
+                      className={`rounded border px-1 py-px text-[9px] font-bold ${POS_BADGE[bestPickSuggestion.player.position]}`}
+                    >
+                      {bestPickSuggestion.player.position}
+                    </span>
+                    <span
+                      className={`tabular-nums font-medium ${
+                        bestPickSuggestion.player.vbd > 0 ? "text-emerald-400" : "text-zinc-500"
+                      }`}
+                    >
+                      {bestPickSuggestion.player.vbd > 0 ? "+" : ""}
+                      {bestPickSuggestion.player.vbd.toFixed(1)}
+                    </span>
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className="overflow-hidden rounded-xl border border-zinc-800">
               <table className="w-full text-sm">
