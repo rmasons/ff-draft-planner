@@ -693,7 +693,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                     const player = playerById.get(k.playerId);
                     return (
                       <div key={k.pickNumber} className="flex items-center gap-2 text-xs">
-                        <span className="shrink-0 text-zinc-600">Rd {rd} · T{k.teamSlot}</span>
+                        <span className="shrink-0 text-zinc-600">Rd {rd} · {teamLabel(k.teamSlot)}</span>
                         <span className="truncate text-zinc-300">{player?.name ?? k.playerName ?? k.playerId}</span>
                       </div>
                     );
@@ -710,7 +710,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       const pickNum = pickNumForCell(k.round, k.teamSlot, numTeams);
                       return (
                         <div key={i} className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/50 px-3 py-1.5 text-xs">
-                          <span className="shrink-0 text-zinc-500">Rd {k.round} · T{k.teamSlot} · #{pickNum}</span>
+                          <span className="shrink-0 text-zinc-500">Rd {k.round} · {teamLabel(k.teamSlot)} · #{pickNum}</span>
                           <span className="min-w-0 flex-1 truncate text-zinc-200">{player?.name ?? k.playerId}</span>
                           <button
                             onClick={() => setPendingKeepers((prev) => prev.filter((_, j) => j !== i))}
@@ -737,7 +737,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       onChange={(e) => setKeeperSlot(Number(e.target.value))}
                       className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                     >
-                      {slotOptions.map((n) => <option key={n} value={n}>T{n}</option>)}
+                      {slotOptions.map((n) => <option key={n} value={n}>{teamLabel(n)}</option>)}
                     </select>
                     <select
                       value={keeperRound}
