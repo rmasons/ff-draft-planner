@@ -80,6 +80,7 @@ export default function AuctionDraft() {
   const [nomineeId, setNomineeId] = useState<string | null>(null);
   const [nomineeWinner, setNomineeWinner] = useState(0);
   const [nomineeBid, setNomineeBid] = useState("");
+  const [bidError, setBidError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -126,23 +127,79 @@ export default function AuctionDraft() {
     return arr;
   }, [wonPlayers, setup.numTeams, setup.budgetPerTeam]);
 
-  // Suggested bid formula: (player.vbd / positiveVorPool) × remainingTotalBudget
-  // Denominator is over *available* players only so it recomputes as players are won.
-  const positiveVorPool = useMemo(
-    () => available.reduce((sum, p) => (p.vbd > 0 ? sum + p.vbd : sum), 0),
-    [available]
+  // Roster size per team, approximated from the roster config used for VBD
+  // (qb + rb + wr + te + flex + superflex + bench). This doesn't count K/DEF
+  // since those aren't modeled in rosterCfg, but it's close enough to know
+  // how many more players a team must still buy.
+  const rosterSize =
+    rosterCfg.qb +
+    rosterCfg.rb +
+    rosterCfg.wr +
+    rosterCfg.te +
+    rosterCfg.flex +
+    rosterCfg.superflex +
+    rosterCfg.bench;
+
+  // How many players each team has already won.
+  const wonCountByTeam = useMemo(() => {
+    const counts = Array.from({ length: setup.numTeams }, () => 0);
+    for (const w of wonPlayers) {
+      if (w.teamIndex >= 0 && w.teamIndex < counts.length) {
+        counts[w.teamIndex] += 1;
+      }
+    }
+    return counts;
+  }, [wonPlayers, setup.numTeams]);
+
+  // Unfilled roster slots per team, floored at 0 (a team could already have
+  // more players than rosterSize if the user over-drafted manually).
+  const unfilledSlotsByTeam = useMemo(
+    () => wonCountByTeam.map((count) => Math.max(0, rosterSize - count)),
+    [wonCountByTeam, rosterSize]
   );
+
+  // Total unfilled slots across the whole league — every one of these needs
+  // at least $1, so that money isn't "discretionary" (biddable above the floor).
+  const totalUnfilledSlots = useMemo(
+    () => unfilledSlotsByTeam.reduce((a, b) => a + b, 0),
+    [unfilledSlotsByTeam]
+  );
+
+  // Suggested bid formula: (player.vbd / positiveVorPool) × discretionaryTotal, plus
+  // the $1 floor. Denominator (VOR pool) is over *available* players only, capped to
+  // the top `numTeams × rosterSize` of them by VOR — that's the most that will ever
+  // actually get rostered, so undraftable tail players shouldn't dilute the pool.
+  const positiveVorPool = useMemo(() => {
+    const rosterableCount = setup.numTeams * rosterSize;
+    const topByVor = [...available]
+      .sort((a, b) => b.vbd - a.vbd)
+      .slice(0, rosterableCount);
+    return topByVor.reduce((sum, p) => (p.vbd > 0 ? sum + p.vbd : sum), 0);
+  }, [available, setup.numTeams, rosterSize]);
   const remainingTotalBudget = useMemo(
     () => budgets.reduce((a, b) => a + b, 0),
     [budgets]
+  );
+  // Discretionary pool = money left over once every unfilled slot reserves its $1.
+  const discretionaryTotal = Math.max(
+    0,
+    remainingTotalBudget - totalUnfilledSlots
   );
 
   function suggestedBid(p: RankedPlayer): number {
     if (p.vbd <= 0 || positiveVorPool <= 0) return 1;
     return Math.max(
       1,
-      Math.round((p.vbd / positiveVorPool) * remainingTotalBudget)
+      Math.round((p.vbd / positiveVorPool) * discretionaryTotal) + 1
     );
+  }
+
+  // Max legal bid for a team: its remaining budget minus $1 reserved for each
+  // *other* unfilled slot it still has to fill (this bid fills one of them).
+  function maxBidForTeam(teamIndex: number): number {
+    if (teamIndex < 0 || teamIndex >= budgets.length) return 0;
+    const otherUnfilled = Math.max(0, unfilledSlotsByTeam[teamIndex] - 1);
+    return Math.max(0, budgets[teamIndex] - otherUnfilled);
   }
 
   const visibleRows = useMemo(() => {
@@ -170,12 +227,23 @@ export default function AuctionDraft() {
     setNomineeId(p.id);
     setNomineeWinner(0);
     setNomineeBid(String(suggestedBid(p)));
+    setBidError(null);
   }
 
   function handleConfirmWin() {
     if (!nomineeId) return;
     const price = parseInt(nomineeBid, 10);
-    if (isNaN(price) || price < 1) return;
+    if (isNaN(price) || price < 1) {
+      setBidError("Enter a bid of at least $1.");
+      return;
+    }
+    const maxBid = maxBidForTeam(nomineeWinner);
+    if (price > maxBid) {
+      setBidError(
+        `${teamLabel(nomineeWinner)} can bid at most $${maxBid} (must save $1 for each remaining roster slot).`
+      );
+      return;
+    }
     setWonPlayers((prev) => [
       ...prev,
       { playerId: nomineeId, teamIndex: nomineeWinner, price },
@@ -183,6 +251,7 @@ export default function AuctionDraft() {
     setNomineeId(null);
     setNomineeBid("");
     setNomineeWinner(0);
+    setBidError(null);
   }
 
   function handleReset() {
@@ -404,11 +473,10 @@ export default function AuctionDraft() {
                               </span>
                               <select
                                 value={nomineeWinner}
-                                onChange={(e) =>
-                                  setNomineeWinner(
-                                    parseInt(e.target.value, 10)
-                                  )
-                                }
+                                onChange={(e) => {
+                                  setNomineeWinner(parseInt(e.target.value, 10));
+                                  setBidError(null);
+                                }}
                                 className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                               >
                                 {Array.from(
@@ -420,16 +488,21 @@ export default function AuctionDraft() {
                                   )
                                 )}
                               </select>
+                              <span className="text-sm text-zinc-400">
+                                (max ${maxBidForTeam(nomineeWinner)})
+                              </span>
                               <span className="text-sm text-zinc-400">at</span>
                               <div className="flex items-center gap-1">
                                 <span className="text-sm text-zinc-400">$</span>
                                 <input
                                   type="number"
                                   min={1}
+                                  max={maxBidForTeam(nomineeWinner)}
                                   value={nomineeBid}
-                                  onChange={(e) =>
-                                    setNomineeBid(e.target.value)
-                                  }
+                                  onChange={(e) => {
+                                    setNomineeBid(e.target.value);
+                                    setBidError(null);
+                                  }}
                                   className="w-20 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                                 />
                               </div>
@@ -439,6 +512,11 @@ export default function AuctionDraft() {
                               >
                                 Confirm Win
                               </button>
+                              {bidError && (
+                                <span className="w-full text-xs text-rose-400">
+                                  {bidError}
+                                </span>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -499,6 +577,9 @@ export default function AuctionDraft() {
                 >
                   ${budgets[i]}
                 </span>
+              </div>
+              <div className="mb-1.5 text-[11px] text-zinc-600">
+                max bid ${maxBidForTeam(i)}
               </div>
               <div className="space-y-0.5">
                 {teamRoster.map((w) => (
