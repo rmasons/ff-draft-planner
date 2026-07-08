@@ -206,8 +206,12 @@ export function rankPlayers(
     });
   }
 
-  // Sort skill players by VBD descending and assign overall rank.
-  ranked.sort((a, b) => b.vbd - a.vbd);
+  // Sort skill players by VBD descending. Ties (equal VBD) are broken
+  // deterministically by projected points desc, then name asc, so equal-VBD
+  // players don't shuffle order across recomputes based on array insertion order.
+  ranked.sort(
+    (a, b) => b.vbd - a.vbd || b.points - a.points || a.name.localeCompare(b.name)
+  );
   let rank = 1;
   for (const p of ranked) p.overallRank = rank++;
 

@@ -22,6 +22,13 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 interface AdpSnapshot {
   ts: number;
   data: Record<string, number>;
+  // Which adpKey (ppr/half/std/superflex, see adpKeyFor) the snapshot's `data`
+  // was computed under. Consensus ADP differs by scoring/roster format, so a
+  // snapshot seeded under one key is meaningless compared against another —
+  // this lets us detect a format switch and rebuild instead of showing bogus
+  // trend arrows. Optional so snapshots persisted before this field existed
+  // are handled gracefully (treated as a mismatch, see trendMap below).
+  adpKey?: string;
 }
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
@@ -38,7 +45,11 @@ function riskScore(p: Player): number {
   if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
   else if (p.injuryStatus === "Out") score += 5;
   else if (p.injuryStatus === "Doubtful") score += 4;
-  else if (p.injuryStatus === "Questionable") score += 2;
+  // Questionable is weighted light: this is a pre-draft tool used mostly in
+  // the summer, when "Questionable" tags are largely stale offseason noise
+  // (leftover from limited practice participation, etc.) rather than a real
+  // week-to-week game-status signal — full weight here overstates the risk.
+  else if (p.injuryStatus === "Questionable") score += 1;
   if (p.injuryNotes?.includes("Surgery")) score += 2;
   if (p.yearsExp === 0) score += 1;
   if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
@@ -116,7 +127,11 @@ export default function DraftBoard() {
     if (!players || !snapshotHydrated) return;
     setSnapshot((prev) => {
       const now = Date.now();
-      if (prev && now - prev.ts <= SEVEN_DAYS_MS) return prev; // still fresh
+      // Still fresh AND seeded under the currently-active adpKey → keep it.
+      // A missing adpKey (snapshot from before this field existed) or a key
+      // that doesn't match the current scoring/roster format both count as
+      // a mismatch and force a rebuild below.
+      if (prev && prev.adpKey === adpKey && now - prev.ts <= SEVEN_DAYS_MS) return prev;
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
@@ -127,7 +142,7 @@ export default function DraftBoard() {
           data[p.id] = srcs.reduce((a, b) => a + b, 0) / srcs.length;
         }
       }
-      return { ts: now, data };
+      return { ts: now, data, adpKey };
     });
   }, [players, snapshotHydrated, adpKey, setSnapshot]);
 
@@ -136,6 +151,11 @@ export default function DraftBoard() {
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
     if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
+    // Snapshot was seeded under a different adpKey (format switch, or an old
+    // snapshot from before adpKey was tracked) — its ADP values aren't
+    // comparable to the current consensus, so bail out rather than show
+    // bogus trend arrows. The seeding effect above will rebuild it shortly.
+    if (snapshot.adpKey !== adpKey) return {};
     const map: Record<string, number> = {};
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
@@ -200,6 +220,12 @@ export default function DraftBoard() {
         }
         case "value": {
           const getVal = (p: RankedPlayer): number | null => {
+            // K/DEF overallRank is forced to the bottom of the board by
+            // design (see rankPlayers in lib/vbd.ts), so consensus ADP minus
+            // overallRank is always a huge, meaningless negative number for
+            // them. Treat as "no value" so they group with the other
+            // no-value players instead of dragging the value sort down.
+            if (p.position === "K" || p.position === "DEF") return null;
             const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
             const es = p.adp.espn >= 999 ? null : p.adp.espn;
             const srcs = [sl, es].filter((x): x is number => x !== null);
@@ -386,7 +412,12 @@ export default function DraftBoard() {
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Tier</th>
                   <SortTh label="Proj" sk="proj" className="text-right" />
-                  <th className="px-3 py-2 text-right font-medium text-zinc-500">2025</th>
+                  <th
+                    className="px-3 py-2 text-right font-medium text-zinc-500"
+                    title="2025 season total, PPR scoring"
+                  >
+                    2025
+                  </th>
                   <SortTh label="VOR" sk="vor" className="text-right" />
                   <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
                   <SortTh label="Val" sk="value" className="text-right" />
@@ -418,7 +449,15 @@ export default function DraftBoard() {
                   const consensusAdp = adpSources.length > 0
                     ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
                     : null;
-                  const value = consensusAdp !== null ? consensusAdp - p.overallRank : null;
+                  // K/DEF overallRank is forced to the bottom by design (see
+                  // rankPlayers), so Val would always read as a huge, bogus
+                  // negative number for them — show "—" instead.
+                  const value =
+                    p.position === "K" || p.position === "DEF"
+                      ? null
+                      : consensusAdp !== null
+                      ? consensusAdp - p.overallRank
+                      : null;
                   const risk = riskScore(p);
                   const trend = trendMap[p.id] ?? 0;
                   return (
