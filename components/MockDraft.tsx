@@ -139,6 +139,9 @@ function assignRoster(
 
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
+// Snapshot of an in-progress draft (after "started" becomes true), so a
+// refresh mid-draft doesn't throw away everything.
+const ACTIVE_DRAFT_KEY = "ffdp.draft-active";
 
 function teamSlotForPick(pickNum: number, numTeams: number): number {
   const round = Math.ceil(pickNum / numTeams);
@@ -224,8 +227,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
   const [watchlist, setWatchlist] = useState<Set<string>>(new Set());
 
-  // Live sync
-  const wsRef = useRef<WebSocket | null>(null);
+  // Live sync — polls Sleeper's documented REST API (no WebSocket; Sleeper's
+  // live socket protocol isn't publicly documented, so REST polling is the
+  // reliable option even though it's a little less "instant").
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollFailCountRef = useRef(0);
   const [wsStatus, setWsStatus] = useState<"idle" | "connecting" | "live" | "error" | "disconnected">("idle");
   const [wsError, setWsError] = useState<string | null>(null);
 
@@ -258,6 +264,35 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         if (Array.isArray(ks)) setPendingKeepers(ks);
       } catch { /* ignore */ }
     }
+
+    // Restore an in-progress draft, if one was left running. This runs after
+    // the DRAFT_SETUP_KEY restore above so its `setPicks`/`setUserSlot` calls
+    // win for a draft that had already started (the setup snapshot only ever
+    // reflects the pre-start import step).
+    const rawActive = sessionStorage.getItem(ACTIVE_DRAFT_KEY);
+    if (rawActive) {
+      try {
+        const a = JSON.parse(rawActive);
+        if (Array.isArray(a.picks)) setPicks(a.picks);
+        if (typeof a.userSlot === "number") setUserSlot(a.userSlot);
+        if (Array.isArray(a.watchlist)) setWatchlist(new Set(a.watchlist));
+        // Needed so a restored live draft can actually reconnect: a live
+        // draft reached via the username lookup (not the Import button)
+        // never touches DRAFT_SETUP_KEY, so draftId would otherwise be lost
+        // on refresh and the Connect button would have nothing to connect to.
+        if (a.draftId) setDraftId(a.draftId);
+        if (a.draftMode === "live") {
+          // Live mode holds no real connection across a refresh — land back
+          // on the setup screen (picks are restored) so the user has to hit
+          // Connect again rather than sitting in a "live" state that isn't.
+          setDraftMode("live");
+          setStarted(false);
+        } else if (a.draftMode === "cpu" || a.draftMode === "manual") {
+          setDraftMode(a.draftMode);
+          if (a.started) setStarted(true);
+        }
+      } catch { /* ignore malformed storage */ }
+    }
   }, []);
 
   // Persist manual keepers across tab switches
@@ -268,6 +303,28 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       sessionStorage.removeItem(KEEPER_SETUP_KEY);
     }
   }, [pendingKeepers]);
+
+  // Persist the in-progress draft so a refresh mid-draft doesn't lose it.
+  // Guarded on `started` so this doesn't fire (and clobber the snapshot with
+  // empty initial state) before the mount-restore effect above has run —
+  // `started` is false on first render, so this simply no-ops until either
+  // the restore effect or the user sets it true. Only resetDraft() clears
+  // the stored snapshot; we deliberately never remove it here.
+  useEffect(() => {
+    if (!started) return;
+    sessionStorage.setItem(
+      ACTIVE_DRAFT_KEY,
+      JSON.stringify({
+        picks,
+        started,
+        draftMode,
+        userSlot,
+        watchlist: Array.from(watchlist),
+        // Only meaningful for draftMode === "live" (see restore effect above)
+        draftId,
+      })
+    );
+  }, [started, picks, draftMode, userSlot, watchlist, draftId]);
 
   // Fetch player projections
   useEffect(() => {
@@ -391,13 +448,21 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const draftGrade = useMemo(() => {
     if (!isDone || draftMode !== "cpu") return null;
     const graded = myPicks.flatMap((pick) => {
+      // Keepers aren't a drafting decision (you didn't "win" the pick against
+      // the market that round), so they don't count toward the grade.
+      if (pick.isKeeper) return [];
       const player = playerById.get(pick.playerId);
       if (!player) return [];
       const srcs = [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn]
         .filter((v): v is number => v < 999);
       if (srcs.length === 0) return [];
       const avgAdp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-      const value = avgAdp - player.overallRank;
+      // Value = how many picks LATER than the market average you got this
+      // player. Positive = steal (you drafted him after the market would
+      // have), negative = reach. Using the actual pick number (instead of
+      // just "board rank vs ADP") is what makes this measure drafting skill:
+      // a big reach at pick 1 now grades worse than the same gap at pick 20.
+      const value = pick.pickNumber - avgAdp;
       return [{ pick, player, value }];
     });
     if (graded.length === 0) return null;
@@ -484,7 +549,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (pendingKeepers.length === 0 || ranked.length === 0) return [];
     return pendingKeepers.map((k) => {
       const player = playerById.get(k.playerId);
-      const pickEquivalent = (k.round - 1) * numTeams + userSlot;
+      // Snake-draft pick number for this keeper's own team slot (not the
+      // user's slot — a keeper can belong to any team in the league).
+      const pickEquivalent = pickNumForCell(k.round, k.teamSlot, numTeams);
       const srcs = player
         ? [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn].filter(
             (v): v is number => v < 999
@@ -500,7 +567,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       }
       return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
     });
-  }, [pendingKeepers, ranked, playerById, numTeams, userSlot]);
+  }, [pendingKeepers, ranked, playerById, numTeams]);
 
   // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
@@ -509,11 +576,44 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const available = ranked.filter((p) => !draftedIds.has(p.id));
       if (available.length === 0 || currentTeamSlot === null) return;
 
+      // --- Positional-need adjustment for the CPU team on the clock ---
+      // Without this, CPU teams just chase ADP and can end up with 5 QBs
+      // or zero QBs. Count what the picking team already has at each spot.
+      const teamPicks = picks.filter((pk) => pk.teamSlot === currentTeamSlot);
+      const posCounts: Record<string, number> = {};
+      for (const pk of teamPicks) {
+        const pos = playerById.get(pk.playerId)?.position ?? pk.playerPos;
+        if (pos) posCounts[pos] = (posCounts[pos] ?? 0) + 1;
+      }
+      // Soft roster caps: once a team is at/above the cap for a position,
+      // drafting more there gets a big score penalty (score is ascending,
+      // i.e. lower = better, so a penalty is added).
+      const POS_CAP: Record<string, number> = { QB: 2, TE: 2, K: 1, DEF: 1, RB: 6, WR: 6 };
+      const NEED_PENALTY = 200; // dwarfs the ~1-300 ADP scale so the cap actually bites
+      // In the last few rounds, still-missing required positions become
+      // urgent (no team should finish with zero QB/TE, or no K/DEF at all),
+      // so give those a big score boost (subtract, since lower = better).
+      const NEED_BOOST = 200;
+      const roundsLeft = numRounds - currentRound;
+
       const best = available
         .map((p) => {
           const adpVal = p.adp[adpKey] < 999 ? p.adp[adpKey] : p.overallRank + 100;
           const jitter = (Math.random() - 0.5) * 8; // ±4 pick variance
-          return { p, score: adpVal + jitter };
+          let score = adpVal + jitter;
+
+          const have = posCounts[p.position] ?? 0;
+          const cap = POS_CAP[p.position];
+          if (cap !== undefined && have >= cap) score += NEED_PENALTY;
+
+          if ((p.position === "QB" || p.position === "TE") && have === 0 && roundsLeft <= 2) {
+            score -= NEED_BOOST;
+          }
+          if ((p.position === "K" || p.position === "DEF") && have === 0 && roundsLeft <= 3) {
+            score -= NEED_BOOST;
+          }
+
+          return { p, score };
         })
         .sort((a, b) => a.score - b.score)[0]?.p;
 
@@ -527,18 +627,18 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => clearTimeout(timer);
   }, [
     started, draftMode, isUserTurn, isDone, ranked, draftedIds,
-    currentTeamSlot, currentPickNum, adpKey,
+    currentTeamSlot, currentPickNum, adpKey, picks, playerById, numRounds, currentRound,
   ]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [picks.length]);
 
-  // Clean up WebSocket on unmount
+  // Clean up the live-draft poll loop on unmount
   useEffect(() => {
     return () => {
-      wsRef.current?.close(1000, "unmount");
-      wsRef.current = null;
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null;
     };
   }, []);
 
@@ -584,10 +684,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }
 
   function resetDraft() {
-    if (wsRef.current) {
-      wsRef.current.close(1000, "reset");
-      wsRef.current = null;
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
     }
+    pollFailCountRef.current = 0;
     setWsStatus("idle");
     setWsError(null);
     setPicks([]);
@@ -613,6 +714,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setWatchlist(new Set());
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
+    sessionStorage.removeItem(ACTIVE_DRAFT_KEY);
   }
 
   function exportCsv() {
@@ -708,108 +810,86 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const id = draftId.trim();
     if (!id) return;
 
-    // Close any stale connection
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
+    // Stop any previous poll loop before starting a new one
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
     }
 
     setWsStatus("connecting");
     setWsError(null);
+    pollFailCountRef.current = 0;
 
-    // TODO: WS protocol unverified — may need adjustment.
-    // Sleeper appears to use Phoenix channels (Elixir backend).
-    // The host prod.sleeper.app was found via community network inspection and
-    // may not resolve from all environments; try sleeper.app if it fails.
-    // The /websocket?vsn=2.0.0 suffix is the standard Phoenix transport path.
-    // If picks don't stream, the URL, an auth token in query params, or the
-    // event names below may need updating after inspecting Sleeper's network traffic.
-    const wsUrl = "wss://prod.sleeper.app/v1/ws/websocket?vsn=2.0.0";
-
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (err) {
-      setWsStatus("error");
-      setWsError(`Failed to open connection: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-
-    wsRef.current = ws;
-    let hbTimer: ReturnType<typeof setInterval> | null = null;
-    let refCounter = 0;
-
-    ws.addEventListener("open", () => {
-      setWsStatus("live");
-
-      // TODO: WS protocol unverified — Phoenix phx_join message format assumed.
-      // Topic "draft:<id>" and empty payload {} may differ in Sleeper's implementation.
-      refCounter++;
-      ws.send(JSON.stringify([null, String(refCounter), `draft:${id}`, "phx_join", {}]));
-
-      // Phoenix heartbeat: server closes the connection after ~60s without one
-      hbTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          refCounter++;
-          ws.send(JSON.stringify([null, String(refCounter), "phoenix", "heartbeat", {}]));
-        }
-      }, 30_000);
-    });
-
-    ws.addEventListener("message", (event) => {
+    // Sleeper doesn't publish its live-draft push protocol, so instead of
+    // guessing at a WebSocket wire format we just poll the same documented
+    // REST endpoints handleImport() already uses. Simple, and it works.
+    const poll = async () => {
       try {
-        const msg = JSON.parse(event.data as string);
+        const picksRes = await fetch(`https://api.sleeper.app/v1/draft/${id}/picks`);
+        if (!picksRes.ok) throw new Error(`Could not fetch picks (${picksRes.status})`);
+        const sleeperPicks: SleeperPick[] = await picksRes.json();
 
-        // TODO: WS protocol unverified — Phoenix v2 wire format assumed:
-        // [join_ref, ref, topic, event_name, payload]
-        if (!Array.isArray(msg) || msg.length < 5) return;
-        const [, , , eventName, payload] = msg as [unknown, unknown, unknown, string, Record<string, unknown>];
+        const newPicks: MockPick[] = sleeperPicks.map((sp) => ({
+          pickNumber: sp.pick_no,
+          teamSlot: sp.draft_slot,
+          playerId: sp.player_id,
+          playerName:
+            sp.metadata?.first_name && sp.metadata?.last_name
+              ? `${sp.metadata.first_name} ${sp.metadata.last_name}`
+              : sp.player_id,
+          playerPos: sp.metadata?.position ?? undefined,
+          isKeeper: sp.is_keeper === true,
+        }));
 
-        // TODO: WS protocol unverified — confirm the real event name(s).
-        // Common guesses based on Sleeper REST API naming:
-        // "pick_completed", "draft_pick", or simply "pick".
-        if (eventName === "pick_completed" || eventName === "draft_pick" || eventName === "pick") {
-          // TODO: WS protocol unverified — confirm pick nesting.
-          // The pick object may be in payload.pick or directly in payload.
-          const sp = (payload?.pick ?? (payload?.player_id ? payload : null)) as SleeperPick | null;
-          if (!sp || !sp.player_id || sp.pick_no == null) return;
+        setPicks((prev) => {
+          // Merge by pick number — Sleeper is the source of truth, so a
+          // pick already seen just gets refreshed rather than duplicated.
+          const merged = new Map(prev.map((p) => [p.pickNumber, p]));
+          for (const np of newPicks) merged.set(np.pickNumber, np);
+          return [...merged.values()].sort((a, b) => a.pickNumber - b.pickNumber);
+        });
 
-          const mockPick: MockPick = {
-            pickNumber: sp.pick_no,
-            teamSlot: sp.draft_slot,
-            playerId: sp.player_id,
-            playerName:
-              sp.metadata?.first_name && sp.metadata?.last_name
-                ? `${sp.metadata.first_name} ${sp.metadata.last_name}`
-                : sp.player_id,
-            playerPos: sp.metadata?.position ?? undefined,
-            isKeeper: sp.is_keeper === true,
-          };
+        // A successful fetch means we're connected, regardless of past failures
+        pollFailCountRef.current = 0;
+        setWsStatus("live");
+        setWsError(null);
 
-          setPicks((prev) => {
-            // Deduplicate by pick number so a reconnect-and-replay doesn't double-add
-            if (prev.some((p) => p.pickNumber === mockPick.pickNumber)) return prev;
-            return [...prev, mockPick].sort((a, b) => a.pickNumber - b.pickNumber);
-          });
+        // Separately check whether the draft has finished, and stop polling if so
+        const draftRes = await fetch(`https://api.sleeper.app/v1/draft/${id}`);
+        if (draftRes.ok) {
+          const draft: SleeperDraft = await draftRes.json();
+          if (draft.status === "complete") {
+            if (pollRef.current) {
+              clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+            setWsStatus("idle");
+          }
         }
-      } catch { /* ignore malformed messages */ }
-    });
+      } catch (err) {
+        pollFailCountRef.current += 1;
+        // Only flip to an error state after a few misses in a row — a single
+        // dropped request every 5s shouldn't alarm the user
+        if (pollFailCountRef.current >= 3) {
+          setWsStatus("error");
+          setWsError(
+            `Could not reach Sleeper: ${err instanceof Error ? err.message : String(err)}`
+          );
+          if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        }
+      }
+    };
 
-    ws.addEventListener("error", () => {
-      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-      setWsStatus("error");
-      setWsError("WebSocket error — the draft ID may be wrong, or the server requires auth");
-    });
-
-    ws.addEventListener("close", (ev) => {
-      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-      wsRef.current = null;
-      // Codes 1000/1001 = normal close; anything else = unexpected drop
-      setWsStatus(ev.code === 1000 || ev.code === 1001 ? "idle" : "disconnected");
-    });
+    // Fetch once immediately so the status flips to "live" right away,
+    // then keep polling every ~5 seconds while connected.
+    poll();
+    pollRef.current = setInterval(poll, 5000);
 
     // The draft screen mounts as soon as setStarted(true) fires;
-    // existing imported picks are preserved (dedup logic above handles overlap)
+    // existing imported picks are preserved (merge logic above handles overlap)
     setStarted(true);
   }
 
@@ -1206,7 +1286,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         <span className="text-zinc-300">#{pickEquivalent}</span>
                         <span className="text-zinc-500">ADP</span>
                         <span className="text-zinc-300">{consensusAdp !== null ? consensusAdp.toFixed(1) : "—"}</span>
-                        <span className="text-zinc-500">VOR surplus</span>
+                        <span className="text-zinc-500">ADP surplus</span>
                         <span className={surplus === null ? "text-zinc-500" : surplus > 0 ? "text-emerald-400" : "text-rose-400"}>
                           {surplus !== null
                             ? surplus > 0
@@ -1240,7 +1320,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             </div>
             {draftMode === "live" && (
               <p className="mt-1.5 text-xs text-zinc-500">
-                Connects to a live Sleeper draft via WebSocket — read-only, picks stream in automatically.
+                Connects to a live Sleeper draft — read-only, picks refresh automatically every few seconds.
               </p>
             )}
           </div>
@@ -1268,9 +1348,6 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
           {draftMode === "live" ? (
             <div>
-              <div className="mb-3 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
-                WS protocol unverified — may need adjustment. Picks will stream in read-only; you cannot make selections.
-              </div>
               <button
                 onClick={connectLiveDraft}
                 disabled={!draftId.trim() || !players || players.length === 0}
@@ -1459,7 +1536,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 >
                   {draftGrade.avgValue >= 0 ? "+" : ""}
                   {draftGrade.avgValue.toFixed(1)} picks{" "}
-                  {draftGrade.avgValue >= 0 ? "ahead of" : "behind"} ADP
+                  {draftGrade.avgValue >= 0 ? "later than ADP (steals)" : "earlier than ADP (reaches)"}
                 </span>
               </p>
               <div className="flex flex-wrap gap-1.5">
