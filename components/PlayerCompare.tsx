@@ -1,39 +1,11 @@
 "use client";
 
-import type { Player, Position, RankedPlayer } from "@/lib/types";
+import type { RankedPlayer } from "@/lib/types";
+import { consensusAdp, valueVsAdp } from "@/lib/adp";
+import { riskScore } from "@/lib/risk";
+import { POS_BADGE } from "@/lib/ui";
 
-// ---------- helpers (not exported from DraftBoard — duplicated here) ----------
-
-function riskScore(p: Player): number {
-  let score = 1;
-  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
-  else if (p.injuryStatus === "Out") score += 5;
-  else if (p.injuryStatus === "Doubtful") score += 4;
-  else if (p.injuryStatus === "Questionable") score += 2;
-  if (p.injuryNotes?.includes("Surgery")) score += 2;
-  if (p.yearsExp === 0) score += 1;
-  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
-  return Math.min(score, 10);
-}
-
-const POS_BADGE: Record<Position, string> = {
-  QB:  "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB:  "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR:  "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE:  "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K:   "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-
-/** Consensus ADP (Sleeper PPR + ESPN avg) and value-over-ADP. */
-function adpAndVal(p: RankedPlayer): { adp: number | null; val: number | null } {
-  const sl = p.adp.ppr >= 999 ? null : p.adp.ppr;
-  const es = p.adp.espn >= 999 ? null : p.adp.espn;
-  const srcs = [sl, es].filter((x): x is number => x !== null);
-  if (srcs.length === 0) return { adp: null, val: null };
-  const adp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-  return { adp, val: adp - p.overallRank };
-}
+// ---------- helpers ----------
 
 /**
  * Returns the set of indices tied for best (max or min).
@@ -84,13 +56,22 @@ function StatRow({
 
 export interface Props {
   players: RankedPlayer[];
+  // Which Sleeper ADP column to use for consensus ADP / value-over-ADP,
+  // matching the caller's current scoring/roster format (see `adpKeyFor` in
+  // lib/presets.ts). Without this, ADP/value here silently assumed PPR even
+  // in superflex/half/standard leagues.
+  adpKey: "ppr" | "half" | "std" | "superflex";
   onClose: () => void;
   onRemove: (id: string) => void;
 }
 
-export default function PlayerCompare({ players, onClose, onRemove }: Props) {
+export default function PlayerCompare({ players, adpKey, onClose, onRemove }: Props) {
   // Pre-compute derived stats once per player.
-  const stats = players.map((p) => ({ risk: riskScore(p), ...adpAndVal(p) }));
+  const stats = players.map((p) => ({
+    risk: riskScore(p),
+    adp: consensusAdp(p, adpKey),
+    val: valueVsAdp(p, adpKey),
+  }));
 
   // Best-value index sets for each highlightable stat row.
   const bestProj   = bestIdx(players.map((p) => p.points),        "max");

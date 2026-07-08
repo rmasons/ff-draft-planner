@@ -10,6 +10,9 @@ import {
   type Baselines,
 } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { consensusAdp, valueVsAdp } from "@/lib/adp";
+import { riskScore } from "@/lib/risk";
+import { POS_BADGE, POS_DOT } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
 import PlayerCompare from "./PlayerCompare";
@@ -40,44 +43,11 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   risk: -1,  // desc: higher risk first (surface the most dangerous picks)
 };
 
-function riskScore(p: Player): number {
-  let score = 1;
-  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
-  else if (p.injuryStatus === "Out") score += 5;
-  else if (p.injuryStatus === "Doubtful") score += 4;
-  // Questionable is weighted light: this is a pre-draft tool used mostly in
-  // the summer, when "Questionable" tags are largely stale offseason noise
-  // (leftover from limited practice participation, etc.) rather than a real
-  // week-to-week game-status signal — full weight here overstates the risk.
-  else if (p.injuryStatus === "Questionable") score += 1;
-  if (p.injuryNotes?.includes("Surgery")) score += 2;
-  if (p.yearsExp === 0) score += 1;
-  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
-  return Math.min(score, 10);
-}
-
 const TIER_COLORS = [
   "#34d399", "#60a5fa", "#c084fc", "#fbbf24",
   "#fb7185", "#22d3ee", "#a3e635", "#f472b6",
 ];
 const tierColor = (tier: number) => TIER_COLORS[(tier - 1) % TIER_COLORS.length];
-
-const POS_BADGE: Record<Position, string> = {
-  QB:  "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB:  "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR:  "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE:  "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K:   "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-const POS_DOT: Record<Position, string> = {
-  QB:  "#fb7185",
-  RB:  "#34d399",
-  WR:  "#38bdf8",
-  TE:  "#fbbf24",
-  K:   "#a78bfa",
-  DEF: "#fb923c",
-};
 
 export default function DraftBoard() {
   const [players, setPlayers] = useState<Player[] | null>(null);
@@ -135,12 +105,8 @@ export default function DraftBoard() {
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
-        const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-        const es = p.adp.espn >= 999 ? null : p.adp.espn;
-        const srcs = [sl, es].filter((x): x is number => x !== null);
-        if (srcs.length > 0) {
-          data[p.id] = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-        }
+        const c = consensusAdp(p, adpKey);
+        if (c !== null) data[p.id] = c;
       }
       return { ts: now, data, adpKey };
     });
@@ -160,11 +126,8 @@ export default function DraftBoard() {
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
       if (snapAdp === undefined) continue;
-      const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-      const es = p.adp.espn >= 999 ? null : p.adp.espn;
-      const srcs = [sl, es].filter((x): x is number => x !== null);
-      if (srcs.length === 0) continue;
-      const currentConsensus = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      const currentConsensus = consensusAdp(p, adpKey);
+      if (currentConsensus === null) continue;
       // Positive → snapshotAdp was higher → player is now drafted earlier → rising
       map[p.id] = snapAdp - currentConsensus;
     }
@@ -219,22 +182,11 @@ export default function DraftBoard() {
           return (va - vb) * sortDir;
         }
         case "value": {
-          const getVal = (p: RankedPlayer): number | null => {
-            // K/DEF overallRank is forced to the bottom of the board by
-            // design (see rankPlayers in lib/vbd.ts), so consensus ADP minus
-            // overallRank is always a huge, meaningless negative number for
-            // them. Treat as "no value" so they group with the other
-            // no-value players instead of dragging the value sort down.
-            if (p.position === "K" || p.position === "DEF") return null;
-            const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-            const es = p.adp.espn >= 999 ? null : p.adp.espn;
-            const srcs = [sl, es].filter((x): x is number => x !== null);
-            if (!srcs.length) return null;
-            const consensus = srcs.reduce((acc, n) => acc + n, 0) / srcs.length;
-            return consensus - p.overallRank;
-          };
-          const va = getVal(a);
-          const vb = getVal(b);
+          // valueVsAdp already returns null for K/DEF (their overallRank is
+          // forced to the bottom of the board by design, see rankPlayers in
+          // lib/vbd.ts) and for players with no consensus ADP data.
+          const va = valueVsAdp(a, adpKey);
+          const vb = valueVsAdp(b, adpKey);
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
@@ -445,19 +397,10 @@ export default function DraftBoard() {
                   const adpRaw = p.adp[adpKey];
                   const adpDisplay = adpRaw >= 999 ? null : adpRaw;
                   const espnAdp = p.adp.espn >= 999 ? null : p.adp.espn;
-                  const adpSources = [adpDisplay, espnAdp].filter((x): x is number => x !== null);
-                  const consensusAdp = adpSources.length > 0
-                    ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
-                    : null;
-                  // K/DEF overallRank is forced to the bottom by design (see
-                  // rankPlayers), so Val would always read as a huge, bogus
-                  // negative number for them — show "—" instead.
-                  const value =
-                    p.position === "K" || p.position === "DEF"
-                      ? null
-                      : consensusAdp !== null
-                      ? consensusAdp - p.overallRank
-                      : null;
+                  // valueVsAdp already returns null for K/DEF (forced to the
+                  // bottom of the board by design, see rankPlayers in
+                  // lib/vbd.ts) and for players with no consensus ADP data.
+                  const value = valueVsAdp(p, adpKey);
                   const risk = riskScore(p);
                   const trend = trendMap[p.id] ?? 0;
                   return (
@@ -502,6 +445,7 @@ export default function DraftBoard() {
       {compareIds.length >= 2 && (
         <PlayerCompare
           players={ranked.filter((p) => compareIds.includes(p.id))}
+          adpKey={adpKey}
           onClose={() => setCompareIds([])}
           onRemove={(id) =>
             setCompareIds((prev) => {
@@ -554,7 +498,7 @@ function Row({
             colSpan={11}
             className="border-y border-dashed border-zinc-600 bg-zinc-800/40 px-3 py-1 text-center text-[11px] font-semibold uppercase tracking-widest text-zinc-400"
           >
-            ▼ Replacement level · players below have negative VOR
+            ▼ Replacement level · replacement band starts here
           </td>
         </tr>
       )}
