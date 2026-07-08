@@ -2,7 +2,16 @@ import type { Player, Position, RawStats } from "./types";
 import { ALL_POSITIONS } from "./types";
 import { byeFor } from "./byes";
 
-export const SEASON = "2026";
+// NFL fantasy season year, derived from today's date instead of hardcoded.
+// The season "year" is the calendar year of the season's autumn/winter, but
+// free agency, the draft, and offseason roster moves all happen in the
+// following Jan/Feb under the SAME season label (e.g. the 2025 season's
+// offseason runs into March 2026). So: Jan/Feb still belong to the PREVIOUS
+// season, and the new season "year" only starts once March begins.
+// `getMonth()` is 0-indexed, so March is index 2 — cutoff is `>= 2`.
+const today = new Date();
+const seasonYear = today.getMonth() >= 2 ? today.getFullYear() : today.getFullYear() - 1;
+export const SEASON: string = String(seasonYear);
 
 const SLEEPER_URL =
   `https://api.sleeper.com/projections/nfl/${SEASON}` +
