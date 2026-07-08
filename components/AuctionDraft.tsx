@@ -5,6 +5,7 @@ import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { POS_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 
 type Filter = "ALL" | Position;
@@ -25,15 +26,6 @@ const DEFAULT_SETUP: AuctionSetup = {
   numTeams: 12,
   budgetPerTeam: 200,
   started: false,
-};
-
-const POS_BADGE: Record<Position, string> = {
-  QB: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K: "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
 };
 
 export default function AuctionDraft() {
