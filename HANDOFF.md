@@ -117,9 +117,10 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
   import in `MockDraft.tsx`) live on a different base URL:
   `https://api.sleeper.app/v1` (note: `.app`, not `.com` — the projections/stats
   endpoints above are `.com`). Don't conflate the two hosts.
-- The Mock Draft "Live Sync" mode connects to a Sleeper draft over WebSocket
-  (`wss://prod.sleeper.app/v1/ws/websocket?vsn=2.0.0`, assumed Phoenix-channel
-  protocol). **This protocol is unverified** — see "What's actually left" below.
+- The Mock Draft "Live Sync" mode polls Sleeper's documented REST API
+  (`GET https://api.sleeper.app/v1/draft/{id}/picks` every ~5 seconds, deduped
+  by pick number, stops when draft status is `complete`, error state after 3
+  consecutive failures). Uses no WebSocket.
 
 ### VOR methodology (the core IP)
 
@@ -201,11 +202,6 @@ npm run build      # type + lint check (always run before declaring done)
   adjust port as needed).
 - The Sleeper projections host is `api.sleeper.com`; the users/leagues/drafts
   host is `api.sleeper.app` — easy to typo one for the other.
-- The live-draft WebSocket protocol in `MockDraft.tsx` (`connectLiveDraft`) is
-  reverse-engineered and marked with `TODO: WS protocol unverified` comments at
-  every assumption (URL, join message, wire format, event names, pick nesting).
-  If live sync misbehaves, that's the first place to check — inspect real
-  Sleeper network traffic rather than assuming the code is otherwise wrong.
 
 ## What's actually left
 
@@ -213,14 +209,9 @@ The original v1 punch list (value-vs-ADP column, K/DEF, byes, deploy +
 review-workflow install) has **all shipped** — verified against the code on
 this branch. What plausibly remains:
 
-1. **Live Sync WebSocket protocol verification** (`MockDraft.tsx`,
-   `connectLiveDraft`) — the Phoenix-channel URL, join message, wire format,
-   and event names are all educated guesses per the `TODO` comments. Needs
-   testing against a real live Sleeper draft, or removal/gating if it doesn't
-   work.
-2. **`SEASON` bump** — `lib/sleeper.ts` hardcodes `"2026"`; will need updating
+1. **`SEASON` bump** — `lib/sleeper.ts` hardcodes `"2026"`; will need updating
    (and a fresh `lib/byes.ts`) for the following season.
-3. General polish/bug-fix work — check `git log` and open PRs/branches for
+2. General polish/bug-fix work — check `git log` and open PRs/branches for
    in-flight fixes (e.g. auction math, cheat-sheet polish, mock-draft logic)
    before assuming a given area is unpolished from scratch.
 
