@@ -10,6 +10,7 @@ import {
   type Baselines,
 } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { SEASON } from "@/lib/sleeper";
 import { POS_BADGE, POS_DOT } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
@@ -17,25 +18,21 @@ import { marketReference, valueVsMarket } from "@/lib/market";
 import { assessRisk } from "@/lib/risk";
 import { fantasyPointsForStats } from "@/lib/scoring";
 import { annotationKey, EMPTY_ANNOTATION, updateAnnotation, type AnnotationStore, type PlayerAnnotation } from "@/lib/annotations";
-import { validRoster, validScoring } from "@/lib/validation";
+import {
+  validRoster,
+  validScoring,
+  validDraftedIds,
+  validBaselineMethod,
+  validAnnotationStore,
+  validAdpSnapshot,
+  type AdpSnapshot,
+} from "@/lib/validation";
 import PlayerCompare from "./PlayerCompare";
 
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-
-interface AdpSnapshot {
-  ts: number;
-  data: Record<string, number>;
-  // Which adpKey (ppr/half/std/superflex, see adpKeyFor) the snapshot's `data`
-  // was computed under. Consensus ADP differs by scoring/roster format, so a
-  // snapshot seeded under one key is meaningless compared against another —
-  // this lets us detect a format switch and rebuild instead of showing bogus
-  // trend arrows. Optional so snapshots persisted before this field existed
-  // are handled gracefully (treated as a mismatch, see trendMap below).
-  adpKey?: string;
-}
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1,   // asc: lower = better
@@ -74,15 +71,16 @@ export default function DraftBoard() {
   const [error, setError] = useState<string | null>(null);
   const [season, setSeason] = useState<string>("");
 
-  const [scoring, setScoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
-  const [roster, setRoster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
-  const [method, setMethod] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
-  const [drafted, setDrafted] = useLocalStorage<string[]>("ffdp.drafted", []);
-  const [snapshot, setSnapshot, snapshotHydrated] = useLocalStorage<AdpSnapshot | null>(
+  const [scoring, setScoring, , scoringError] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [roster, setRoster, , rosterError] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
+  const [method, setMethod, , methodError] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS", validBaselineMethod);
+  const [drafted, setDrafted, , draftedError] = useLocalStorage<string[]>("ffdp.drafted", [], validDraftedIds);
+  const [snapshot, setSnapshot, snapshotHydrated, snapshotError] = useLocalStorage<AdpSnapshot | null>(
     "ffdp.adp-snapshot",
     null,
+    validAdpSnapshot,
   );
-  const [annotations, setAnnotations] = useLocalStorage<AnnotationStore>("ffdp.annotations", {});
+  const [annotations, setAnnotations, , annotationsError] = useLocalStorage<AnnotationStore>("ffdp.annotations", {}, validAnnotationStore);
 
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
@@ -90,6 +88,22 @@ export default function DraftBoard() {
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [dismissedStorageNotice, setDismissedStorageNotice] = useState(false);
+
+  const storageErrors = useMemo(
+    () =>
+      (
+        [
+          ["Scoring settings", scoringError],
+          ["Roster settings", rosterError],
+          ["Ranking method", methodError],
+          ["Drafted players", draftedError],
+          ["ADP trend snapshot", snapshotError],
+          ["Player notes", annotationsError],
+        ] as [string, string | null][]
+      ).filter((entry): entry is [string, string] => entry[1] !== null),
+    [scoringError, rosterError, methodError, draftedError, snapshotError, annotationsError]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -118,18 +132,19 @@ export default function DraftBoard() {
     if (!players || !snapshotHydrated) return;
     setSnapshot((prev) => {
       const now = Date.now();
-      // Still fresh AND seeded under the currently-active adpKey → keep it.
-      // A missing adpKey (snapshot from before this field existed) or a key
-      // that doesn't match the current scoring/roster format both count as
-      // a mismatch and force a rebuild below.
-      if (prev && prev.adpKey === adpKey && now - prev.ts <= SEVEN_DAYS_MS) return prev;
+      // Still fresh AND seeded under the currently-active adpKey AND season →
+      // keep it. A missing/mismatched adpKey (format switch, or a snapshot
+      // from before this field existed) or a missing/mismatched season (a
+      // snapshot left over from a prior season — same format, stale
+      // consensus numbers) both count as a mismatch and force a rebuild.
+      if (prev && prev.adpKey === adpKey && prev.season === SEASON && now - prev.ts <= SEVEN_DAYS_MS) return prev;
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
         const market = marketReference(p, scoring, roster);
         if (market.consensus !== null) data[p.id] = market.consensus;
       }
-      return { ts: now, data, adpKey };
+      return { ts: now, data, adpKey, season: SEASON };
     });
   }, [players, snapshotHydrated, adpKey, setSnapshot, scoring, roster]);
 
@@ -141,10 +156,12 @@ export default function DraftBoard() {
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
     // Snapshot was seeded under a different adpKey (format switch, or an old
-    // snapshot from before adpKey was tracked) — its ADP values aren't
-    // comparable to the current consensus, so bail out rather than show
-    // bogus trend arrows. The seeding effect above will rebuild it shortly.
-    if (snapshot.adpKey !== adpKey) return {};
+    // snapshot from before adpKey was tracked) or a different season (a
+    // snapshot left over from a prior season, or from before season was
+    // tracked) — its ADP values aren't comparable to the current consensus,
+    // so bail out rather than show bogus trend arrows. The seeding effect
+    // above will rebuild it shortly.
+    if (snapshot.adpKey !== adpKey || snapshot.season !== SEASON) return {};
     const map: Record<string, number> = {};
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
@@ -265,6 +282,31 @@ export default function DraftBoard() {
       />
 
       <main className="min-w-0 flex-1">
+        {storageErrors.length > 0 && !dismissedStorageNotice && (
+          <div className="mb-4 flex items-start justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+            <div>
+              <p className="font-medium">Some saved data couldn&apos;t be loaded and was reset:</p>
+              <ul className="mt-1 list-disc pl-5 text-amber-300/90">
+                {storageErrors.map(([label, message]) => (
+                  <li key={label}>
+                    {label}: {message}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-1 text-xs text-amber-300/70">
+                The original saved value(s) were kept in a backup key (same name plus &quot;.corrupt&quot;) in case you need to recover them.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDismissedStorageNotice(true)}
+              className="shrink-0 rounded px-2 py-1 text-xs text-amber-300 underline hover:text-amber-100"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {/* Baseline summary — skill positions only */}
         {baselines && (
           <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
@@ -406,8 +448,8 @@ export default function DraftBoard() {
                       risk={risk.score}
                       riskExplanation={`${risk.factors.join("; ")} · ${risk.confidence} confidence estimate`}
                       actualPoints={p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null}
-                      annotation={annotations[annotationKey(season || "2026", p.id)] ?? EMPTY_ANNOTATION}
-                      onAnnotation={(patch) => setAnnotations((prev) => updateAnnotation(prev, season || "2026", p.id, patch))}
+                      annotation={annotations[annotationKey(SEASON, p.id)] ?? EMPTY_ANNOTATION}
+                      onAnnotation={(patch) => setAnnotations((prev) => updateAnnotation(prev, SEASON, p.id, patch))}
                       trend={trend}
                       isDrafted={isDrafted}
                       tierBreak={tierBreak}

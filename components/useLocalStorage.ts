@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { encodeStored, parseStored } from "@/lib/persistence";
+import { encodeStored, parseStored, quarantineKeyFor } from "@/lib/persistence";
 
 /** Persisted state backed by localStorage, SSR-safe (reads after mount). */
 export function useLocalStorage<T>(key: string, initial: T, validate?: (value: unknown) => value is T) {
@@ -16,6 +16,17 @@ export function useLocalStorage<T>(key: string, initial: T, validate?: (value: u
       // eslint-disable-next-line react-hooks/set-state-in-effect -- hydration reads an external browser store
       setValue(parsed.value);
       setStorageError(parsed.error);
+      if (raw !== null && parsed.error) {
+        // The record failed validation/migration and is about to be reset to
+        // the fallback (see the persist effect below), which would otherwise
+        // silently destroy it. Stash the raw payload under a sibling key so
+        // it stays recoverable.
+        try {
+          window.localStorage.setItem(quarantineKeyFor(key), raw);
+        } catch {
+          // best effort — a failed quarantine shouldn't block recovery of the app itself
+        }
+      }
       if (raw !== null && parsed.migrated) window.localStorage.setItem(key, encodeStored(parsed.value));
     } catch (error) {
       setStorageError(error instanceof Error ? error.message : "Unable to read saved data.");

@@ -6,6 +6,16 @@ export function encodeStored<T>(data: T, season?: string): string {
   return JSON.stringify({ version: STORAGE_VERSION, ...(season ? { season } : {}), data });
 }
 
+/**
+ * Sibling localStorage key used to preserve a raw payload that failed
+ * validation/migration, so the original value isn't silently destroyed the
+ * moment it gets reset to the caller's fallback. Pure so it can be unit
+ * tested without touching `window.localStorage`.
+ */
+export function quarantineKeyFor(key: string): string {
+  return `${key}.corrupt`;
+}
+
 export function parseStored<T>(raw: string | null, fallback: T, validate?: (value: unknown) => value is T): ParseResult<T> {
   if (raw === null) return { value: fallback, migrated: false, error: null };
   try {

@@ -15,12 +15,14 @@ import { validRoster, validScoring } from "@/lib/validation";
 import { encodeStored, parseStored } from "@/lib/persistence";
 import { marketReference } from "@/lib/market";
 import {
-  chooseCpuPick,
+  chooseCpuPickOrBestAvailable,
   gradeLetter,
   gradePick,
   keeperValue,
+  mergeKeepersNonDestructive,
   ownerForPick,
   pickNumberForSlot,
+  pollBackoffDelay,
   positionalRun,
   rosterSlots,
   seededRandom,
@@ -206,6 +208,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [keeperPlayerId, setKeeperPlayerId] = useState<string | null>(null);
   const [keeperSlot, setKeeperSlot] = useState(1);
   const [keeperRound, setKeeperRound] = useState(1);
+  const [keeperError, setKeeperError] = useState<string | null>(null);
 
   // Export / copy state
   const [copiedRoster, setCopiedRoster] = useState(false);
@@ -227,6 +230,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
+  // Manual "Refresh now" control for the live-sync poll below; the effect
+  // that owns the actual poll loop keeps this pointed at its latest closure.
+  const livePollRef = useRef<() => void>(() => {});
 
   // Restore import settings from sessionStorage on mount
   useEffect(() => {
@@ -527,7 +533,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         return player ? [{ id: player.id, position: player.position }] : [];
       });
       const configuredSlots = rosterSlots(roster);
-      const best = chooseCpuPick(available, teamPlayers, configuredSlots, (player) => marketReference(player, scoring, roster).consensus, seededRandom(currentPickNum * 1009 + currentTeamSlot));
+      // Fall back to best-available (bench-anything) once the roster's slots
+      // are full — e.g. an imported league with more rounds than the local
+      // roster config has slots for — so the CPU always has a legal pick and
+      // the draft can't stall waiting on a pick that will never come.
+      const best = chooseCpuPickOrBestAvailable(available, teamPlayers, configuredSlots, (player) => marketReference(player, scoring, roster).consensus, seededRandom(currentPickNum * 1009 + currentTeamSlot));
 
       if (best) {
         setPicks((prev) => [
@@ -578,11 +588,20 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           isKeeper: true as const,
         };
       });
-      setPicks((prev) => {
-        const merged = new Map(prev.map((p) => [p.pickNumber, p]));
-        for (const kp of keeperPicks) merged.set(kp.pickNumber, kp);
-        return [...merged.values()].sort((a, b) => a.pickNumber - b.pickNumber);
-      });
+      // Never let a keeper silently clobber an existing (e.g. imported) pick
+      // at the same pickNumber — a naive Map.set merge would otherwise
+      // overwrite it with no trace. Skip colliding keepers and surface a
+      // visible message instead of merging destructively.
+      const { merged, skipped } = mergeKeepersNonDestructive(picks, keeperPicks);
+      if (skipped.length > 0) {
+        // Stay on the setup screen so the message is actually seen — once
+        // the draft starts, the setup screen (and this error) is gone.
+        setKeeperError(
+          `${skipped.length} keeper${skipped.length !== 1 ? "s" : ""} collided with an existing pick at that slot and ${skipped.length !== 1 ? "were" : "was"} not applied. Remove or reassign ${skipped.length !== 1 ? "them" : "it"}, then start again.`
+        );
+        return;
+      }
+      setPicks(merged);
     }
     sendDraftEvent({ type: "READY" });
     sendDraftEvent({ type: "START" });
@@ -609,6 +628,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setUserDrafts([]);
     setUserLookupError(null);
     setPendingKeepers([]);
+    setKeeperError(null);
     setBoardFilter("ALL");
     setTeamNames({});
     setLeagueRosterPositions([]);
@@ -695,9 +715,24 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   function addKeeper() {
     if (!keeperPlayerId) return;
+    setKeeperError(null);
     const pickNum = pickNumberForSlot(keeperRound, keeperSlot, numTeams);
-    if (pendingKeepers.some((k) => pickNumberForSlot(k.round, k.teamSlot, numTeams) === pickNum)) return;
-    if (pendingKeepers.some((k) => k.playerId === keeperPlayerId)) return;
+    if (pendingKeepers.some((k) => pickNumberForSlot(k.round, k.teamSlot, numTeams) === pickNum)) {
+      setKeeperError(`Round ${keeperRound} for ${teamLabel(keeperSlot)} is already assigned to another keeper.`);
+      return;
+    }
+    // pendingKeepers only checks other pending keepers — it never checked
+    // pickedNums (existing picks, e.g. from a Sleeper import or a draft that
+    // was reset back to setup with picks already made). Without this check
+    // startDraft's Map-based merge would silently overwrite that pick.
+    if (pickedNums.has(pickNum)) {
+      setKeeperError(`Pick #${pickNum} (Round ${keeperRound}, ${teamLabel(keeperSlot)}) is already taken by an existing pick.`);
+      return;
+    }
+    if (pendingKeepers.some((k) => k.playerId === keeperPlayerId)) {
+      setKeeperError("That player is already set as a keeper.");
+      return;
+    }
     setPendingKeepers((prev) => [
       ...prev,
       { playerId: keeperPlayerId, teamSlot: keeperSlot, round: keeperRound },
@@ -710,16 +745,21 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (!draftId.trim()) return;
     setSyncStatus("syncing");
     setSyncError(null);
-    try {
-      await handleImport();
-      setLastSyncAt(Date.now());
-      setSyncStatus("live");
-      sendDraftEvent({ type: "READY" });
-      sendDraftEvent({ type: "SYNC" });
-    } catch (error) {
+    // handleImport swallows its own errors (setImportError, no throw) so the
+    // setup screen's plain "Import Draft" button can rely on it never
+    // rejecting. That means a try/catch here would never fire for a bad
+    // draft ID — connectLiveDraft must check handleImport's return value
+    // instead of relying on an exception to know the import failed.
+    const errorMessage = await handleImport();
+    if (errorMessage) {
       setSyncStatus("error");
-      setSyncError(error instanceof Error ? error.message : String(error));
+      setSyncError(errorMessage);
+      return;
     }
+    setLastSyncAt(Date.now());
+    setSyncStatus("live");
+    sendDraftEvent({ type: "READY" });
+    sendDraftEvent({ type: "SYNC" });
   }
 
   async function handleLookupUser() {
@@ -773,9 +813,14 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     }
   }
 
-  async function handleImport() {
+  // Returns null on success, or the error message on failure. Never throws —
+  // callers that only want fire-and-forget behavior (the setup screen's
+  // "Import Draft" button) can ignore the return value, while callers that
+  // need to know whether the import actually succeeded (connectLiveDraft)
+  // can check it instead of relying on a rejected promise.
+  async function handleImport(): Promise<string | null> {
     const id = draftId.trim();
-    if (!id) return;
+    if (!id) return null;
     setImporting(true);
     setImportError(null);
     setImportSummary(null);
@@ -902,8 +947,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           leagueRosterPositions: rosterPositions,
         }, SEASON)
       );
+      return null;
     } catch (e) {
-      setImportError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setImportError(message);
+      return message;
     } finally {
       setImporting(false);
     }
@@ -911,14 +959,34 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   useEffect(() => {
     if (!started || draftMode !== "live" || !draftId.trim() || isDone) return;
+    let cancelled = false;
+    let seq = 0;
     let failures = 0;
+    let timer: number | undefined;
+    // 8s -> 16s -> 32s, capped, reset to 8s as soon as a poll succeeds.
+    const nextDelay = () => pollBackoffDelay(failures);
+    const scheduleNext = (delayMs: number) => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => { void poll(); }, delayMs);
+    };
+
     const poll = async () => {
-      if (document.visibilityState !== "visible") return;
+      if (cancelled) return;
+      if (document.visibilityState !== "visible") {
+        scheduleNext(nextDelay());
+        return;
+      }
+      // Tag this request so a response that resolves after a *later* poll
+      // has already started (e.g. a slow tick-N response landing after
+      // tick-N+1, or a manual refresh overlapping the interval poll) gets
+      // discarded instead of clobbering newer data with a stale snapshot.
+      const mySeq = ++seq;
       setSyncStatus("syncing");
       try {
         const response = await fetch(`https://api.sleeper.app/v1/draft/${draftId.trim()}/picks`, { cache: "no-store" });
         if (!response.ok) throw new Error(`Sleeper picks request failed (${response.status})`);
         const sleeperPicks: SleeperPick[] = await response.json();
+        if (cancelled || mySeq !== seq) return;
         setPicks(sleeperPicks.map((sp) => ({
           pickNumber: sp.pick_no, teamSlot: ownerForPick(sp.pick_no, numTeams, tradeRecords), playerId: sp.player_id,
           playerName: sp.metadata?.first_name && sp.metadata?.last_name ? `${sp.metadata.first_name} ${sp.metadata.last_name}` : sp.player_id,
@@ -929,13 +997,27 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         setSyncError(null);
         setSyncStatus("live");
       } catch (error) {
+        if (cancelled || mySeq !== seq) return;
         failures++;
         setSyncError(error instanceof Error ? error.message : String(error));
         setSyncStatus(failures > 1 ? "stale" : "error");
+      } finally {
+        if (!cancelled && mySeq === seq) scheduleNext(nextDelay());
       }
     };
-    const timer = window.setInterval(() => { void poll(); }, 8000);
-    return () => window.clearInterval(timer);
+
+    // Manual "Refresh now" hook: clear whatever's pending and poll immediately.
+    livePollRef.current = () => {
+      if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
+      void poll();
+    };
+
+    scheduleNext(8000);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      livePollRef.current = () => {};
+    };
   }, [started, draftMode, draftId, isDone, numTeams, tradeRecords]);
 
   // ── Setup screen ──────────────────────────────────────────────────────────
@@ -1114,6 +1196,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                     </div>
                   )}
                 </div>
+                {keeperError && <p className="mt-1.5 text-xs text-rose-400">{keeperError}</p>}
               </div>
             )}
           </div>
@@ -1327,6 +1410,15 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 ? "Sync error"
                 : "Not syncing"}
             </span>
+          )}
+          {draftMode === "live" && (
+            <button
+              onClick={() => livePollRef.current()}
+              disabled={syncStatus === "syncing"}
+              className="rounded-md border border-zinc-700 px-3 py-1 text-xs text-zinc-400 transition hover:text-zinc-200 disabled:opacity-40"
+            >
+              Refresh now
+            </button>
           )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
             {(["players", "board", "scarcity"] as const).map((v) => (

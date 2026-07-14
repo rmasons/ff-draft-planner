@@ -511,57 +511,59 @@ Phase ordering is the default execution order. Within a phase, items whose depen
 
 ## Implementation tracking checklist
 
+Status audited 2026-07-14 against the acceptance criteria above (fresh-context review + fix pass on `fix/review-reconcile`). Unchecked items carry a note describing the remaining gap.
+
 ### Phase 1
 
-- [ ] P1-1
-- [ ] P1-2
+- [x] P1-1
+- [ ] P1-2 — route/normalization contract tests with mocked fetch now exist (`tests/data-fixes.test.ts`), but flex/superflex baseline allocation and VORP bench allocation are still untested.
 
 ### Phase 2
 
-- [ ] P2-1
-- [ ] P2-2
-- [ ] P2-3
-- [ ] P2-4
-- [ ] P2-5
+- [x] P2-1
+- [x] P2-2
+- [x] P2-3
+- [x] P2-4
+- [x] P2-5
 
 ### Phase 3
 
-- [ ] P3-1
-- [ ] P3-2
-- [ ] P3-3
-- [ ] P3-4
-- [ ] P3-5
+- [ ] P3-1 — MockDraft retains a second local roster assigner alongside `lib/draft.ts`'s engine, and CPU legality is checked against the cheat-sheet roster config rather than the imported league's positions.
+- [ ] P3-2 — CPU picks are need/tier-aware and per-pick seeded, but there is no draft-level seed (repeat drafts are identical) and the feasibility guard only checks assignability, not starter fillability.
+- [x] P3-3
+- [x] P3-4
+- [ ] P3-5 — the reducer exists but `COMPLETE`/`STALE` are never dispatched; completion and staleness still live in derived values and a separate `syncStatus` state.
 
 ### Phase 4
 
-- [ ] P4-1
-- [ ] P4-2
-- [ ] P4-3
-- [ ] P4-4
+- [x] P4-1
+- [x] P4-2
+- [ ] P4-3 — guidance is per-team, but prices actually paid never enter the formula (no inflation ratio), the formula is unlabeled in the UI, and the pool-exhausted fallback is silent.
+- [ ] P4-4 — budget guidance (incl. spendable-above-minimum) is displayed and updates correctly, but accessible labels/tooltips are minimal.
 
 ### Phase 5
 
-- [ ] P5-1
-- [ ] P5-2
-- [ ] P5-3
-- [ ] P5-4
-- [ ] P5-5
-- [ ] P5-6
+- [ ] P5-1 — the pick is still chosen by highest-VOR-fills-need; the composite score is post hoc, tooltip-only, with no factor breakdown or confidence flags.
+- [ ] P5-2 — next-owned-pick (trade-aware) survival is computed and shown, but only for the suggested player and without labeled assumptions/ranges.
+- [ ] P5-3 — the metric measures the drop to the next available player, not the next tier; no cheat-sheet indicator or tested threshold policy.
+- [ ] P5-4 — run detection works and excludes keepers, but only surfaces inside the suggestion button in CPU mode.
+- [x] P5-5
+- [ ] P5-6 — deterministic evidence factors + confidence exist, but zero-evidence players render green/safe with the "low confidence" label buried in a mouse-only tooltip.
 
 ### Phase 6
 
-- [ ] P6-1
-- [ ] P6-2
-- [ ] P6-3
-- [ ] P6-4
-- [ ] P6-5
-- [ ] P6-6
+- [ ] P6-1 — bounds/validators exist and auction setup now clamps with a visible message, but ConfigPanel still silently clamps and shows no inline errors.
+- [ ] P6-2 — envelopes, validators, quarantine-on-corruption (`<key>.corrupt`), and a recovery notice now exist, but season scoping is not enforced by the storage adapter itself (only per-payload where callers check it).
+- [ ] P6-3 — in-module memos removed; per-source `unstable_cache` units with stale-on-error semantics and CDN headers; cross-instance durability still depends on the platform (no `cacheHandler` configured) and is undocumented operationally.
+- [x] P6-4
+- [ ] P6-5 — sortable headers/rows/annotation controls are keyboard-accessible, but the only live region is the auction bid error; draft/sync results are not announced and some labels are tooltip-only.
+- [ ] P6-6 — MockDraft.tsx is still ~1,900 lines combining import, sync, simulation, analytics, export, and three views.
 
 ### Phase 7
 
-- [ ] P7-1
-- [ ] P7-2
-- [ ] P7-3
+- [x] P7-1
+- [x] P7-2
+- [x] P7-3
 
 ## Release-readiness checklist
 

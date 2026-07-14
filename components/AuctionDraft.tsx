@@ -7,23 +7,15 @@ import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { POS_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
-import { auctionBudget, legalAuctionPurchase, teamAuctionValue } from "@/lib/auction";
+import {
+  auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, isValidWonPlayers,
+  legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
+  type AuctionSetup, type WonPlayer,
+} from "@/lib/auction";
 import { rosterSlots } from "@/lib/draft";
-import { boundedInteger, validRoster, validScoring } from "@/lib/validation";
+import { validRoster, validScoring } from "@/lib/validation";
 
 type Filter = "ALL" | Position;
-
-interface WonPlayer {
-  playerId: string;
-  teamIndex: number;
-  price: number;
-}
-
-interface AuctionSetup {
-  numTeams: number;
-  budgetPerTeam: number;
-  started: boolean;
-}
 
 const DEFAULT_SETUP: AuctionSetup = {
   numTeams: 12,
@@ -41,14 +33,18 @@ export default function AuctionDraft() {
   const [rosterCfg] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
   const [method] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
 
-  // Auction-specific persisted state
+  // Auction-specific persisted state. Validated on load so malformed
+  // localStorage (e.g. a non-numeric price) can't flow into budget math and
+  // silently defeat the max-bid gate (see lib/auction.ts).
   const [wonPlayers, setWonPlayers] = useLocalStorage<WonPlayer[]>(
     "ffdp.auction.wonPlayers",
-    []
+    [],
+    isValidWonPlayers
   );
   const [setup, setSetup, setupHydrated] = useLocalStorage<AuctionSetup>(
     "ffdp.auction.setup",
-    DEFAULT_SETUP
+    DEFAULT_SETUP,
+    isValidAuctionSetup
   );
 
   // Local draft of the setup form (pre-Start); syncs once localStorage hydrates
@@ -56,6 +52,7 @@ export default function AuctionDraft() {
     numTeams: DEFAULT_SETUP.numTeams,
     budgetPerTeam: DEFAULT_SETUP.budgetPerTeam,
   });
+  const [setupMessage, setSetupMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (setupHydrated) {
@@ -138,10 +135,19 @@ export default function AuctionDraft() {
   )), [budgets, setup.budgetPerTeam, slots.length, teamPlayers]);
   const remainingTotalBudget = useMemo(() => budgets.reduce((sum, budget) => sum + budget, 0), [budgets]);
 
+  // Per-team legal-position set, computed once per team (not once per
+  // visible player row). Legality of a $1 nomination only depends on the
+  // team's roster + budget + the candidate's position, never on which
+  // specific player is asked about, so this tests the ~6 known positions
+  // instead of running legalAuctionPurchase (and its backtracking
+  // assignRoster solve) for every available player on every row render.
+  const teamLegalPositions = useMemo(
+    () => budgetGuidance.map((budget, teamIndex) => legalPositionsForTeam(budget, teamPlayers[teamIndex] ?? [], slots)),
+    [budgetGuidance, teamPlayers, slots]
+  );
+
   function suggestedBid(p: RankedPlayer, teamIndex = nomineeWinner): number {
-    const legalPositions = new Set(available.filter((candidate) => legalAuctionPurchase(
-      1, budgetGuidance[teamIndex], teamPlayers[teamIndex] ?? [], candidate, slots,
-    ).legal).map((candidate) => candidate.position));
+    const legalPositions = teamLegalPositions[teamIndex] ?? new Set<Position>();
     return teamAuctionValue(p, available, budgetGuidance[teamIndex], legalPositions);
   }
 
@@ -160,10 +166,18 @@ export default function AuctionDraft() {
   }, [available, filter, query]);
 
   function handleStart() {
-    const n = boundedInteger(setupDraft.numTeams, 12, 2, 32);
     const minimumRoster = slots.length;
-    const b = boundedInteger(setupDraft.budgetPerTeam, 200, minimumRoster, 10000);
-    setSetup({ numTeams: n, budgetPerTeam: b, started: true });
+    const clamped = clampAuctionSetupInput(setupDraft.numTeams, setupDraft.budgetPerTeam, minimumRoster);
+    if (clamped.adjusted) {
+      // Clamp to the nearest bound and show what changed, instead of
+      // silently substituting a fallback default (e.g. 33 teams -> 32, not a
+      // silent 12-team default). Require a second Start click to confirm.
+      setSetupDraft({ numTeams: clamped.numTeams, budgetPerTeam: clamped.budgetPerTeam });
+      setSetupMessage(clamped.messages.join(" "));
+      return;
+    }
+    setSetupMessage(null);
+    setSetup({ numTeams: clamped.numTeams, budgetPerTeam: clamped.budgetPerTeam, started: true });
     setWonPlayers([]);
   }
 
@@ -254,6 +268,11 @@ export default function AuctionDraft() {
               className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none"
             />
           </div>
+          {setupMessage && (
+            <p role="alert" className="mb-4 text-xs text-rose-400">
+              {setupMessage}
+            </p>
+          )}
           <button
             onClick={handleStart}
             className="w-full rounded-lg bg-emerald-500 py-2.5 font-semibold text-zinc-950 transition hover:bg-emerald-400"
@@ -529,6 +548,7 @@ export default function AuctionDraft() {
                   <span className="text-right">${budgetGuidance[i].dollarsPerSlot.toFixed(1)}/slot</span>
                   <span>${budgetGuidance[i].reservedMinimum} reserved</span>
                   <span className="text-right">${budgetGuidance[i].maxBid} max</span>
+                  <span className="col-span-2">${budgetGuidance[i].spendable} spendable above min</span>
                 </div>
                 {teamRoster.map((w) => (
                   <div
