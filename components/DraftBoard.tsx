@@ -12,6 +12,11 @@ import {
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
+import { marketReference } from "@/lib/market";
+import { assessRisk } from "@/lib/risk";
+import { fantasyPointsForStats } from "@/lib/scoring";
+import { annotationKey, EMPTY_ANNOTATION, updateAnnotation, type AnnotationStore, type PlayerAnnotation } from "@/lib/annotations";
+import { validRoster, validScoring } from "@/lib/validation";
 
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
@@ -31,18 +36,6 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   value: -1, // desc: bigger steal = better
   risk: -1,  // desc: higher risk first (surface the most dangerous picks)
 };
-
-function riskScore(p: Player): number {
-  let score = 1;
-  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
-  else if (p.injuryStatus === "Out") score += 5;
-  else if (p.injuryStatus === "Doubtful") score += 4;
-  else if (p.injuryStatus === "Questionable") score += 2;
-  if (p.injuryNotes?.includes("Surgery")) score += 2;
-  if (p.yearsExp === 0) score += 1;
-  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
-  return Math.min(score, 10);
-}
 
 const TIER_COLORS = [
   "#34d399", "#60a5fa", "#c084fc", "#fbbf24",
@@ -67,19 +60,37 @@ const POS_DOT: Record<Position, string> = {
   DEF: "#fb923c",
 };
 
+function SortTh({
+  label, sk, sortKey, sortDir, onSort, className, subLabel,
+}: {
+  label: string; sk: SortKey; sortKey: SortKey; sortDir: 1 | -1;
+  onSort: (key: SortKey) => void; className?: string; subLabel?: string;
+}) {
+  const active = sortKey === sk;
+  return (
+    <th aria-sort={active ? (sortDir === 1 ? "ascending" : "descending") : "none"} className={`select-none px-3 py-2 font-medium ${active ? "text-emerald-400" : "text-zinc-500"} ${className ?? ""}`}>
+      <button type="button" onClick={() => onSort(sk)} className="rounded px-1 transition hover:text-zinc-200 focus-visible:outline-2 focus-visible:outline-emerald-400">
+        {label}{subLabel && <span className="ml-1 font-normal text-zinc-600">{subLabel}</span>}
+        <span className="ml-0.5 text-[10px]">{active ? sortDir === 1 ? " ↑" : " ↓" : <span className="text-zinc-700"> ⇅</span>}</span>
+      </button>
+    </th>
+  );
+}
+
 export default function DraftBoard() {
   const [players, setPlayers] = useState<Player[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [season, setSeason] = useState<string>("");
 
-  const [scoring, setScoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING);
-  const [roster, setRoster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
+  const [scoring, setScoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [roster, setRoster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
   const [method, setMethod] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
   const [drafted, setDrafted] = useLocalStorage<string[]>("ffdp.drafted", []);
   const [snapshot, setSnapshot, snapshotHydrated] = useLocalStorage<AdpSnapshot | null>(
     "ffdp.adp-snapshot",
     null,
   );
+  const [annotations, setAnnotations] = useLocalStorage<AnnotationStore>("ffdp.annotations", {});
 
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
@@ -118,36 +129,28 @@ export default function DraftBoard() {
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
-        const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-        const es = p.adp.espn >= 999 ? null : p.adp.espn;
-        const srcs = [sl, es].filter((x): x is number => x !== null);
-        if (srcs.length > 0) {
-          data[p.id] = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-        }
+        const market = marketReference(p, scoring, roster);
+        if (market.consensus !== null) data[p.id] = market.consensus;
       }
       return { ts: now, data };
     });
-  }, [players, snapshotHydrated, adpKey, setSnapshot]);
+  }, [players, snapshotHydrated, adpKey, setSnapshot, scoring, roster]);
 
   // Map player_id → trend delta (positive = rising, negative = falling).
   // Only populated when a fresh (≤7 day old) snapshot exists from a prior load.
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
-    if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
     const map: Record<string, number> = {};
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
       if (snapAdp === undefined) continue;
-      const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-      const es = p.adp.espn >= 999 ? null : p.adp.espn;
-      const srcs = [sl, es].filter((x): x is number => x !== null);
-      if (srcs.length === 0) continue;
-      const currentConsensus = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      const currentConsensus = marketReference(p, scoring, roster).consensus;
+      if (currentConsensus === null) continue;
       // Positive → snapshotAdp was higher → player is now drafted earlier → rising
       map[p.id] = snapAdp - currentConsensus;
     }
     return map;
-  }, [players, snapshot, snapshotHydrated, adpKey]);
+  }, [players, snapshot, snapshotHydrated, scoring, roster]);
 
   const { ranked, baselines } = useMemo(() => {
     if (!players) return { ranked: [] as RankedPlayer[], baselines: null as Baselines | null };
@@ -189,8 +192,8 @@ export default function DraftBoard() {
         case "vor":
           return (a.vbd - b.vbd) * sortDir;
         case "adp": {
-          const va = a.adp[adpKey] >= 999 ? null : a.adp[adpKey];
-          const vb = b.adp[adpKey] >= 999 ? null : b.adp[adpKey];
+          const va = marketReference(a, scoring, roster).consensus;
+          const vb = marketReference(b, scoring, roster).consensus;
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
@@ -198,12 +201,8 @@ export default function DraftBoard() {
         }
         case "value": {
           const getVal = (p: RankedPlayer): number | null => {
-            const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-            const es = p.adp.espn >= 999 ? null : p.adp.espn;
-            const srcs = [sl, es].filter((x): x is number => x !== null);
-            if (!srcs.length) return null;
-            const consensus = srcs.reduce((acc, n) => acc + n, 0) / srcs.length;
-            return consensus - p.overallRank;
+            const consensus = marketReference(p, scoring, roster).consensus;
+            return consensus === null ? null : consensus - p.overallRank;
           };
           const va = getVal(a);
           const vb = getVal(b);
@@ -213,14 +212,14 @@ export default function DraftBoard() {
           return (va - vb) * sortDir;
         }
         case "risk":
-          return (riskScore(a) - riskScore(b)) * sortDir;
+          return (assessRisk(a).score - assessRisk(b).score) * sortDir;
         default:
           return 0;
       }
     });
 
     return hideDrafted ? sorted.filter((p) => !draftedSet.has(p.id)) : sorted;
-  }, [ranked, filter, query, hideDrafted, draftedSet, sortKey, sortDir, adpKey]);
+  }, [ranked, filter, query, hideDrafted, draftedSet, sortKey, sortDir, scoring, roster]);
 
   const toggleDrafted = (id: string) =>
     setDrafted((prev) =>
@@ -233,36 +232,6 @@ export default function DraftBoard() {
     filter !== "ALL" && !query.trim() && isRankSort && baselines
       ? baselines[filter].rank
       : null;
-
-  function SortTh({
-    label,
-    sk,
-    className,
-    subLabel,
-  }: {
-    label: string;
-    sk: SortKey;
-    className?: string;
-    subLabel?: string;
-  }) {
-    const active = sortKey === sk;
-    return (
-      <th
-        onClick={() => handleSort(sk)}
-        className={`cursor-pointer select-none px-3 py-2 font-medium transition hover:text-zinc-200 ${
-          active ? "text-emerald-400" : "text-zinc-500"
-        } ${className ?? ""}`}
-      >
-        {label}
-        {subLabel && <span className="ml-1 font-normal text-zinc-600">{subLabel}</span>}
-        <span className="ml-0.5 text-[10px]">
-          {active
-            ? sortDir === 1 ? " ↑" : " ↓"
-            : <span className="text-zinc-700"> ⇅</span>}
-        </span>
-      </th>
-    );
-  }
 
   return (
     <div className="flex flex-col gap-6 lg:flex-row">
@@ -363,20 +332,20 @@ export default function DraftBoard() {
         )}
 
         {players && (
-          <div className="overflow-hidden rounded-xl border border-zinc-800">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800" tabIndex={0} aria-label="Draft rankings table">
+            <table className="min-w-[940px] w-full text-sm">
               <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                 <tr>
-                  <SortTh label="#" sk="rank" className="text-left" />
+                  <SortTh label="#" sk="rank" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-left" />
                   <th className="px-3 py-2 text-left font-medium text-zinc-500">Player</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Tier</th>
-                  <SortTh label="Proj" sk="proj" className="text-right" />
+                  <SortTh label="Proj" sk="proj" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
                   <th className="px-3 py-2 text-right font-medium text-zinc-500">2025</th>
-                  <SortTh label="VOR" sk="vor" className="text-right" />
-                  <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
-                  <SortTh label="Val" sk="value" className="text-right" />
-                  <SortTh label="Risk" sk="risk" className="text-center" />
+                  <SortTh label="VOR" sk="vor" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                  <SortTh label="ADP" sk="adp" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" subLabel={adpKey === "ppr" ? "SL·ESPN" : "Sleeper"} />
+                  <SortTh label="Val" sk="value" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                  <SortTh label="Risk" sk="risk" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-center" />
                   <th className="px-2 py-2 text-center font-medium text-zinc-500"></th>
                 </tr>
               </thead>
@@ -397,25 +366,23 @@ export default function DraftBoard() {
                     p.posRank > replRank &&
                     (!prev || prev.posRank <= replRank);
                   const isDrafted = draftedSet.has(p.id);
-                  const adpRaw = p.adp[adpKey];
-                  const adpDisplay = adpRaw >= 999 ? null : adpRaw;
-                  const espnAdp = p.adp.espn >= 999 ? null : p.adp.espn;
-                  const adpSources = [adpDisplay, espnAdp].filter((x): x is number => x !== null);
-                  const consensusAdp = adpSources.length > 0
-                    ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
-                    : null;
-                  const value = consensusAdp !== null ? consensusAdp - p.overallRank : null;
-                  const risk = riskScore(p);
+                  const market = marketReference(p, scoring, roster);
+                  const value = market.consensus !== null ? market.consensus - p.overallRank : null;
+                  const risk = assessRisk(p);
                   const trend = trendMap[p.id] ?? 0;
                   return (
                     <Row
                       key={p.id}
                       p={p}
                       rank={filter === "ALL" ? p.overallRank : p.posRank}
-                      adp={adpDisplay}
-                      espnAdp={espnAdp}
+                      adp={market.sleeper}
+                      espnAdp={market.espn}
                       value={value}
-                      risk={risk}
+                      risk={risk.score}
+                      riskExplanation={`${risk.factors.join("; ")} · ${risk.confidence} confidence estimate`}
+                      actualPoints={p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null}
+                      annotation={annotations[annotationKey(season || "2026", p.id)] ?? EMPTY_ANNOTATION}
+                      onAnnotation={(patch) => setAnnotations((prev) => updateAnnotation(prev, season || "2026", p.id, patch))}
                       trend={trend}
                       isDrafted={isDrafted}
                       tierBreak={tierBreak}
@@ -454,6 +421,10 @@ function Row({
   espnAdp,
   value,
   risk,
+  riskExplanation,
+  actualPoints,
+  annotation,
+  onAnnotation,
   trend,
   isDrafted,
   tierBreak,
@@ -466,6 +437,10 @@ function Row({
   espnAdp: number | null;
   value: number | null;
   risk: number;
+  riskExplanation: string;
+  actualPoints: number | null;
+  annotation: PlayerAnnotation;
+  onAnnotation: (patch: Partial<PlayerAnnotation>) => void;
   trend: number;
   isDrafted: boolean;
   tierBreak: boolean;
@@ -530,6 +505,11 @@ function Row({
               </span>
             ) : null}
           </div>
+          <div className="mt-1 flex max-w-md items-center gap-1">
+            <button type="button" aria-pressed={annotation.target} onClick={() => onAnnotation({ target: !annotation.target })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.target ? "border-amber-400/50 text-amber-400" : "border-zinc-700 text-zinc-600"}`}>Target</button>
+            <button type="button" aria-pressed={annotation.avoid} onClick={() => onAnnotation({ avoid: !annotation.avoid, target: annotation.avoid ? annotation.target : false })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.avoid ? "border-rose-400/50 text-rose-400" : "border-zinc-700 text-zinc-600"}`}>Avoid</button>
+            <input aria-label={`Note for ${p.name}`} value={annotation.note} onChange={(event) => onAnnotation({ note: event.target.value })} placeholder="Note…" className="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-950 px-1.5 py-0.5 text-[10px] text-zinc-300 placeholder-zinc-700 focus:border-emerald-500 focus:outline-none" />
+          </div>
         </td>
         <td className="px-2 py-2 text-center">
           <span
@@ -550,8 +530,8 @@ function Row({
           {p.points.toFixed(1)}
         </td>
         <td className="px-3 py-2 text-right tabular-nums">
-          {p.actualPts2025 != null
-            ? <span className="text-zinc-400">{p.actualPts2025.toFixed(1)}</span>
+          {actualPoints != null
+            ? <span className="text-zinc-400">{actualPoints.toFixed(1)}</span>
             : <span className="text-zinc-600">—</span>}
         </td>
         <td
@@ -591,7 +571,7 @@ function Row({
             ? value.toFixed(1)
             : "~0"}
         </td>
-        <td className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
+        <td title={riskExplanation} className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
           {risk}
         </td>
         <td className="px-2 py-2 text-center">

@@ -6,6 +6,9 @@ import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { useLocalStorage } from "./useLocalStorage";
+import { auctionBudget, legalAuctionPurchase, teamAuctionValue } from "@/lib/auction";
+import { rosterSlots } from "@/lib/draft";
+import { boundedInteger, validRoster, validScoring } from "@/lib/validation";
 
 type Filter = "ALL" | Position;
 
@@ -42,8 +45,8 @@ export default function AuctionDraft() {
   const [error, setError] = useState<string | null>(null);
 
   // Inherit the same config as DraftBoard so rankings match
-  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING);
-  const [rosterCfg] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
+  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [rosterCfg] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
   const [method] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
 
   // Auction-specific persisted state
@@ -64,6 +67,7 @@ export default function AuctionDraft() {
 
   useEffect(() => {
     if (setupHydrated) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate editable form draft from persisted setup
       setSetupDraft({
         numTeams: setup.numTeams,
         budgetPerTeam: setup.budgetPerTeam,
@@ -80,6 +84,7 @@ export default function AuctionDraft() {
   const [nomineeId, setNomineeId] = useState<string | null>(null);
   const [nomineeWinner, setNomineeWinner] = useState(0);
   const [nomineeBid, setNomineeBid] = useState("");
+  const [bidError, setBidError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -126,23 +131,26 @@ export default function AuctionDraft() {
     return arr;
   }, [wonPlayers, setup.numTeams, setup.budgetPerTeam]);
 
-  // Suggested bid formula: (player.vbd / positiveVorPool) × remainingTotalBudget
-  // Denominator is over *available* players only so it recomputes as players are won.
-  const positiveVorPool = useMemo(
-    () => available.reduce((sum, p) => (p.vbd > 0 ? sum + p.vbd : sum), 0),
-    [available]
-  );
-  const remainingTotalBudget = useMemo(
-    () => budgets.reduce((a, b) => a + b, 0),
-    [budgets]
-  );
+  const slots = useMemo(() => rosterSlots(rosterCfg), [rosterCfg]);
+  const teamPlayers = useMemo(() => Array.from({ length: setup.numTeams }, (_, teamIndex) => wonPlayers
+    .filter((win) => win.teamIndex === teamIndex)
+    .flatMap((win) => {
+      const player = ranked.find((item) => item.id === win.playerId);
+      return player ? [{ id: player.id, position: player.position }] : [];
+    })), [setup.numTeams, wonPlayers, ranked]);
+  const budgetGuidance = useMemo(() => budgets.map((remaining, teamIndex) => auctionBudget(
+    setup.budgetPerTeam,
+    setup.budgetPerTeam - remaining,
+    slots.length,
+    teamPlayers[teamIndex]?.length ?? 0,
+  )), [budgets, setup.budgetPerTeam, slots.length, teamPlayers]);
+  const remainingTotalBudget = useMemo(() => budgets.reduce((sum, budget) => sum + budget, 0), [budgets]);
 
-  function suggestedBid(p: RankedPlayer): number {
-    if (p.vbd <= 0 || positiveVorPool <= 0) return 1;
-    return Math.max(
-      1,
-      Math.round((p.vbd / positiveVorPool) * remainingTotalBudget)
-    );
+  function suggestedBid(p: RankedPlayer, teamIndex = nomineeWinner): number {
+    const legalPositions = new Set(available.filter((candidate) => legalAuctionPurchase(
+      1, budgetGuidance[teamIndex], teamPlayers[teamIndex] ?? [], candidate, slots,
+    ).legal).map((candidate) => candidate.position));
+    return teamAuctionValue(p, available, budgetGuidance[teamIndex], legalPositions);
   }
 
   const visibleRows = useMemo(() => {
@@ -160,8 +168,9 @@ export default function AuctionDraft() {
   }, [available, filter, query]);
 
   function handleStart() {
-    const n = Math.max(2, setupDraft.numTeams || 12);
-    const b = Math.max(1, setupDraft.budgetPerTeam || 200);
+    const n = boundedInteger(setupDraft.numTeams, 12, 2, 32);
+    const minimumRoster = slots.length;
+    const b = boundedInteger(setupDraft.budgetPerTeam, 200, minimumRoster, 10000);
     setSetup({ numTeams: n, budgetPerTeam: b, started: true });
     setWonPlayers([]);
   }
@@ -169,13 +178,17 @@ export default function AuctionDraft() {
   function handleNominate(p: RankedPlayer) {
     setNomineeId(p.id);
     setNomineeWinner(0);
-    setNomineeBid(String(suggestedBid(p)));
+    setNomineeBid(String(suggestedBid(p, 0)));
+    setBidError(null);
   }
 
   function handleConfirmWin() {
     if (!nomineeId) return;
     const price = parseInt(nomineeBid, 10);
-    if (isNaN(price) || price < 1) return;
+    const nominee = ranked.find((player) => player.id === nomineeId);
+    if (!nominee) return;
+    const validation = legalAuctionPurchase(price, budgetGuidance[nomineeWinner], teamPlayers[nomineeWinner] ?? [], nominee, slots);
+    if (!validation.legal) { setBidError(validation.reason); return; }
     setWonPlayers((prev) => [
       ...prev,
       { playerId: nomineeId, teamIndex: nomineeWinner, price },
@@ -183,6 +196,7 @@ export default function AuctionDraft() {
     setNomineeId(null);
     setNomineeBid("");
     setNomineeWinner(0);
+    setBidError(null);
   }
 
   function handleReset() {
@@ -261,7 +275,7 @@ export default function AuctionDraft() {
 
   // ---- Main screen ----
   return (
-    <div className="flex gap-4">
+    <div className="flex flex-col gap-4 xl:flex-row">
       {/* Left panel — available players */}
       <div className="min-w-0 flex-1">
         <div className="mb-3 flex flex-wrap items-center gap-3">
@@ -309,8 +323,8 @@ export default function AuctionDraft() {
         )}
 
         {players && (
-          <div className="overflow-hidden rounded-xl border border-zinc-800">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800" tabIndex={0} aria-label="Auction player values">
+            <table className="min-w-[700px] w-full text-sm">
               <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                 <tr>
                   <th className="px-3 py-2 text-left font-medium text-zinc-500">
@@ -404,11 +418,12 @@ export default function AuctionDraft() {
                               </span>
                               <select
                                 value={nomineeWinner}
-                                onChange={(e) =>
-                                  setNomineeWinner(
-                                    parseInt(e.target.value, 10)
-                                  )
-                                }
+                                onChange={(e) => {
+                                  const winner = parseInt(e.target.value, 10);
+                                  setNomineeWinner(winner);
+                                  setNomineeBid(String(suggestedBid(p, winner)));
+                                  setBidError(null);
+                                }}
                                 className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                               >
                                 {Array.from(
@@ -426,9 +441,10 @@ export default function AuctionDraft() {
                                 <input
                                   type="number"
                                   min={1}
+                                  max={budgetGuidance[nomineeWinner]?.maxBid}
                                   value={nomineeBid}
                                   onChange={(e) =>
-                                    setNomineeBid(e.target.value)
+                                    { setNomineeBid(e.target.value); setBidError(null); }
                                   }
                                   className="w-20 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                                 />
@@ -440,6 +456,10 @@ export default function AuctionDraft() {
                                 Confirm Win
                               </button>
                             </div>
+                            <p className="mt-2 text-xs text-zinc-500">
+                              {teamLabel(nomineeWinner)}: ${budgetGuidance[nomineeWinner]?.remaining} left · ${budgetGuidance[nomineeWinner]?.reservedMinimum} reserved · ${budgetGuidance[nomineeWinner]?.maxBid} max
+                            </p>
+                            {bidError && <p role="alert" className="mt-1 text-xs text-rose-400">{bidError}</p>}
                           </td>
                         </tr>
                       )}
@@ -470,7 +490,7 @@ export default function AuctionDraft() {
       </div>
 
       {/* Right panel — rosters */}
-      <div className="w-56 shrink-0">
+      <div className="w-full shrink-0 xl:w-64">
         <h3 className="mb-2 text-xs uppercase tracking-widest text-zinc-500">
           Rosters
         </h3>
@@ -501,6 +521,12 @@ export default function AuctionDraft() {
                 </span>
               </div>
               <div className="space-y-0.5">
+                <div className="mb-2 grid grid-cols-2 gap-x-2 text-[10px] text-zinc-500">
+                  <span>{budgetGuidance[i].openSlots} slots</span>
+                  <span className="text-right">${budgetGuidance[i].dollarsPerSlot.toFixed(1)}/slot</span>
+                  <span>${budgetGuidance[i].reservedMinimum} reserved</span>
+                  <span className="text-right">${budgetGuidance[i].maxBid} max</span>
+                </div>
                 {teamRoster.map((w) => (
                   <div
                     key={w.playerId}

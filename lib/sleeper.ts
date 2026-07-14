@@ -92,6 +92,7 @@ function normalize(rec: SleeperRecord): Player | null {
       superflex: s.adp_2qb ?? 999,
       espn: 999, // filled in server-side by /api/players after ESPN fetch
     },
+    actualStats2025: null,
     actualPts2025: null, // filled in server-side by /api/players after stats fetch
   };
 }
@@ -142,13 +143,12 @@ const STATS_2025_URL =
   `?season_type=regular&order_by=pts_ppr` +
   ALL_POSITIONS.map((p) => `&position[]=${p}`).join("");
 
-let statsMemo: { at: number; data: Map<string, number> } | null = null;
+let statsMemo: { at: number; data: Map<string, RawStats> } | null = null;
 
 /**
- * Returns a map of player_id → 2025 PPR season total.
- * Falls back to pts_std for positions that have no pts_ppr value.
+ * Returns raw historical stats so the client can apply active league scoring.
  */
-export async function fetch2025ActualPts(): Promise<Map<string, number>> {
+export async function fetch2025ActualStats(): Promise<Map<string, RawStats>> {
   const now = Date.now();
   if (statsMemo && now - statsMemo.at < TTL_MS) return statsMemo.data;
 
@@ -167,14 +167,22 @@ export async function fetch2025ActualPts(): Promise<Map<string, number>> {
     stats: Record<string, number | undefined>;
   }> = await res.json();
 
-  const data = new Map<string, number>();
+  const data = new Map<string, RawStats>();
   for (const r of records) {
-    const pts = r.stats?.pts_ppr ?? r.stats?.pts_std;
-    if (typeof pts === "number" && pts > 0) {
-      data.set(r.player_id, pts);
+    const stats: RawStats = {};
+    for (const key of STAT_KEYS) {
+      const value = r.stats?.[key];
+      if (typeof value === "number") stats[key] = value;
     }
+    if (Object.keys(stats).length) data.set(r.player_id, stats);
   }
 
   statsMemo = { at: now, data };
   return data;
+}
+
+/** @deprecated Prefer raw stats and active scoring. */
+export async function fetch2025ActualPts(): Promise<Map<string, number>> {
+  const stats = await fetch2025ActualStats();
+  return new Map([...stats].flatMap(([id, value]) => typeof value.pts_std === "number" ? [[id, value.pts_std]] : []));
 }

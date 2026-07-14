@@ -24,11 +24,15 @@ function NumberField({
   label,
   value,
   step = 1,
+  min = -1000,
+  max = 1000,
   onChange,
 }: {
   label: string;
   value: number;
   step?: number;
+  min?: number;
+  max?: number;
   onChange: (n: number) => void;
 }) {
   return (
@@ -37,8 +41,13 @@ function NumberField({
       <input
         type="number"
         step={step}
+        min={min}
+        max={max}
         value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onChange={(e) => {
+          const next = Number(e.target.value);
+          if (Number.isFinite(next)) onChange(Math.min(max, Math.max(min, next)));
+        }}
         className="w-20 rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-right text-zinc-100 focus:border-emerald-500 focus:outline-none"
       />
     </label>
@@ -142,14 +151,14 @@ export default function ConfigPanel({
           ))}
         </div>
         <div className="flex flex-col gap-2">
-          <NumberField label="Teams" value={roster.teams} onChange={(n) => r({ teams: n })} />
-          <NumberField label="QB" value={roster.qb} onChange={(n) => r({ qb: n })} />
-          <NumberField label="RB" value={roster.rb} onChange={(n) => r({ rb: n })} />
-          <NumberField label="WR" value={roster.wr} onChange={(n) => r({ wr: n })} />
-          <NumberField label="TE" value={roster.te} onChange={(n) => r({ te: n })} />
-          <NumberField label="FLEX (R/W/T)" value={roster.flex} onChange={(n) => r({ flex: n })} />
-          <NumberField label="SUPERFLEX" value={roster.superflex} onChange={(n) => r({ superflex: n })} />
-          <NumberField label="Bench" value={roster.bench} onChange={(n) => r({ bench: n })} />
+          <NumberField label="Teams" min={2} max={32} value={roster.teams} onChange={(n) => r({ teams: Math.round(n) })} />
+          <NumberField label="QB" min={0} max={30} value={roster.qb} onChange={(n) => r({ qb: Math.round(n) })} />
+          <NumberField label="RB" min={0} max={30} value={roster.rb} onChange={(n) => r({ rb: Math.round(n) })} />
+          <NumberField label="WR" min={0} max={30} value={roster.wr} onChange={(n) => r({ wr: Math.round(n) })} />
+          <NumberField label="TE" min={0} max={30} value={roster.te} onChange={(n) => r({ te: Math.round(n) })} />
+          <NumberField label="FLEX (R/W/T)" min={0} max={30} value={roster.flex} onChange={(n) => r({ flex: Math.round(n) })} />
+          <NumberField label="SUPERFLEX" min={0} max={30} value={roster.superflex} onChange={(n) => r({ superflex: Math.round(n) })} />
+          <NumberField label="Bench" min={0} max={30} value={roster.bench} onChange={(n) => r({ bench: Math.round(n) })} />
         </div>
       </section>
     </aside>

@@ -1,13 +1,30 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
-import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { useLocalStorage } from "./useLocalStorage";
 import DraftBoardGrid from "./DraftBoardGrid";
 import { SEASON } from "@/lib/sleeper";
+import { annotationKey, updateAnnotation, type AnnotationStore } from "@/lib/annotations";
+import { validRoster, validScoring } from "@/lib/validation";
+import { encodeStored, parseStored } from "@/lib/persistence";
+import { marketReference } from "@/lib/market";
+import {
+  chooseCpuPick,
+  gradeLetter,
+  gradePick,
+  keeperValue,
+  ownerForPick,
+  pickNumberForSlot,
+  positionalRun,
+  rosterSlots,
+  seededRandom,
+  survivalEstimate,
+  transitionDraft,
+} from "@/lib/draft";
 
 interface MockPick {
   pickNumber: number;
@@ -139,18 +156,6 @@ function assignRoster(
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
 
-function teamSlotForPick(pickNum: number, numTeams: number): number {
-  const round = Math.ceil(pickNum / numTeams);
-  const pos = ((pickNum - 1) % numTeams) + 1;
-  return round % 2 === 1 ? pos : numTeams + 1 - pos;
-}
-
-// Also used in DraftBoardGrid; kept here for keeper pick-number computation
-function pickNumForCell(round: number, slot: number, numTeams: number): number {
-  const base = (round - 1) * numTeams;
-  return round % 2 === 1 ? base + slot : base + (numTeams + 1 - slot);
-}
-
 function SortTh({
   label, sk, sortKey, sortDir, onSort, className,
 }: {
@@ -159,16 +164,13 @@ function SortTh({
 }) {
   const active = sortKey === sk;
   return (
-    <th
-      onClick={() => onSort(sk)}
-      className={`cursor-pointer select-none px-3 py-2 font-medium transition hover:text-zinc-200 ${
+    <th aria-sort={active ? (sortDir === 1 ? "ascending" : "descending") : "none"} className={`select-none px-3 py-2 font-medium ${
         active ? "text-emerald-400" : "text-zinc-500"
       } ${className ?? ""}`}
     >
-      {label}
-      <span className="ml-0.5 text-[10px]">
-        {active ? (sortDir === 1 ? " ↑" : " ↓") : <span className="text-zinc-700"> ⇅</span>}
-      </span>
+      <button type="button" onClick={() => onSort(sk)} className="rounded px-1 transition hover:text-zinc-200 focus-visible:outline-2 focus-visible:outline-emerald-400">
+        {label}<span className="ml-0.5 text-[10px]">{active ? (sortDir === 1 ? " ↑" : " ↓") : <span className="text-zinc-700"> ⇅</span>}</span>
+      </button>
     </th>
   );
 }
@@ -177,14 +179,15 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [players, setPlayers] = useState<Player[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING);
-  const [roster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
+  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [roster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
   const [method] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
 
   const [picks, setPicks] = useState<MockPick[]>([]);
   const [userSlot, setUserSlot] = useState(1);
   const [draftMode, setDraftMode] = useState<"cpu" | "manual" | "live">("cpu");
-  const [started, setStarted] = useState(false);
+  const [draftStatus, sendDraftEvent] = useReducer(transitionDraft, "setup");
+  const started = draftStatus === "running" || draftStatus === "syncing" || draftStatus === "stale" || draftStatus === "complete";
 
   // Sleeper username lookup
   const [sleeperUsername, setSleeperUsername] = useState("");
@@ -221,22 +224,28 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
-  const [watchlist, setWatchlist] = useState<Set<string>>(new Set());
+  const [annotations, setAnnotations] = useLocalStorage<AnnotationStore>("ffdp.annotations", {});
+  const watchlist = useMemo(() => new Set(Object.entries(annotations).filter(([key, value]) => key.startsWith(`${SEASON}:`) && value.target).map(([key]) => key.slice(SEASON.length + 1))), [annotations]);
 
-  // Live sync
-  const wsRef = useRef<WebSocket | null>(null);
-  const [wsStatus, setWsStatus] = useState<"idle" | "connecting" | "live" | "error" | "disconnected">("idle");
-  const [wsError, setWsError] = useState<string | null>(null);
+  // Supported live sync uses Sleeper's documented REST endpoints.
+  const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "live" | "error" | "stale">("idle");
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
 
   const logRef = useRef<HTMLDivElement>(null);
   const pickingRef = useRef(false);
 
   // Restore import settings from sessionStorage on mount
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- one-time sessionStorage hydration */
     const raw = sessionStorage.getItem(DRAFT_SETUP_KEY);
     if (raw) {
       try {
-        const d = JSON.parse(raw);
+        const d = parseStored<Record<string, unknown>>(raw, {}).value as {
+          draftId?: string; sleeperUsername?: string; sleeperUserId?: string; importedTeams?: number;
+          importedRounds?: number; picks?: MockPick[]; userSlot?: number; tradedPicks?: TradedPick[];
+          importSummary?: string; teamNames?: Record<number, string>; leagueRosterPositions?: string[];
+        };
         if (d.draftId) setDraftId(d.draftId);
         if (d.sleeperUsername) setSleeperUsername(d.sleeperUsername);
         if (d.sleeperUserId) setSleeperUserId(d.sleeperUserId);
@@ -253,16 +262,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const rawKeepers = sessionStorage.getItem(KEEPER_SETUP_KEY);
     if (rawKeepers) {
       try {
-        const ks = JSON.parse(rawKeepers);
+        const ks = parseStored<PendingKeeper[]>(rawKeepers, []).value;
         if (Array.isArray(ks)) setPendingKeepers(ks);
       } catch { /* ignore */ }
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
   // Persist manual keepers across tab switches
   useEffect(() => {
     if (pendingKeepers.length > 0) {
-      sessionStorage.setItem(KEEPER_SETUP_KEY, JSON.stringify(pendingKeepers));
+      sessionStorage.setItem(KEEPER_SETUP_KEY, encodeStored(pendingKeepers, SEASON));
     } else {
       sessionStorage.removeItem(KEEPER_SETUP_KEY);
     }
@@ -291,7 +301,6 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const numRounds =
     importedRounds ??
     Math.max(10, roster.qb + roster.rb + roster.wr + roster.te + roster.flex + roster.superflex + roster.bench + 2);
-  const adpKey = adpKeyFor(scoring, roster);
 
   // Which pick numbers are already filled (supports non-sequential keeper picks)
   const pickedNums = useMemo(() => new Set(picks.map((p) => p.pickNumber)), [picks]);
@@ -312,7 +321,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }, [started, isDone, onActiveChange]);
 
   const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
-  const currentTeamSlot = isDone ? null : teamSlotForPick(currentPickNum, numTeams);
+  const tradeRecords = useMemo(() => tradedPicks.map((trade) => ({ round: trade.round, roster_id: trade.originalSlot, owner_id: trade.currentSlot })), [tradedPicks]);
+  const currentTeamSlot = isDone ? null : ownerForPick(currentPickNum, numTeams, tradeRecords);
   // In live mode the user watches; no slot is ever "their turn"
   const isUserTurn = draftMode !== "live" && !isDone && (draftMode === "manual" || currentTeamSlot === userSlot);
 
@@ -340,13 +350,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const aWatched = watchlist.has(a.id) ? 0 : 1;
       const bWatched = watchlist.has(b.id) ? 0 : 1;
       if (aWatched !== bWatched) return aWatched - bWatched;
+      const aAvoid = annotations[annotationKey(SEASON, a.id)]?.avoid ? 1 : 0;
+      const bAvoid = annotations[annotationKey(SEASON, b.id)]?.avoid ? 1 : 0;
+      if (aAvoid !== bAvoid) return aAvoid - bAvoid;
       switch (sortKey) {
         case "rank": return (a.overallRank - b.overallRank) * sortDir;
         case "proj": return (a.points - b.points) * sortDir;
         case "vor": return (a.vbd - b.vbd) * sortDir;
         case "adp": {
-          const va = a.adp[adpKey] >= 999 ? null : a.adp[adpKey];
-          const vb = b.adp[adpKey] >= 999 ? null : b.adp[adpKey];
+          const va = marketReference(a, scoring, roster).consensus;
+          const vb = marketReference(b, scoring, roster).consensus;
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
@@ -354,11 +367,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         }
         case "value": {
           const val = (p: RankedPlayer): number | null => {
-            const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-            const es = p.adp.espn >= 999 ? null : p.adp.espn;
-            const srcs = [sl, es].filter((x): x is number => x !== null);
-            if (!srcs.length) return null;
-            return srcs.reduce((a, b) => a + b, 0) / srcs.length - p.overallRank;
+            const consensus = marketReference(p, scoring, roster).consensus;
+            return consensus === null ? null : consensus - p.overallRank;
           };
           const va = val(a), vb = val(b);
           if (va === null && vb === null) return 0;
@@ -369,7 +379,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         default: return 0;
       }
     });
-  }, [ranked, draftedIds, filter, query, sortKey, sortDir, adpKey, watchlist]);
+  }, [ranked, draftedIds, filter, query, sortKey, sortDir, scoring, roster, watchlist, annotations]);
 
   // Compact available-player list for board view sidebar
   const boardAvailable = useMemo(() => {
@@ -392,24 +402,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const graded = myPicks.flatMap((pick) => {
       const player = playerById.get(pick.playerId);
       if (!player) return [];
-      const srcs = [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn]
-        .filter((v): v is number => v < 999);
-      if (srcs.length === 0) return [];
-      const avgAdp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-      const value = avgAdp - player.overallRank;
-      return [{ pick, player, value }];
+      if (pick.isKeeper) return [];
+      const market = marketReference(player, scoring, roster);
+      const value = gradePick(market.consensus, pick.pickNumber);
+      return value === null ? [] : [{ pick, player, value, marketAdp: market.consensus }];
     });
     if (graded.length === 0) return null;
     const avgValue = graded.reduce((a, b) => a + b.value, 0) / graded.length;
-    let letter: "A" | "B" | "C" | "D" | "F";
-    if (avgValue > 5) letter = "A";
-    else if (avgValue >= 2) letter = "B";
-    else if (avgValue > -2) letter = "C";
-    else if (avgValue >= -5) letter = "D";
-    else letter = "F";
+    const letter = gradeLetter(avgValue);
     const sorted = [...graded].sort((a, b) => b.value - a.value);
     return { letter, avgValue, sorted };
-  }, [isDone, draftMode, myPicks, playerById]);
+  }, [isDone, draftMode, myPicks, playerById, scoring, roster]);
 
   // Position availability counts for the draft strip
   const positionCounts = useMemo(
@@ -431,7 +434,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   // Watchlist: remaining targets still on the board
   const watchlistRemaining = useMemo(
-    () => Array.from(watchlist).filter((id) => !draftedIds.has(id)).length,
+    () => [...watchlist].filter((id) => !draftedIds.has(id)).length,
     [watchlist, draftedIds]
   );
 
@@ -444,7 +447,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   // Best available pick suggestion, weighted by VOR. Requires roster structure from a Sleeper import.
   const bestPickSuggestion = useMemo((): { player: RankedPlayer; isBench: boolean } | null => {
     if (!isUserTurn || draftMode !== "cpu" || !myRosterSlots) return null;
-    const available = ranked.filter((p) => !draftedIds.has(p.id));
+    const available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
     if (available.length === 0) return null;
     const byVor = [...available].sort((a, b) => b.vbd - a.vbd);
 
@@ -461,7 +464,21 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
     // All starters filled — suggest the highest-VOR bench pick
     return { player: byVor[0], isBench: true };
-  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots]);
+  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots, annotations]);
+
+  const recommendationContext = useMemo(() => {
+    if (!bestPickSuggestion) return null;
+    let nextPick = currentPickNum + 1;
+    while (nextPick <= numTeams * numRounds && ownerForPick(nextPick, numTeams, tradeRecords) !== userSlot) nextPick++;
+    const market = marketReference(bestPickSuggestion.player, scoring, roster);
+    const survival = nextPick <= numTeams * numRounds ? survivalEstimate(market.consensus, currentPickNum, nextPick) : null;
+    const nextAtPosition = ranked.find((player) => !draftedIds.has(player.id) && player.position === bestPickSuggestion.player.position && player.id !== bestPickSuggestion.player.id);
+    const cliff = nextAtPosition ? Math.max(0, bestPickSuggestion.player.points - nextAtPosition.points) : 0;
+    const runs = positionalRun(picks, playerById);
+    const run = runs.find((item) => item.position === bestPickSuggestion.player.position);
+    const score = bestPickSuggestion.player.vbd + cliff * 0.75 + (survival === null ? 0 : (1 - survival) * 8) + (run ? 2 : 0);
+    return { nextPick, survival, cliff, run, score, marketLabel: market.label };
+  }, [bestPickSuggestion, currentPickNum, numTeams, numRounds, tradeRecords, userSlot, scoring, roster, ranked, draftedIds, picks, playerById]);
 
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
@@ -483,14 +500,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (pendingKeepers.length === 0 || ranked.length === 0) return [];
     return pendingKeepers.map((k) => {
       const player = playerById.get(k.playerId);
-      const pickEquivalent = (k.round - 1) * numTeams + userSlot;
-      const srcs = player
-        ? [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn].filter(
-            (v): v is number => v < 999
-          )
-        : [];
-      const consensusAdp = srcs.length ? srcs.reduce((a, b) => a + b, 0) / srcs.length : null;
-      const surplus = consensusAdp === null ? null : pickEquivalent - consensusAdp;
+      const consensusAdp = player ? marketReference(player, scoring, roster).consensus : null;
+      const { pickEquivalent, surplus } = keeperValue(k.round, k.teamSlot, numTeams, consensusAdp);
       let verdict: "keep" | "borderline" | "cut" | null = null;
       if (surplus !== null) {
         if (surplus > 8) verdict = "keep";
@@ -499,22 +510,21 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       }
       return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
     });
-  }, [pendingKeepers, ranked, playerById, numTeams, userSlot]);
+  }, [pendingKeepers, ranked, playerById, numTeams, scoring, roster]);
 
-  // CPU auto-pick: ADP-weighted with positional need and jitter
+  // CPU auto-pick: market-aware, roster-valid, need-aware, and reproducible.
   useEffect(() => {
     if (!started || draftMode !== "cpu" || isUserTurn || isDone || ranked.length === 0) return;
     const timer = setTimeout(() => {
-      const available = ranked.filter((p) => !draftedIds.has(p.id));
+      const available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
       if (available.length === 0 || currentTeamSlot === null) return;
 
-      const best = available
-        .map((p) => {
-          const adpVal = p.adp[adpKey] < 999 ? p.adp[adpKey] : p.overallRank + 100;
-          const jitter = (Math.random() - 0.5) * 8; // ±4 pick variance
-          return { p, score: adpVal + jitter };
-        })
-        .sort((a, b) => a.score - b.score)[0]?.p;
+      const teamPlayers = picks.filter((pick) => pick.teamSlot === currentTeamSlot).flatMap((pick) => {
+        const player = playerById.get(pick.playerId);
+        return player ? [{ id: player.id, position: player.position }] : [];
+      });
+      const configuredSlots = rosterSlots(roster);
+      const best = chooseCpuPick(available, teamPlayers, configuredSlots, (player) => marketReference(player, scoring, roster).consensus, seededRandom(currentPickNum * 1009 + currentTeamSlot));
 
       if (best) {
         setPicks((prev) => [
@@ -526,20 +536,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => clearTimeout(timer);
   }, [
     started, draftMode, isUserTurn, isDone, ranked, draftedIds,
-    currentTeamSlot, currentPickNum, adpKey,
+    currentTeamSlot, currentPickNum, picks, playerById, roster, scoring, annotations,
   ]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [picks.length]);
-
-  // Clean up WebSocket on unmount
-  useEffect(() => {
-    return () => {
-      wsRef.current?.close(1000, "unmount");
-      wsRef.current = null;
-    };
-  }, []);
 
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir((d) => (d === 1 ? -1 : 1));
@@ -565,7 +567,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const keeperPicks: MockPick[] = pendingKeepers.map((k) => {
         const player = playerById.get(k.playerId);
         return {
-          pickNumber: pickNumForCell(k.round, k.teamSlot, numTeams),
+          pickNumber: pickNumberForSlot(k.round, k.teamSlot, numTeams),
           teamSlot: k.teamSlot,
           playerId: k.playerId,
           playerName: player?.name,
@@ -579,18 +581,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         return [...merged.values()].sort((a, b) => a.pickNumber - b.pickNumber);
       });
     }
-    setStarted(true);
+    sendDraftEvent({ type: "READY" });
+    sendDraftEvent({ type: "START" });
   }
 
   function resetDraft() {
-    if (wsRef.current) {
-      wsRef.current.close(1000, "reset");
-      wsRef.current = null;
-    }
-    setWsStatus("idle");
-    setWsError(null);
+    setSyncStatus("idle");
+    setSyncError(null);
+    setLastSyncAt(null);
     setPicks([]);
-    setStarted(false);
+    sendDraftEvent({ type: "RESET" });
     setFilter("ALL");
     setQuery("");
     setSortKey("rank");
@@ -609,13 +609,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setBoardFilter("ALL");
     setTeamNames({});
     setLeagueRosterPositions([]);
-    setWatchlist(new Set());
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
   }
 
   function exportCsv() {
-    const header = "Pick,Round,Team,Player,Position,Team (NFL),Projected Points,VOR,Avg ADP,Value";
+    const header = "Pick,Round,Team,Player,Position,Team (NFL),Projected Points,VOR,Market ADP,Pick Value,Target,Avoid,Note";
     const escape = (s: string) =>
       s.includes(",") || s.includes('"') || s.includes("\n")
         ? `"${s.replace(/"/g, '""')}"`
@@ -629,6 +628,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const playerName = player?.name ?? pick.playerName ?? pick.playerId;
       const position = player?.position ?? pick.playerPos ?? "";
       const nflTeam = player?.team ?? "";
+      const annotation = annotations[annotationKey(SEASON, pick.playerId)];
       const projPts = player ? player.points.toFixed(1) : "";
       const vor = player
         ? (player.vbd > 0 ? "+" : "") + player.vbd.toFixed(1)
@@ -637,13 +637,10 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       let avgAdpStr = "";
       let valueStr = "";
       if (player) {
-        const sl = player.adp[adpKey] >= 999 ? null : player.adp[adpKey];
-        const es = player.adp.espn >= 999 ? null : player.adp.espn;
-        const srcs = [sl, es].filter((x): x is number => x !== null);
-        if (srcs.length > 0) {
-          const avg = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+        const avg = marketReference(player, scoring, roster).consensus;
+        if (avg !== null) {
           avgAdpStr = avg.toFixed(1);
-          const val = avg - player.overallRank;
+          const val = avg - pick.pickNumber;
           valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
         }
       }
@@ -659,6 +656,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         vor,
         avgAdpStr,
         valueStr,
+        annotation?.target ? "yes" : "",
+        annotation?.avoid ? "yes" : "",
+        escape(annotation?.note ?? ""),
       ].join(",");
     });
 
@@ -692,8 +692,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   function addKeeper() {
     if (!keeperPlayerId) return;
-    const pickNum = pickNumForCell(keeperRound, keeperSlot, numTeams);
-    if (pendingKeepers.some((k) => pickNumForCell(k.round, k.teamSlot, numTeams) === pickNum)) return;
+    const pickNum = pickNumberForSlot(keeperRound, keeperSlot, numTeams);
+    if (pendingKeepers.some((k) => pickNumberForSlot(k.round, k.teamSlot, numTeams) === pickNum)) return;
     if (pendingKeepers.some((k) => k.playerId === keeperPlayerId)) return;
     setPendingKeepers((prev) => [
       ...prev,
@@ -703,113 +703,20 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setKeeperPlayerId(null);
   }
 
-  function connectLiveDraft() {
-    const id = draftId.trim();
-    if (!id) return;
-
-    // Close any stale connection
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-
-    setWsStatus("connecting");
-    setWsError(null);
-
-    // TODO: WS protocol unverified — may need adjustment.
-    // Sleeper appears to use Phoenix channels (Elixir backend).
-    // The host prod.sleeper.app was found via community network inspection and
-    // may not resolve from all environments; try sleeper.app if it fails.
-    // The /websocket?vsn=2.0.0 suffix is the standard Phoenix transport path.
-    // If picks don't stream, the URL, an auth token in query params, or the
-    // event names below may need updating after inspecting Sleeper's network traffic.
-    const wsUrl = "wss://prod.sleeper.app/v1/ws/websocket?vsn=2.0.0";
-
-    let ws: WebSocket;
+  async function connectLiveDraft() {
+    if (!draftId.trim()) return;
+    setSyncStatus("syncing");
+    setSyncError(null);
     try {
-      ws = new WebSocket(wsUrl);
-    } catch (err) {
-      setWsStatus("error");
-      setWsError(`Failed to open connection: ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      await handleImport();
+      setLastSyncAt(Date.now());
+      setSyncStatus("live");
+      sendDraftEvent({ type: "READY" });
+      sendDraftEvent({ type: "SYNC" });
+    } catch (error) {
+      setSyncStatus("error");
+      setSyncError(error instanceof Error ? error.message : String(error));
     }
-
-    wsRef.current = ws;
-    let hbTimer: ReturnType<typeof setInterval> | null = null;
-    let refCounter = 0;
-
-    ws.addEventListener("open", () => {
-      setWsStatus("live");
-
-      // TODO: WS protocol unverified — Phoenix phx_join message format assumed.
-      // Topic "draft:<id>" and empty payload {} may differ in Sleeper's implementation.
-      refCounter++;
-      ws.send(JSON.stringify([null, String(refCounter), `draft:${id}`, "phx_join", {}]));
-
-      // Phoenix heartbeat: server closes the connection after ~60s without one
-      hbTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          refCounter++;
-          ws.send(JSON.stringify([null, String(refCounter), "phoenix", "heartbeat", {}]));
-        }
-      }, 30_000);
-    });
-
-    ws.addEventListener("message", (event) => {
-      try {
-        const msg = JSON.parse(event.data as string);
-
-        // TODO: WS protocol unverified — Phoenix v2 wire format assumed:
-        // [join_ref, ref, topic, event_name, payload]
-        if (!Array.isArray(msg) || msg.length < 5) return;
-        const [, , , eventName, payload] = msg as [unknown, unknown, unknown, string, Record<string, unknown>];
-
-        // TODO: WS protocol unverified — confirm the real event name(s).
-        // Common guesses based on Sleeper REST API naming:
-        // "pick_completed", "draft_pick", or simply "pick".
-        if (eventName === "pick_completed" || eventName === "draft_pick" || eventName === "pick") {
-          // TODO: WS protocol unverified — confirm pick nesting.
-          // The pick object may be in payload.pick or directly in payload.
-          const sp = (payload?.pick ?? (payload?.player_id ? payload : null)) as SleeperPick | null;
-          if (!sp || !sp.player_id || sp.pick_no == null) return;
-
-          const mockPick: MockPick = {
-            pickNumber: sp.pick_no,
-            teamSlot: sp.draft_slot,
-            playerId: sp.player_id,
-            playerName:
-              sp.metadata?.first_name && sp.metadata?.last_name
-                ? `${sp.metadata.first_name} ${sp.metadata.last_name}`
-                : sp.player_id,
-            playerPos: sp.metadata?.position ?? undefined,
-            isKeeper: sp.is_keeper === true,
-          };
-
-          setPicks((prev) => {
-            // Deduplicate by pick number so a reconnect-and-replay doesn't double-add
-            if (prev.some((p) => p.pickNumber === mockPick.pickNumber)) return prev;
-            return [...prev, mockPick].sort((a, b) => a.pickNumber - b.pickNumber);
-          });
-        }
-      } catch { /* ignore malformed messages */ }
-    });
-
-    ws.addEventListener("error", () => {
-      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-      setWsStatus("error");
-      setWsError("WebSocket error — the draft ID may be wrong, or the server requires auth");
-    });
-
-    ws.addEventListener("close", (ev) => {
-      if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-      wsRef.current = null;
-      // Codes 1000/1001 = normal close; anything else = unexpected drop
-      setWsStatus(ev.code === 1000 || ev.code === 1001 ? "idle" : "disconnected");
-    });
-
-    // The draft screen mounts as soon as setStarted(true) fires;
-    // existing imported picks are preserved (dedup logic above handles overlap)
-    setStarted(true);
   }
 
   async function handleLookupUser() {
@@ -883,7 +790,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const rawTradedPicks = tradedRes.ok ? await tradedRes.json() : [];
 
       // Fetch league details + team names in parallel (non-critical — silently ignored on failure)
-      let slotToName: Record<number, string> = {};
+      const slotToName: Record<number, string> = {};
       let rosterPositions: string[] = [];
       if (draft.league_id) {
         try {
@@ -933,7 +840,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       }
 
       // Parse traded picks
-      let parsedTradedPicks: TradedPick[] = [];
+      const parsedTradedPicks: TradedPick[] = [];
       let tradedPickNote = "";
       if (Array.isArray(rawTradedPicks) && rawTradedPicks.length > 0) {
         const slotToRoster = draft.slot_to_roster_id;
@@ -958,32 +865,39 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       const statusLabel = draft.status === "complete" ? "complete" : draft.status === "drafting" ? "in progress" : "pre-draft";
       const keeperNote = keeperCount > 0 ? ` · ${keeperCount} keepers` : "";
       const summary = `Imported ${imported.length} picks from a ${teams}-team ${rounds}-round draft (${statusLabel}${keeperNote})${tradedPickNote}`;
+      const ownershipRecords = parsedTradedPicks.map((trade) => ({ round: trade.round, roster_id: trade.originalSlot, owner_id: trade.currentSlot }));
+      const ownedImported = imported.map((pick) => ({ ...pick, teamSlot: ownerForPick(pick.pickNumber, teams, ownershipRecords) }));
 
       setImportedTeams(teams);
       setImportedRounds(rounds);
-      setPicks(imported);
+      setPicks(ownedImported);
       setUserSlot(newUserSlot);
       setTradedPicks(parsedTradedPicks);
       setImportSummary(summary);
       setTeamNames(slotToName);
       setLeagueRosterPositions(rosterPositions);
+      if (draftMode === "live") {
+        setLastSyncAt(Date.now());
+        setSyncStatus("live");
+        setSyncError(null);
+      }
 
       // Persist so tab switches don't lose the setup
       sessionStorage.setItem(
         DRAFT_SETUP_KEY,
-        JSON.stringify({
+        encodeStored({
           draftId: id,
           sleeperUsername,
           sleeperUserId,
           importedTeams: teams,
           importedRounds: rounds,
-          picks: imported,
+          picks: ownedImported,
           userSlot: newUserSlot,
           tradedPicks: parsedTradedPicks,
           importSummary: summary,
           teamNames: slotToName,
           leagueRosterPositions: rosterPositions,
-        })
+        }, SEASON)
       );
     } catch (e) {
       setImportError(e instanceof Error ? e.message : String(e));
@@ -991,6 +905,35 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       setImporting(false);
     }
   }
+
+  useEffect(() => {
+    if (!started || draftMode !== "live" || !draftId.trim() || isDone) return;
+    let failures = 0;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      setSyncStatus("syncing");
+      try {
+        const response = await fetch(`https://api.sleeper.app/v1/draft/${draftId.trim()}/picks`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`Sleeper picks request failed (${response.status})`);
+        const sleeperPicks: SleeperPick[] = await response.json();
+        setPicks(sleeperPicks.map((sp) => ({
+          pickNumber: sp.pick_no, teamSlot: ownerForPick(sp.pick_no, numTeams, tradeRecords), playerId: sp.player_id,
+          playerName: sp.metadata?.first_name && sp.metadata?.last_name ? `${sp.metadata.first_name} ${sp.metadata.last_name}` : sp.player_id,
+          playerPos: sp.metadata?.position, isKeeper: sp.is_keeper === true,
+        })).sort((a, b) => a.pickNumber - b.pickNumber));
+        failures = 0;
+        setLastSyncAt(Date.now());
+        setSyncError(null);
+        setSyncStatus("live");
+      } catch (error) {
+        failures++;
+        setSyncError(error instanceof Error ? error.message : String(error));
+        setSyncStatus(failures > 1 ? "stale" : "error");
+      }
+    };
+    const timer = window.setInterval(() => { void poll(); }, 8000);
+    return () => window.clearInterval(timer);
+  }, [started, draftMode, draftId, isDone, numTeams, tradeRecords]);
 
   // ── Setup screen ──────────────────────────────────────────────────────────
   if (!started) {
@@ -1104,7 +1047,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                   <div className="mb-2 space-y-1">
                     {pendingKeepers.map((k, i) => {
                       const player = playerById.get(k.playerId);
-                      const pickNum = pickNumForCell(k.round, k.teamSlot, numTeams);
+                      const pickNum = pickNumberForSlot(k.round, k.teamSlot, numTeams);
                       return (
                         <div key={i} className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/50 px-3 py-1.5 text-xs">
                           <span className="shrink-0 text-zinc-500">Rd {k.round} · {teamLabel(k.teamSlot)} · #{pickNum}</span>
@@ -1239,7 +1182,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             </div>
             {draftMode === "live" && (
               <p className="mt-1.5 text-xs text-zinc-500">
-                Connects to a live Sleeper draft via WebSocket — read-only, picks stream in automatically.
+                Polls Sleeper&apos;s documented REST draft endpoints every eight seconds while this page is visible.
               </p>
             )}
           </div>
@@ -1268,16 +1211,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           {draftMode === "live" ? (
             <div>
               <div className="mb-3 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
-                WS protocol unverified — may need adjustment. Picks will stream in read-only; you cannot make selections.
+                REST sync is read-only. The last good draft stays visible if Sleeper is temporarily unavailable.
               </div>
               <button
                 onClick={connectLiveDraft}
                 disabled={!draftId.trim() || !players || players.length === 0}
                 className="w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:opacity-40"
               >
-                Connect to Live Draft
+                Start Live REST Sync
               </button>
-              {wsError && <p className="mt-1.5 text-xs text-rose-400">{wsError}</p>}
+              {syncError && <p className="mt-1.5 text-xs text-rose-400">{syncError}</p>}
             </div>
           ) : (
             <button
@@ -1355,29 +1298,31 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           {draftMode === "live" && (
             <span
               className={`flex items-center gap-1.5 text-xs font-medium ${
-                wsStatus === "live"
+                syncStatus === "live"
                   ? "text-emerald-400"
-                  : wsStatus === "connecting"
+                  : syncStatus === "syncing"
                   ? "text-amber-400"
                   : "text-rose-400"
               }`}
             >
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  wsStatus === "live"
+                  syncStatus === "live"
                     ? "bg-emerald-400 animate-pulse"
-                    : wsStatus === "connecting"
+                    : syncStatus === "syncing"
                     ? "bg-amber-400 animate-pulse"
                     : "bg-rose-400"
                 }`}
               />
-              {wsStatus === "live"
-                ? "Live"
-                : wsStatus === "connecting"
-                ? "Connecting…"
-                : wsStatus === "error"
-                ? "Connection error"
-                : "Disconnected"}
+              {syncStatus === "live"
+                ? `Synced${lastSyncAt ? ` ${new Date(lastSyncAt).toLocaleTimeString()}` : ""}`
+                : syncStatus === "syncing"
+                ? "Syncing…"
+                : syncStatus === "stale"
+                ? "Stale — retrying"
+                : syncStatus === "error"
+                ? "Sync error"
+                : "Not syncing"}
             </span>
           )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
@@ -1556,6 +1501,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 {bestPickSuggestion && (
                   <button
                     onClick={() => pickPlayer(bestPickSuggestion.player.id)}
+                    title={recommendationContext ? `${recommendationContext.marketLabel}; score ${recommendationContext.score.toFixed(1)} = VOR, tier cliff, next-pick scarcity, and run context` : undefined}
                     className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-1 text-xs transition hover:bg-emerald-500/15"
                   >
                     <span className="text-zinc-500">
@@ -1575,13 +1521,18 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       {bestPickSuggestion.player.vbd > 0 ? "+" : ""}
                       {bestPickSuggestion.player.vbd.toFixed(1)}
                     </span>
+                    {recommendationContext?.survival !== null && recommendationContext?.survival !== undefined && (
+                      <span className="text-zinc-500">· {Math.round(recommendationContext.survival * 100)}% to #{recommendationContext.nextPick}</span>
+                    )}
+                    {recommendationContext && recommendationContext.cliff > 0 && <span className="text-amber-400">· cliff {recommendationContext.cliff.toFixed(1)}</span>}
+                    {recommendationContext?.run && <span className="text-sky-400">· {recommendationContext.run.count}/{recommendationContext.run.window} run</span>}
                   </button>
                 )}
               </div>
             )}
 
-            <div className="overflow-hidden rounded-xl border border-zinc-800">
-              <table className="w-full text-sm">
+            <div className="overflow-x-auto rounded-xl border border-zinc-800" tabIndex={0} aria-label="Available players">
+              <table className="min-w-[760px] w-full text-sm">
                 <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                   <tr>
                     <th className="w-8 px-2 py-2 text-center font-medium text-zinc-500">★</th>
@@ -1601,6 +1552,14 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                     <tr
                       key={p.id}
                       onClick={() => pickPlayer(p.id)}
+                      onKeyDown={(event) => {
+                        if (isUserTurn && (event.key === "Enter" || event.key === " ")) {
+                          event.preventDefault();
+                          pickPlayer(p.id);
+                        }
+                      }}
+                      tabIndex={isUserTurn ? 0 : -1}
+                      aria-label={isUserTurn ? `Draft ${p.name}` : undefined}
                       className={`border-t border-zinc-800/60 transition ${
                         isUserTurn ? "cursor-pointer hover:bg-emerald-500/10" : "opacity-60"
                       } ${i === 0 && isUserTurn ? "bg-emerald-500/5" : ""} ${
@@ -1611,14 +1570,10 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            setWatchlist((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(p.id)) next.delete(p.id);
-                              else next.add(p.id);
-                              return next;
-                            });
+                            setAnnotations((prev) => updateAnnotation(prev, SEASON, p.id, { target: !prev[annotationKey(SEASON, p.id)]?.target }));
                           }}
-                          className={`text-base leading-none transition ${
+                          aria-label={isWatched ? `Remove ${p.name} from targets` : `Add ${p.name} to targets`}
+                          className={`rounded text-base leading-none transition focus-visible:outline-2 focus-visible:outline-emerald-400 ${
                             isWatched ? "text-amber-400" : "text-zinc-600 hover:text-amber-400"
                           }`}
                         >
@@ -1646,6 +1601,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                             </span>
                           ) : null}
                         </div>
+                        {annotations[annotationKey(SEASON, p.id)]?.note && (
+                          <div className="max-w-xs truncate text-[10px] text-amber-300/70">
+                            {annotations[annotationKey(SEASON, p.id)].note}
+                          </div>
+                        )}
                       </td>
                       <td className="px-2 py-2 text-center">
                         <span className={`inline-block rounded border px-1.5 py-0.5 text-xs font-semibold ${POS_BADGE[p.position]}`}>
@@ -1657,7 +1617,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         {p.vbd > 0 ? "+" : ""}{p.vbd.toFixed(1)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-zinc-400">
-                        {p.adp[adpKey] < 999 ? p.adp[adpKey].toFixed(1) : "—"}
+                        {marketReference(p, scoring, roster).consensus?.toFixed(1) ?? "—"}
                       </td>
                       {isUserTurn && (
                         <td className="px-2 py-2 text-center">

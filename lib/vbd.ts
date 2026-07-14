@@ -23,7 +23,7 @@ export const BASELINE_LABELS: Record<BaselineMethod, string> = {
 };
 
 export interface Baseline {
-  /** Number of players at this position rostered above the replacement line. */
+  /** One-based rank of the first undrafted replacement player. */
   rank: number;
   /** Projected points of the replacement-level player. */
   points: number;
@@ -105,7 +105,7 @@ function computeSkillBaselines(
     const arr = pointsByPos[pos];
     const idx = started[pos];
     baselines[pos] = {
-      rank: Math.min(idx, arr.length),
+      rank: arr.length === 0 ? 0 : Math.min(idx + 1, arr.length),
       points: arr.length === 0 ? 0 : (arr[idx] ?? arr[arr.length - 1] ?? 0),
     };
   }
@@ -174,18 +174,18 @@ export function rankPlayers(
 
   const skillBaselines = computeSkillBaselines(pointsByPos, roster, method);
 
-  // K/DEF baseline: 1 starter per team (simple, no greedy flex assignment).
+  // K/DEF baseline: first undrafted player after one starter per team.
   const kPoints = byPos.K.map((x) => x.points);
   const defPoints = byPos.DEF.map((x) => x.points);
   const baselines: Baselines = {
     ...skillBaselines,
     K: {
-      rank: Math.min(roster.teams, kPoints.length),
-      points: kPoints[roster.teams - 1] ?? kPoints[kPoints.length - 1] ?? 0,
+      rank: kPoints.length === 0 ? 0 : Math.min(roster.teams + 1, kPoints.length),
+      points: kPoints[roster.teams] ?? kPoints[kPoints.length - 1] ?? 0,
     },
     DEF: {
-      rank: Math.min(roster.teams, defPoints.length),
-      points: defPoints[roster.teams - 1] ?? defPoints[defPoints.length - 1] ?? 0,
+      rank: defPoints.length === 0 ? 0 : Math.min(roster.teams + 1, defPoints.length),
+      points: defPoints[roster.teams] ?? defPoints[defPoints.length - 1] ?? 0,
     },
   };
 
