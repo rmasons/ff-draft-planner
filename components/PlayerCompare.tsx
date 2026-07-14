@@ -150,7 +150,7 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 label="Proj"
                 highlight={bestProj}
                 cells={players.map((p) => (
-                  <span className="text-zinc-200">{p.points.toFixed(1)}</span>
+                  <span key={p.id} className="text-zinc-200">{p.points.toFixed(1)}</span>
                 ))}
               />
 
@@ -172,7 +172,7 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 label="VOR"
                 highlight={bestVor}
                 cells={players.map((p) => (
-                  <span className={`font-medium ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
+                  <span key={p.id} className={`font-medium ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
                     {p.vbd > 0 ? "+" : ""}
                     {p.vbd.toFixed(1)}
                   </span>
@@ -184,7 +184,7 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 label="Overall Rank"
                 highlight={bestRank}
                 cells={players.map((p) => (
-                  <span className="text-zinc-300">#{p.overallRank}</span>
+                  <span key={p.id} className="text-zinc-300">#{p.overallRank}</span>
                 ))}
               />
 
@@ -257,9 +257,9 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.bye != null ? (
-                    <span className="text-zinc-400">{p.bye}</span>
+                    <span key={p.id} className="text-zinc-400">{p.bye}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />
@@ -270,9 +270,9 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.injuryStatus ? (
-                    <span className="text-amber-400 text-xs">{p.injuryStatus}</span>
+                    <span key={p.id} className="text-amber-400 text-xs">{p.injuryStatus}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />
@@ -283,11 +283,11 @@ export default function PlayerCompare({ players, scoring, roster, onClose, onRem
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.yearsExp === 0 ? (
-                    <span className="text-amber-400 text-xs">Rookie</span>
+                    <span key={p.id} className="text-amber-400 text-xs">Rookie</span>
                   ) : p.yearsExp !== null ? (
-                    <span className="text-zinc-400 text-xs">Yr {p.yearsExp + 1}</span>
+                    <span key={p.id} className="text-zinc-400 text-xs">Yr {p.yearsExp + 1}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />

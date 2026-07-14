@@ -134,10 +134,12 @@ export default function DraftBoard() {
   }, [players, snapshotHydrated, adpKey, setSnapshot, scoring, roster]);
 
   // Map player_id → trend delta (positive = rising, negative = falling).
-  // Only populated when a fresh (≤7 day old) snapshot exists from a prior load.
+  // Only populated when a fresh snapshot exists from a prior load — the
+  // seeding effect above rebuilds `snapshot` as soon as it's stale (or from a
+  // mismatched adpKey), so `snapshot` itself is the freshness signal; reading
+  // Date.now() again here would be an impure call during render.
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
-    if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
     // Snapshot was seeded under a different adpKey (format switch, or an old
     // snapshot from before adpKey was tracked) — its ADP values aren't
     // comparable to the current consensus, so bail out rather than show
@@ -153,7 +155,7 @@ export default function DraftBoard() {
       map[p.id] = snapAdp - currentConsensus;
     }
     return map;
-  }, [players, snapshot, snapshotHydrated, scoring, roster]);
+  }, [players, snapshot, snapshotHydrated, adpKey, scoring, roster]);
 
   const { ranked, baselines } = useMemo(() => {
     if (!players) return { ranked: [] as RankedPlayer[], baselines: null as Baselines | null };
