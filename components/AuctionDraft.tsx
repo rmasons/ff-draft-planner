@@ -5,6 +5,7 @@ import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { POS_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import { auctionBudget, legalAuctionPurchase, teamAuctionValue } from "@/lib/auction";
 import { rosterSlots } from "@/lib/draft";
@@ -28,15 +29,6 @@ const DEFAULT_SETUP: AuctionSetup = {
   numTeams: 12,
   budgetPerTeam: 200,
   started: false,
-};
-
-const POS_BADGE: Record<Position, string> = {
-  QB: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K: "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
 };
 
 export default function AuctionDraft() {
@@ -435,6 +427,9 @@ export default function AuctionDraft() {
                                   )
                                 )}
                               </select>
+                              <span className="text-sm text-zinc-400">
+                                (max ${budgetGuidance[nomineeWinner]?.maxBid})
+                              </span>
                               <span className="text-sm text-zinc-400">at</span>
                               <div className="flex items-center gap-1">
                                 <span className="text-sm text-zinc-400">$</span>
@@ -455,6 +450,11 @@ export default function AuctionDraft() {
                               >
                                 Confirm Win
                               </button>
+                              {bidError && (
+                                <span className="w-full text-xs text-rose-400">
+                                  {bidError}
+                                </span>
+                              )}
                             </div>
                             <p className="mt-2 text-xs text-zinc-500">
                               {teamLabel(nomineeWinner)}: ${budgetGuidance[nomineeWinner]?.remaining} left · ${budgetGuidance[nomineeWinner]?.reservedMinimum} reserved · ${budgetGuidance[nomineeWinner]?.maxBid} max
@@ -519,6 +519,9 @@ export default function AuctionDraft() {
                 >
                   ${budgets[i]}
                 </span>
+              </div>
+              <div className="mb-1.5 text-[11px] text-zinc-600">
+                max bid ${budgetGuidance[i].maxBid}
               </div>
               <div className="space-y-0.5">
                 <div className="mb-2 grid grid-cols-2 gap-x-2 text-[10px] text-zinc-500">

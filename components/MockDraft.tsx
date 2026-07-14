@@ -5,8 +5,10 @@ import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { POS_BADGE, UNKNOWN_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import DraftBoardGrid from "./DraftBoardGrid";
+import ScarcityChart from "./ScarcityChart";
 import { SEASON } from "@/lib/sleeper";
 import { annotationKey, updateAnnotation, type AnnotationStore } from "@/lib/annotations";
 import { validRoster, validScoring } from "@/lib/validation";
@@ -72,16 +74,7 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1, proj: -1, vor: -1, adp: 1, value: -1,
 };
 
-const POS_BADGE: Record<Position, string> = {
-  QB: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K: "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-
-const UNKNOWN_BADGE = "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
+// POS_BADGE / UNKNOWN_BADGE now come from @/lib/ui (shared across screens).
 
 const SLOT_ELIGIBLE: Record<string, string[]> = {
   QB: ["QB"], RB: ["RB"], WR: ["WR"], TE: ["TE"], K: ["K"], DEF: ["DEF"],
@@ -218,7 +211,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [copiedRoster, setCopiedRoster] = useState(false);
 
   // View and filter state
-  const [viewMode, setViewMode] = useState<"players" | "board">("players");
+  const [viewMode, setViewMode] = useState<"players" | "board" | "scarcity">("players");
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("rank");
@@ -292,10 +285,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => { cancelled = true; };
   }, []);
 
-  const ranked = useMemo(() => {
-    if (!players) return [] as RankedPlayer[];
-    return rankPlayers(players, scoring, roster, method).players;
-  }, [players, scoring, roster, method]);
+  // Keep the full rankPlayers() result (not just `.players`) so the
+  // replacement-level baselines are available to pass down to ScarcityChart.
+  // Calling with `players ?? []` (instead of an early-return null) keeps
+  // `baselines` a real (if all-zero) Baselines object before players load,
+  // so downstream code never has to null-check it.
+  const rankResult = useMemo(
+    () => rankPlayers(players ?? [], scoring, roster, method),
+    [players, scoring, roster, method]
+  );
+  const ranked = rankResult.players;
+  const baselines = rankResult.baselines;
 
   const numTeams = importedTeams ?? roster.teams;
   const numRounds =
@@ -366,6 +366,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           return (va - vb) * sortDir;
         }
         case "value": {
+          // "Value" = consensus ADP minus overall rank (higher = bigger steal).
           const val = (p: RankedPlayer): number | null => {
             const consensus = marketReference(p, scoring, roster).consensus;
             return consensus === null ? null : consensus - p.overallRank;
@@ -400,9 +401,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const draftGrade = useMemo(() => {
     if (!isDone || draftMode !== "cpu") return null;
     const graded = myPicks.flatMap((pick) => {
+      // Keepers aren't a drafting decision (you didn't "win" the pick against
+      // the market that round), so they don't count toward the grade.
+      if (pick.isKeeper) return [];
       const player = playerById.get(pick.playerId);
       if (!player) return [];
-      if (pick.isKeeper) return [];
       const market = marketReference(player, scoring, roster);
       const value = gradePick(market.consensus, pick.pickNumber);
       return value === null ? [] : [{ pick, player, value, marketAdp: market.consensus }];
@@ -1148,7 +1151,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         <span className="text-zinc-300">#{pickEquivalent}</span>
                         <span className="text-zinc-500">ADP</span>
                         <span className="text-zinc-300">{consensusAdp !== null ? consensusAdp.toFixed(1) : "—"}</span>
-                        <span className="text-zinc-500">VOR surplus</span>
+                        <span className="text-zinc-500">ADP surplus</span>
                         <span className={surplus === null ? "text-zinc-500" : surplus > 0 ? "text-emerald-400" : "text-rose-400"}>
                           {surplus !== null
                             ? surplus > 0
@@ -1326,7 +1329,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             </span>
           )}
           <div className="flex rounded-md border border-zinc-700 p-0.5">
-            {(["players", "board"] as const).map((v) => (
+            {(["players", "board", "scarcity"] as const).map((v) => (
               <button
                 key={v}
                 onClick={() => setViewMode(v)}
@@ -1334,7 +1337,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                   viewMode === v ? "bg-zinc-700 text-zinc-100" : "text-zinc-500 hover:text-zinc-300"
                 }`}
               >
-                {v === "players" ? "Players" : "Board"}
+                {v === "players" ? "Players" : v === "board" ? "Board" : "Scarcity"}
               </button>
             ))}
           </div>
@@ -1403,7 +1406,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 >
                   {draftGrade.avgValue >= 0 ? "+" : ""}
                   {draftGrade.avgValue.toFixed(1)} picks{" "}
-                  {draftGrade.avgValue >= 0 ? "ahead of" : "behind"} ADP
+                  {draftGrade.avgValue >= 0 ? "later than ADP (steals)" : "earlier than ADP (reaches)"}
                 </span>
               </p>
               <div className="flex flex-wrap gap-1.5">
@@ -1437,7 +1440,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
       {/* Main layout */}
       <div className="flex gap-4">
-        {/* Left: board or player table */}
+        {/* Left: board, player table, or scarcity chart */}
         {viewMode === "board" ? (
           <div className="min-w-0 flex-1 overflow-x-auto">
             <DraftBoardGrid
@@ -1450,6 +1453,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               playerById={playerById}
               draftMode={draftMode}
               teamNames={teamNames}
+            />
+          </div>
+        ) : viewMode === "scarcity" ? (
+          <div className="min-w-0 flex-1">
+            <ScarcityChart
+              ranked={ranked}
+              draftedIds={draftedIds}
+              numTeams={numTeams}
+              numRounds={numRounds}
+              currentPickNum={currentPickNum}
+              baselines={baselines}
             />
           </div>
         ) : (

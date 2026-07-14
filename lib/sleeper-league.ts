@@ -129,6 +129,14 @@ export function mapLeagueToConfig(
     rushTd: sc.rush_td ?? fallback.rushTd,
     recYd: sc.rec_yd ?? fallback.recYd,
     recTd: sc.rec_td ?? fallback.recTd,
+    // Unlike the other stats above, `rec` and `bonus_rec_te` deliberately do NOT
+    // fall back to the current config if the league doesn't set them. Sleeper
+    // omits `rec` entirely for standard (non-PPR) leagues rather than sending 0 —
+    // so "absent" means "this league doesn't award reception points," and
+    // falling back to whatever PPR/half-PPR value happens to be in `fallback`
+    // would silently misprice every WR/RB (e.g. import a standard league while
+    // a PPR config is active → everyone keeps getting PPR points). Defaulting
+    // to 0 here is the only value that's correct for every league type.
     rec: sc.rec ?? 0,
     teRecBonus: sc.bonus_rec_te ?? 0,
     fumLost: sc.fum_lost ?? fallback.fumLost, // also stored as negative

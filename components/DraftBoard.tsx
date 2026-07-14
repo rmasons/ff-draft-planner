@@ -10,13 +10,15 @@ import {
   type Baselines,
 } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { POS_BADGE, POS_DOT } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
-import { marketReference } from "@/lib/market";
+import { marketReference, valueVsMarket } from "@/lib/market";
 import { assessRisk } from "@/lib/risk";
 import { fantasyPointsForStats } from "@/lib/scoring";
 import { annotationKey, EMPTY_ANNOTATION, updateAnnotation, type AnnotationStore, type PlayerAnnotation } from "@/lib/annotations";
 import { validRoster, validScoring } from "@/lib/validation";
+import PlayerCompare from "./PlayerCompare";
 
 type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
@@ -26,6 +28,13 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 interface AdpSnapshot {
   ts: number;
   data: Record<string, number>;
+  // Which adpKey (ppr/half/std/superflex, see adpKeyFor) the snapshot's `data`
+  // was computed under. Consensus ADP differs by scoring/roster format, so a
+  // snapshot seeded under one key is meaningless compared against another —
+  // this lets us detect a format switch and rebuild instead of showing bogus
+  // trend arrows. Optional so snapshots persisted before this field existed
+  // are handled gracefully (treated as a mismatch, see trendMap below).
+  adpKey?: string;
 }
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
@@ -42,23 +51,6 @@ const TIER_COLORS = [
   "#fb7185", "#22d3ee", "#a3e635", "#f472b6",
 ];
 const tierColor = (tier: number) => TIER_COLORS[(tier - 1) % TIER_COLORS.length];
-
-const POS_BADGE: Record<Position, string> = {
-  QB:  "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB:  "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR:  "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE:  "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K:   "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-const POS_DOT: Record<Position, string> = {
-  QB:  "#fb7185",
-  RB:  "#34d399",
-  WR:  "#38bdf8",
-  TE:  "#fbbf24",
-  K:   "#a78bfa",
-  DEF: "#fb923c",
-};
 
 function SortTh({
   label, sk, sortKey, sortDir, onSort, className, subLabel,
@@ -97,6 +89,7 @@ export default function DraftBoard() {
   const [hideDrafted, setHideDrafted] = useState(true);
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
+  const [compareIds, setCompareIds] = useState<string[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -125,14 +118,18 @@ export default function DraftBoard() {
     if (!players || !snapshotHydrated) return;
     setSnapshot((prev) => {
       const now = Date.now();
-      if (prev && now - prev.ts <= SEVEN_DAYS_MS) return prev; // still fresh
+      // Still fresh AND seeded under the currently-active adpKey → keep it.
+      // A missing adpKey (snapshot from before this field existed) or a key
+      // that doesn't match the current scoring/roster format both count as
+      // a mismatch and force a rebuild below.
+      if (prev && prev.adpKey === adpKey && now - prev.ts <= SEVEN_DAYS_MS) return prev;
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
         const market = marketReference(p, scoring, roster);
         if (market.consensus !== null) data[p.id] = market.consensus;
       }
-      return { ts: now, data };
+      return { ts: now, data, adpKey };
     });
   }, [players, snapshotHydrated, adpKey, setSnapshot, scoring, roster]);
 
@@ -140,6 +137,12 @@ export default function DraftBoard() {
   // Only populated when a fresh (≤7 day old) snapshot exists from a prior load.
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
+    if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
+    // Snapshot was seeded under a different adpKey (format switch, or an old
+    // snapshot from before adpKey was tracked) — its ADP values aren't
+    // comparable to the current consensus, so bail out rather than show
+    // bogus trend arrows. The seeding effect above will rebuild it shortly.
+    if (snapshot.adpKey !== adpKey) return {};
     const map: Record<string, number> = {};
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
@@ -200,12 +203,12 @@ export default function DraftBoard() {
           return (va - vb) * sortDir;
         }
         case "value": {
-          const getVal = (p: RankedPlayer): number | null => {
-            const consensus = marketReference(p, scoring, roster).consensus;
-            return consensus === null ? null : consensus - p.overallRank;
-          };
-          const va = getVal(a);
-          const vb = getVal(b);
+          // Returns null for K/DEF (their overallRank is forced to the bottom
+          // of the board by design, see rankPlayers in lib/vbd.ts, so ADP
+          // minus overallRank would be a huge, meaningless negative number)
+          // and for players with no consensus ADP data.
+          const va = valueVsMarket(a, scoring, roster);
+          const vb = valueVsMarket(b, scoring, roster);
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
@@ -225,6 +228,18 @@ export default function DraftBoard() {
     setDrafted((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
+
+  // Toggle a player in/out of the compare panel (max 3).
+  // When a removal would leave fewer than 2 players, clear the list (closes modal).
+  const toggleCompare = (id: string) =>
+    setCompareIds((prev) => {
+      if (prev.includes(id)) {
+        const next = prev.filter((x) => x !== id);
+        return next.length < 2 ? [] : next;
+      }
+      if (prev.length >= 3) return prev;
+      return [...prev, id];
+    });
 
   // Tier dividers and replacement line only make sense on the default rank sort.
   const isRankSort = sortKey === "rank" && sortDir === 1;
@@ -341,7 +356,12 @@ export default function DraftBoard() {
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Tier</th>
                   <SortTh label="Proj" sk="proj" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
-                  <th className="px-3 py-2 text-right font-medium text-zinc-500">2025</th>
+                  <th
+                    className="px-3 py-2 text-right font-medium text-zinc-500"
+                    title="2025 season total, PPR scoring"
+                  >
+                    2025
+                  </th>
                   <SortTh label="VOR" sk="vor" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
                   <SortTh label="ADP" sk="adp" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" subLabel={adpKey === "ppr" ? "SL·ESPN" : "Sleeper"} />
                   <SortTh label="Val" sk="value" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
@@ -367,7 +387,10 @@ export default function DraftBoard() {
                     (!prev || prev.posRank <= replRank);
                   const isDrafted = draftedSet.has(p.id);
                   const market = marketReference(p, scoring, roster);
-                  const value = market.consensus !== null ? market.consensus - p.overallRank : null;
+                  // valueVsMarket returns null for K/DEF (forced to the
+                  // bottom of the board by design, see rankPlayers in
+                  // lib/vbd.ts) and for players with no consensus ADP data.
+                  const value = valueVsMarket(p, scoring, roster);
                   const risk = assessRisk(p);
                   const trend = trendMap[p.id] ?? 0;
                   return (
@@ -388,6 +411,8 @@ export default function DraftBoard() {
                       tierBreak={tierBreak}
                       replBreak={replBreak}
                       onToggle={() => toggleDrafted(p.id)}
+                      inCompare={compareIds.includes(p.id)}
+                      onCompare={() => toggleCompare(p.id)}
                     />
                   );
                 })}
@@ -410,6 +435,21 @@ export default function DraftBoard() {
           </p>
         )}
       </main>
+
+      {compareIds.length >= 2 && (
+        <PlayerCompare
+          players={ranked.filter((p) => compareIds.includes(p.id))}
+          scoring={scoring}
+          roster={roster}
+          onClose={() => setCompareIds([])}
+          onRemove={(id) =>
+            setCompareIds((prev) => {
+              const next = prev.filter((x) => x !== id);
+              return next.length < 2 ? [] : next;
+            })
+          }
+        />
+      )}
     </div>
   );
 }
@@ -430,6 +470,8 @@ function Row({
   tierBreak,
   replBreak,
   onToggle,
+  inCompare,
+  onCompare,
 }: {
   p: RankedPlayer;
   rank: number;
@@ -446,6 +488,8 @@ function Row({
   tierBreak: boolean;
   replBreak: boolean;
   onToggle: () => void;
+  inCompare: boolean;
+  onCompare: () => void;
 }) {
   const riskColor =
     risk >= 7 ? "text-rose-400" : risk >= 4 ? "text-amber-400" : "text-emerald-400";
@@ -457,7 +501,7 @@ function Row({
             colSpan={11}
             className="border-y border-dashed border-zinc-600 bg-zinc-800/40 px-3 py-1 text-center text-[11px] font-semibold uppercase tracking-widest text-zinc-400"
           >
-            ▼ Replacement level · players below have negative VOR
+            ▼ Replacement level · replacement band starts here
           </td>
         </tr>
       )}
@@ -575,16 +619,27 @@ function Row({
           {risk}
         </td>
         <td className="px-2 py-2 text-center">
-          <button
-            onClick={onToggle}
-            className={`rounded-md border px-2 py-1 text-xs transition ${
-              isDrafted
-                ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
-                : "border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
-            }`}
-          >
-            {isDrafted ? "Undo" : "Draft"}
-          </button>
+          <div className="flex items-center justify-center gap-1.5">
+            <button
+              onClick={onToggle}
+              className={`rounded-md border px-2 py-1 text-xs transition ${
+                isDrafted
+                  ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
+                  : "border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10"
+              }`}
+            >
+              {isDrafted ? "Undo" : "Draft"}
+            </button>
+            <button
+              onClick={onCompare}
+              title={inCompare ? "Remove from compare" : "Add to compare"}
+              className={`text-base leading-none transition ${
+                inCompare ? "text-sky-400" : "text-zinc-600 hover:text-sky-400"
+              }`}
+            >
+              ⊕
+            </button>
+          </div>
         </td>
       </tr>
     </>
