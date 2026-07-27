@@ -1,6 +1,45 @@
 import { NextResponse } from "next/server";
 import { fetchPlayers, fetch2025ActualStats, SEASON } from "@/lib/sleeper";
 import { fetchEspnAdp, espnAdpKey } from "@/lib/espn";
+// `unstable_cache` is superseded in Next 16 — docs/.../04-functions/unstable_cache.md
+// says it "has been replaced by `use cache`". We are deliberately NOT migrating
+// yet. Blockers, in order of importance (paths are under
+// node_modules/next/dist/docs/01-app/):
+//
+// 1. `use cache` does not document the stale-on-error behavior the per-source
+//    split below depends on. That guarantee is stated only for the ISR/Data
+//    Cache path, in 02-guides/incremental-static-regeneration.md ("Handling
+//    uncaught exceptions"): "If an error is thrown while attempting to
+//    revalidate data, the last successfully generated data will continue to be
+//    served from the cache. On the next subsequent request, Next.js will retry
+//    revalidating the data." Nothing in 03-api-reference/01-directives/use-cache.md,
+//    04-functions/cacheLife.md or 04-functions/cacheTag.md says what a
+//    `use cache` entry does when its revalidation throws. Trading a documented
+//    guarantee for an unestablished one is the exact failure this route is
+//    built to avoid — see the block comment below for what rests on it.
+//
+// 2. `use cache` at runtime is an in-memory LRU, not the durable Data Cache.
+//    use-cache.md ("Runtime caching considerations") on Serverless: "Cache
+//    entries typically don't persist across requests (each request can be a
+//    different instance), or during revalidation." unstable_cache instead
+//    "uses Next.js' built-in cache to persist the result across requests and
+//    deployments" (unstable_cache.md). This route exists to hold three
+//    third-party APIs to one fetch per 12h, which a non-persisting cache
+//    defeats. Restoring persistence needs `use cache: remote`, which per
+//    use-cache.md "requires a network roundtrip to check the cache and
+//    typically incurs platform fees".
+//
+// 3. `use cache` is gated on `cacheComponents: true` in next.config.ts
+//    (use-cache.md, "Usage"). Per 03-api-reference/05-config/01-next-config-js/cacheComponents.md
+//    that flag also makes PPR the App Router default and retires
+//    `export const revalidate` (02-guides/migrating-to-cache-components.md), so
+//    it is a repo-wide switch, not an isolated change to this route.
+//
+// Note this is not an unsupported path: 02-guides/caching-without-cache-components.md
+// is the maintained guide for "projects not using Cache Components" and still
+// documents `unstable_cache` for exactly this non-`fetch`, per-source shape.
+// Revisit if a future release documents `use cache` revalidation-error
+// semantics.
 import { unstable_cache } from "next/cache";
 import type { RawStats } from "@/lib/types";
 

@@ -199,9 +199,3 @@ export async function fetch2025ActualStats(): Promise<Map<string, RawStats>> {
     return await fetch2025ActualStatsOnce();
   }
 }
-
-/** @deprecated Prefer raw stats and active scoring. */
-export async function fetch2025ActualPts(): Promise<Map<string, number>> {
-  const stats = await fetch2025ActualStats();
-  return new Map([...stats].flatMap(([id, value]) => typeof value.pts_std === "number" ? [[id, value.pts_std]] : []));
-}
