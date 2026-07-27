@@ -3,7 +3,9 @@ import {
   depthValueFactor,
   fillLineupSlots,
   leagueOpenSlots,
+  remainingPicksForSlot,
   rosterConfigFromLeague,
+  rosterSlots,
   selectSuggestedPick,
   startableByPosition,
 } from "../lib/draft";
@@ -336,6 +338,62 @@ describe("fillLineupSlots / leagueOpenSlots", () => {
 
   it("ignores slots the app does not draft", () => {
     expect(leagueOpenSlots([], () => undefined, ["QB", "IDP_FLEX", "IR"], 1)).toEqual(["QB"]);
+  });
+});
+
+describe("K and DEF slots are independent", () => {
+  const config = { ...DEFAULT_ROSTER, teams: 12, qb: 1, rb: 2, wr: 2, te: 1, flex: 1, superflex: 0, bench: 1 };
+
+  it("gives a kicker-only league no defense slot", () => {
+    // A single flag for both would hand this league a DEF slot it can never
+    // start, so the CPU drafts defenses and the baselines carry DEF demand.
+    const slots = rosterSlots(config, true, false);
+    expect(slots.filter((s) => s === "K")).toHaveLength(1);
+    expect(slots).not.toContain("DEF");
+  });
+
+  it("gives a defense-only league no kicker slot", () => {
+    const slots = rosterSlots(config, false, true);
+    expect(slots).not.toContain("K");
+    expect(slots.filter((s) => s === "DEF")).toHaveLength(1);
+  });
+
+  it("keeps the one- and two-argument forms meaning both or neither", () => {
+    expect(rosterSlots(config)).toContain("K");
+    expect(rosterSlots(config)).toContain("DEF");
+    expect(rosterSlots(config, false)).not.toContain("K");
+    expect(rosterSlots(config, false)).not.toContain("DEF");
+  });
+});
+
+describe("remainingPicksForSlot", () => {
+  // 4 teams, 3 rounds, snake: slot 2 owns picks 2, 7, 10.
+  const noTrades: never[] = [];
+
+  it("lists a slot's picks in snake order", () => {
+    expect(remainingPicksForSlot(1, 4, 3, noTrades, 2, new Set())).toEqual([2, 7, 10]);
+    expect(remainingPicksForSlot(1, 4, 3, noTrades, 1, new Set())).toEqual([1, 8, 9]);
+  });
+
+  it("skips pick numbers a keeper already consumed", () => {
+    // Pick 7 is a keeper: it is in the order but nobody makes it. Counting it
+    // would overstate picks remaining and aim survival at a pick that never
+    // comes — the two used to disagree about this.
+    const filled = new Set([7]);
+    expect(remainingPicksForSlot(1, 4, 3, noTrades, 2, filled)).toEqual([2, 10]);
+    const fromCurrent = remainingPicksForSlot(2, 4, 3, noTrades, 2, filled);
+    expect(fromCurrent.length).toBe(2);                       // picks remaining
+    expect(fromCurrent.find((n) => n > 2)).toBe(10);          // next pick, not 7
+  });
+
+  it("returns nothing once the draft is over", () => {
+    expect(remainingPicksForSlot(13, 4, 3, noTrades, 2, new Set())).toEqual([]);
+  });
+
+  it("follows a traded pick to its new owner", () => {
+    const trades = [{ round: 2, roster_id: 2, owner_id: 3 }];
+    expect(remainingPicksForSlot(1, 4, 3, trades, 2, new Set())).toEqual([2, 10]);
+    expect(remainingPicksForSlot(1, 4, 3, trades, 3, new Set())).toEqual([3, 6, 7, 11]);
   });
 });
 

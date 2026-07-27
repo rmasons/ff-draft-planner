@@ -26,6 +26,7 @@ import {
   pickNumberForSlot,
   pollBackoffDelay,
   positionalRun,
+  remainingPicksForSlot,
   rosterConfigFromLeague,
   rosterSlots,
   seededRandom,
@@ -274,10 +275,14 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return leagueRosterPositions.length > 0 ? rosterConfigFromLeague(leagueRosterPositions, base) : base;
   }, [roster, importedTeams, leagueRosterPositions]);
 
-  // Sleeper leagues can skip K and/or DEF entirely; don't make the CPU fill
-  // slots the league doesn't have.
-  const leagueHasKDef = useMemo(
-    () => leagueRosterPositions.length === 0 || leagueRosterPositions.some((p) => p === "K" || p === "DEF"),
+  // Sleeper leagues can skip K and/or DEF, and can skip one without the other;
+  // don't make the CPU fill a slot the league doesn't have.
+  const leagueHasK = useMemo(
+    () => leagueRosterPositions.length === 0 || leagueRosterPositions.includes("K"),
+    [leagueRosterPositions]
+  );
+  const leagueHasDef = useMemo(
+    () => leagueRosterPositions.length === 0 || leagueRosterPositions.includes("DEF"),
     [leagueRosterPositions]
   );
 
@@ -299,8 +304,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   // One team's roster template: the imported league's if there is one.
   const leagueSlotTemplate = useMemo(
     (): string[] =>
-      leagueRosterPositions.length > 0 ? leagueRosterPositions : rosterSlots(effectiveRoster, leagueHasKDef),
-    [leagueRosterPositions, effectiveRoster, leagueHasKDef]
+      leagueRosterPositions.length > 0 ? leagueRosterPositions : rosterSlots(effectiveRoster, leagueHasK, leagueHasDef),
+    [leagueRosterPositions, effectiveRoster, leagueHasK, leagueHasDef]
   );
 
   // Dynamic replacement level, once there's a board to measure against.
@@ -480,25 +485,18 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return myRosterSlots.filter((s) => s.slotType !== "BN" && s.pick === null);
   }, [myRosterSlots]);
 
-  // Next pick number this user owns after the current one (null if none left).
-  const nextUserPickNum = useMemo((): number | null => {
-    const lastPick = numTeams * numRounds;
-    for (let n = currentPickNum + 1; n <= lastPick; n++) {
-      if (ownerForPick(n, numTeams, tradeRecords) === userSlot) return n;
-    }
-    return null;
-  }, [currentPickNum, numTeams, numRounds, tradeRecords, userSlot]);
-
-  // Picks the user still owns, counting the one on the clock. Skips pick
-  // numbers already filled, so keepers taken out of order don't inflate it.
-  const userPicksRemaining = useMemo(() => {
-    if (isDone) return 0;
-    let count = 0;
-    for (let n = currentPickNum; n <= numTeams * numRounds; n++) {
-      if (!pickedNums.has(n) && ownerForPick(n, numTeams, tradeRecords) === userSlot) count++;
-    }
-    return count;
-  }, [isDone, currentPickNum, numTeams, numRounds, tradeRecords, userSlot, pickedNums]);
+  // Picks the user still gets to make, starting with the one on the clock.
+  // Both the count and "which pick comes next" read off this one list so they
+  // can't disagree about whether an already-filled (keeper) slot counts.
+  const userRemainingPicks = useMemo(
+    () => remainingPicksForSlot(currentPickNum, numTeams, numRounds, tradeRecords, userSlot, pickedNums),
+    [currentPickNum, numTeams, numRounds, tradeRecords, userSlot, pickedNums]
+  );
+  const nextUserPickNum = useMemo(
+    (): number | null => userRemainingPicks.find((n) => n > currentPickNum) ?? null,
+    [userRemainingPicks, currentPickNum]
+  );
+  const userPicksRemaining = userRemainingPicks.length;
 
   // Positional runs in the recent live picks, keyed by position.
   const runsByPosition = useMemo(() => {
@@ -607,7 +605,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         const player = playerById.get(pick.playerId);
         return player ? [{ id: player.id, position: player.position }] : [];
       });
-      const configuredSlots = rosterSlots(effectiveRoster, leagueHasKDef);
+      const configuredSlots = rosterSlots(effectiveRoster, leagueHasK, leagueHasDef);
       // Fall back to best-available (bench-anything) once the roster's slots
       // are full — e.g. an imported league with more rounds than the local
       // roster config has slots for — so the CPU always has a legal pick and
@@ -624,7 +622,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => clearTimeout(timer);
   }, [
     started, draftMode, isUserTurn, isDone, ranked, draftedIds,
-    currentTeamSlot, currentPickNum, picks, playerById, effectiveRoster, leagueHasKDef, scoring, annotations,
+    currentTeamSlot, currentPickNum, picks, playerById, effectiveRoster, leagueHasK, leagueHasDef, scoring, annotations,
   ]);
 
   useEffect(() => {

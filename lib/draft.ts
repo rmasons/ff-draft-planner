@@ -327,15 +327,45 @@ export function ownerForPick(pickNumber: number, teams: number, trades: TradedPi
   return owner;
 }
 
+/**
+ * Pick numbers from `fromPick` onward that a team still gets to make, in
+ * order. Pick numbers already in `filled` are skipped: a keeper consumes a
+ * slot in the order without being a pick anyone makes, so counting it would
+ * both overstate how many picks a team has left and point "who survives to my
+ * next pick" at a pick that never happens.
+ */
+export function remainingPicksForSlot(
+  fromPick: number,
+  teams: number,
+  rounds: number,
+  trades: TradedPickLike[],
+  slot: number,
+  filled: ReadonlySet<number>,
+): number[] {
+  const picks: number[] = [];
+  for (let n = Math.max(1, fromPick); n <= teams * rounds; n++) {
+    if (!filled.has(n) && ownerForPick(n, teams, trades) === slot) picks.push(n);
+  }
+  return picks;
+}
+
 export type RosterSlot = "QB" | "RB" | "WR" | "TE" | "FLEX" | "SUPER_FLEX" | "K" | "DEF" | "BN";
 export interface RosterAssignment { valid: boolean; assignments: (string | null)[]; openSlots: RosterSlot[] }
 
-export function rosterSlots(config: RosterConfig, includeKDef = true): RosterSlot[] {
+/**
+ * The slot template for one team. K and DEF are controlled independently —
+ * Sleeper leagues can roster one without the other, and a single flag for both
+ * gives such a league a slot it can never start (and, through the baselines, a
+ * league-wide demand of one per team for a position nobody drafts).
+ * `includeDef` defaults to `includeK` so the two-argument form still means
+ * "both" or "neither".
+ */
+export function rosterSlots(config: RosterConfig, includeK = true, includeDef = includeK): RosterSlot[] {
   const repeat = (slot: RosterSlot, count: number) => Array.from({ length: Math.max(0, count) }, () => slot);
   return [
     ...repeat("QB", config.qb), ...repeat("RB", config.rb), ...repeat("WR", config.wr),
     ...repeat("TE", config.te), ...repeat("FLEX", config.flex), ...repeat("SUPER_FLEX", config.superflex),
-    ...(includeKDef ? (["K", "DEF"] as RosterSlot[]) : []), ...repeat("BN", config.bench),
+    ...repeat("K", includeK ? 1 : 0), ...repeat("DEF", includeDef ? 1 : 0), ...repeat("BN", config.bench),
   ];
 }
 
