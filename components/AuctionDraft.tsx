@@ -8,9 +8,9 @@ import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { POS_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import {
-  auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, isValidWonPlayers,
-  legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
-  type AuctionSetup, type WonPlayer,
+  auctionBudget, auctionPriceFromPool, auctionValuePool, averageAuctionBudget, clampAuctionSetupInput,
+  isValidAuctionSetup, isValidWonPlayers, legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
+  unionLegalPositions, type AuctionSetup, type WonPlayer,
 } from "@/lib/auction";
 import { rosterSlots } from "@/lib/draft";
 import { validRoster, validScoring } from "@/lib/validation";
@@ -141,12 +141,29 @@ export default function AuctionDraft() {
   // specific player is asked about, so this tests the ~6 known positions
   // instead of running legalAuctionPurchase (and its backtracking
   // assignRoster solve) for every available player on every row render.
+  // NOTE: this only hoists the assignRoster probe out of the per-row path —
+  // it says nothing about the O(available.length) VBD-pool sum inside
+  // teamAuctionValue, which is hoisted separately below (marketPool).
   const teamLegalPositions = useMemo(
     () => budgetGuidance.map((budget, teamIndex) => legalPositionsForTeam(budget, teamPlayers[teamIndex] ?? [], slots)),
     [budgetGuidance, teamPlayers, slots]
   );
 
-  function suggestedBid(p: RankedPlayer, teamIndex = nomineeWinner): number {
+  // Team-agnostic market price for the board-wide "Sug. Bid" column. Must not
+  // depend on the nominee-winner dropdown (that would silently rewrite every
+  // row's price whenever the dropdown changes) and must not collapse to $0
+  // just because one arbitrary team's roster happens to be full — so this
+  // unions legal positions across every team and averages their budgets,
+  // rather than reading a single team's numbers. Computed once per render
+  // (not once per row) since every row prices against the same pool.
+  const marketLegalPositions = useMemo(() => unionLegalPositions(teamLegalPositions), [teamLegalPositions]);
+  const marketBudget = useMemo(() => averageAuctionBudget(budgetGuidance), [budgetGuidance]);
+  const marketPool = useMemo(() => auctionValuePool(available, marketLegalPositions), [available, marketLegalPositions]);
+
+  // Team-specific price for the nomination panel, where the team is explicit
+  // (either the team the dropdown is currently set to, or a caller-supplied
+  // one) — unlike the board column, this one legitimately depends on teamIndex.
+  function suggestedBid(p: RankedPlayer, teamIndex: number): number {
     const legalPositions = teamLegalPositions[teamIndex] ?? new Set<Position>();
     return teamAuctionValue(p, available, budgetGuidance[teamIndex], legalPositions);
   }
@@ -362,7 +379,7 @@ export default function AuctionDraft() {
               <tbody>
                 {visibleRows.map((p) => {
                   const isNominated = nomineeId === p.id;
-                  const bid = suggestedBid(p);
+                  const bid = auctionPriceFromPool(p, marketPool, marketBudget);
                   return (
                     <Fragment key={p.id}>
                       <tr

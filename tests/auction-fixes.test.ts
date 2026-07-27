@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, isValidWonPlayers,
-  legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue, type AuctionBudget,
+  auctionBudget, auctionPriceFromPool, auctionValuePool, averageAuctionBudget, clampAuctionSetupInput,
+  isValidAuctionSetup, isValidWonPlayers, legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
+  unionLegalPositions, type AuctionBudget,
 } from "../lib/auction";
 import { rosterSlots } from "../lib/draft";
 import { DEFAULT_ROSTER } from "../lib/presets";
@@ -191,6 +192,72 @@ describe("BUG 3b — isValidAuctionSetup validator", () => {
     expect(isValidAuctionSetup({ numTeams: 12, budgetPerTeam: "200", started: true })).toBe(false);
     expect(isValidAuctionSetup({ numTeams: 33, budgetPerTeam: 200, started: true })).toBe(false);
     expect(isValidAuctionSetup({ numTeams: 12, budgetPerTeam: NaN, started: true })).toBe(false);
+  });
+});
+
+describe("Sug. Bid column — hoisted pool matches teamAuctionValue (Part B)", () => {
+  const available: RankedPlayer[] = [
+    rankedPlayer("qb1", "QB", 40), rankedPlayer("rb1", "RB", 50), rankedPlayer("rb2", "RB", -5),
+    rankedPlayer("wr1", "WR", 45), rankedPlayer("te1", "TE", 0),
+  ];
+  const legalPositions = new Set<Position>(["QB", "RB", "WR", "TE"]);
+  const budget = auctionBudget(200, 20, slots.length, 2);
+
+  it("auctionPriceFromPool(player, auctionValuePool(...), budget) equals teamAuctionValue(...) for every player", () => {
+    const pool = auctionValuePool(available, legalPositions);
+    for (const player of available) {
+      expect(auctionPriceFromPool(player, pool, budget)).toBe(teamAuctionValue(player, available, budget, legalPositions));
+    }
+  });
+
+  it("auctionValuePool only sums positive VBD at legal positions, matching teamAuctionValue's internal reduce", () => {
+    const rbOnly = new Set<Position>(["RB"]);
+    // rb2 has negative VBD (Math.max(0, ...) floors it at 0) and qb1/wr1/te1 are off-position.
+    expect(auctionValuePool(available, rbOnly)).toBe(50);
+  });
+});
+
+describe("Sug. Bid column — team-agnostic market price (Part A)", () => {
+  it("unionLegalPositions unions across teams and handles an empty list", () => {
+    const empty = new Set<Position>();
+    const rbWr = new Set<Position>(["RB", "WR"]);
+    const teOnly = new Set<Position>(["TE"]);
+    expect(unionLegalPositions([empty, rbWr, teOnly])).toEqual(new Set(["RB", "WR", "TE"]));
+    expect(unionLegalPositions([])).toEqual(new Set());
+  });
+
+  it("averageAuctionBudget averages maxBid/spendable across teams, rounded to whole dollars", () => {
+    const b1: AuctionBudget = { remaining: 100, openSlots: 5, reservedMinimum: 5, spendable: 95, maxBid: 91, dollarsPerSlot: 20 };
+    const b2: AuctionBudget = { remaining: 50, openSlots: 5, reservedMinimum: 5, spendable: 45, maxBid: 41, dollarsPerSlot: 10 };
+    expect(averageAuctionBudget([b1, b2])).toEqual({ maxBid: 66, spendable: 70 });
+    expect(averageAuctionBudget([])).toEqual({ maxBid: 0, spendable: 0 });
+  });
+
+  it("a league-average market price is not zeroed out just because one team's roster is full", () => {
+    const available: RankedPlayer[] = [rankedPlayer("rb1", "RB", 50), rankedPlayer("wr1", "WR", 40)];
+
+    // Team 0: full roster -> maxBid 0, no legal positions (mirrors the "full
+    // roster" case in the BUG 4 suite above).
+    const fullRoster = Array.from({ length: slots.length }, (_, i) => ({ id: `f${i}`, position: "RB" as Position }));
+    const fullBudget = auctionBudget(200, 200, slots.length, fullRoster.length);
+    const fullLegal = legalPositionsForTeam(fullBudget, fullRoster, slots);
+    expect(fullLegal.size).toBe(0);
+
+    // Team 1: empty roster, full budget available.
+    const openBudget = auctionBudget(200, 0, slots.length, 0);
+    const openLegal = legalPositionsForTeam(openBudget, [], slots);
+    expect(openLegal.size).toBeGreaterThan(0);
+
+    // Pre-fix behavior: pricing the board against one arbitrary team's own
+    // budget/positions reads $0 the moment that team's roster is full.
+    expect(teamAuctionValue(available[0], available, fullBudget, fullLegal)).toBe(0);
+
+    // Fixed behavior: union legal positions and average budgets across every
+    // team so a single full roster can't zero out the whole board.
+    const marketLegal = unionLegalPositions([fullLegal, openLegal]);
+    const marketBudget = averageAuctionBudget([fullBudget, openBudget]);
+    const marketPool = auctionValuePool(available, marketLegal);
+    expect(auctionPriceFromPool(available[0], marketPool, marketBudget)).toBeGreaterThan(0);
   });
 });
 

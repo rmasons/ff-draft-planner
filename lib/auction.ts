@@ -53,12 +53,55 @@ export function legalPositionsForTeam(
   return legal;
 }
 
-export function teamAuctionValue(player: RankedPlayer, available: RankedPlayer[], budget: AuctionBudget, legalPositions: Set<Position>): number {
+/** Sum of remaining VBD across `available` players at positions in
+ * `legalPositions` — the denominator of the suggested-bid formula. This is
+ * the same for every row being priced against a given (available,
+ * legalPositions) pair, so callers rendering many rows (e.g. the whole
+ * board) should compute it once via this function and reuse it with
+ * auctionPriceFromPool, rather than letting teamAuctionValue re-reduce the
+ * full available list on every row. */
+export function auctionValuePool(available: RankedPlayer[], legalPositions: Set<Position>): number {
+  return available.reduce((sum, candidate) => legalPositions.has(candidate.position) ? sum + Math.max(0, candidate.vbd) : sum, 0);
+}
+
+/** Prices a player from a pool already computed by auctionValuePool, against
+ * a budget (only maxBid/spendable matter for pricing). Split out of
+ * teamAuctionValue so per-row rendering can reuse one precomputed pool
+ * instead of paying the O(available.length) reduce on every row. */
+export function auctionPriceFromPool(player: RankedPlayer, pool: number, budget: Pick<AuctionBudget, "maxBid" | "spendable">): number {
   if (budget.maxBid < 1) return 0;
-  const pool = available.reduce((sum, candidate) => legalPositions.has(candidate.position) ? sum + Math.max(0, candidate.vbd) : sum, 0);
   if (player.vbd <= 0 || pool <= 0) return 1;
   const price = 1 + Math.round((Math.max(0, player.vbd) / pool) * budget.spendable);
   return Math.max(1, Math.min(budget.maxBid, price));
+}
+
+export function teamAuctionValue(player: RankedPlayer, available: RankedPlayer[], budget: AuctionBudget, legalPositions: Set<Position>): number {
+  return auctionPriceFromPool(player, auctionValuePool(available, legalPositions), budget);
+}
+
+/** Union of several teams' legal-position sets — used to build a
+ * team-agnostic position pool (e.g. for a board-wide market price) that
+ * isn't zeroed out just because one particular team's roster happens to be
+ * full at every position. */
+export function unionLegalPositions(legalPositionsByTeam: Set<Position>[]): Set<Position> {
+  const union = new Set<Position>();
+  for (const positions of legalPositionsByTeam) {
+    for (const position of positions) union.add(position);
+  }
+  return union;
+}
+
+/** Averages maxBid/spendable across every team's budget — the "what would a
+ * typical team pay" figure a team-agnostic market price should use, instead
+ * of defaulting to one arbitrary team's budget (which can be $0 if that
+ * team's roster happens to be full). Returns zeros for an empty list rather
+ * than dividing by zero. */
+export function averageAuctionBudget(budgets: AuctionBudget[]): Pick<AuctionBudget, "maxBid" | "spendable"> {
+  if (budgets.length === 0) return { maxBid: 0, spendable: 0 };
+  const totals = budgets.reduce((sum, b) => ({ maxBid: sum.maxBid + b.maxBid, spendable: sum.spendable + b.spendable }), { maxBid: 0, spendable: 0 });
+  // Round to whole dollars — maxBid flows straight into auctionPriceFromPool's
+  // final clamp, and a fractional cap there would render as e.g. "$45.5".
+  return { maxBid: Math.round(totals.maxBid / budgets.length), spendable: Math.round(totals.spendable / budgets.length) };
 }
 
 // ---- Persisted auction state (localStorage) ----
