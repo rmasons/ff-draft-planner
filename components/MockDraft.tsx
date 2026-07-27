@@ -11,7 +11,7 @@ import DraftBoardGrid from "./DraftBoardGrid";
 import ScarcityChart from "./ScarcityChart";
 import { SEASON } from "@/lib/sleeper";
 import { annotationKey, updateAnnotation, type AnnotationStore } from "@/lib/annotations";
-import { validRoster, validScoring } from "@/lib/validation";
+import { validAnnotationStore, validRoster, validScoring } from "@/lib/validation";
 import { encodeStored, parseStored } from "@/lib/persistence";
 import { marketReference } from "@/lib/market";
 import {
@@ -195,7 +195,10 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [boardFilter, setBoardFilter] = useState<Filter>("ALL");
-  const [annotations, setAnnotations] = useLocalStorage<AnnotationStore>("ffdp.annotations", {});
+  // Same key/validator DraftBoard uses (lib/validation.ts) — without the validator,
+  // a malformed record slips past hydration and the watchlist memo below throws
+  // on the first entry missing `target`/`note`, taking down the whole screen.
+  const [annotations, setAnnotations] = useLocalStorage<AnnotationStore>("ffdp.annotations", {}, validAnnotationStore);
   const watchlist = useMemo(() => new Set(Object.entries(annotations).filter(([key, value]) => key.startsWith(`${SEASON}:`) && value.target).map(([key]) => key.slice(SEASON.length + 1))), [annotations]);
 
   // Supported live sync uses Sleeper's documented REST endpoints.
@@ -344,9 +347,18 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
 
   const isDone = currentPickNum > numTeams * numRounds;
 
-  // Report active state to parent (for tab-switch guard; only while draft is actively in progress)
+  // Report active state to parent (for tab-switch guard; only while draft is actively in progress).
+  // Cleanup reports inactive on unmount — without it, confirming "Leave the mock
+  // draft?" unmounts this component but leaves AppShell's draftActive stuck true,
+  // so the confirm fires again on every future tab switch even with no draft
+  // running. The cleanup also re-runs on every dependency change (not just
+  // unmount), but that's harmless here: it fires false then the effect body
+  // immediately fires the real value again, so the net effect for a live
+  // dependency change is unchanged — only a genuine unmount leaves the "false"
+  // as the final word.
   useEffect(() => {
     onActiveChange?.(started && !isDone);
+    return () => onActiveChange?.(false);
   }, [started, isDone, onActiveChange]);
 
   const currentRound = isDone ? numRounds : Math.ceil(currentPickNum / numTeams);
@@ -1036,6 +1048,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     let seq = 0;
     let failures = 0;
     let timer: number | undefined;
+    // Tracks whether this live-mode session has completed a poll attempt yet,
+    // so only the first poll (and manual refreshes) flip the pill to "Syncing…".
+    // Without this, every routine 8s background tick also set "syncing" for the
+    // duration of the fetch, making a healthy connection flap between "Synced"
+    // and "Syncing…" and greying out "Refresh now" on a fixed cadence.
+    let hasPolledOnce = false;
     // 8s -> 16s -> 32s, capped, reset to 8s as soon as a poll succeeds.
     const nextDelay = () => pollBackoffDelay(failures);
     const scheduleNext = (delayMs: number) => {
@@ -1043,7 +1061,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       timer = window.setTimeout(() => { void poll(); }, delayMs);
     };
 
-    const poll = async () => {
+    const poll = async (manual = false) => {
       if (cancelled) return;
       if (document.visibilityState !== "visible") {
         scheduleNext(nextDelay());
@@ -1054,7 +1072,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       // tick-N+1, or a manual refresh overlapping the interval poll) gets
       // discarded instead of clobbering newer data with a stale snapshot.
       const mySeq = ++seq;
-      setSyncStatus("syncing");
+      // Only surface "syncing" for a manual refresh or the very first poll of
+      // this live session — routine background ticks stay silent so a healthy
+      // connection reads as steady "Synced HH:MM:SS" instead of flapping.
+      if (manual || !hasPolledOnce) setSyncStatus("syncing");
+      hasPolledOnce = true;
       try {
         const response = await fetch(`https://api.sleeper.app/v1/draft/${draftId.trim()}/picks`, { cache: "no-store" });
         if (!response.ok) throw new Error(`Sleeper picks request failed (${response.status})`);
@@ -1080,9 +1102,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     };
 
     // Manual "Refresh now" hook: clear whatever's pending and poll immediately.
+    // Passes manual=true so the user always gets "Syncing…" feedback for a
+    // click, even if a background tick already flipped hasPolledOnce.
     livePollRef.current = () => {
       if (timer !== undefined) { window.clearTimeout(timer); timer = undefined; }
-      void poll();
+      void poll(true);
     };
 
     scheduleNext(8000);
