@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { POSITIONS, ALL_POSITIONS } from "@/lib/types";
 import {
@@ -33,6 +33,13 @@ type Filter = "ALL" | Position;
 type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Typing a note updates the input's local state immediately (so it feels
+// responsive) but only commits to the shared annotation store after a short
+// pause in typing — every commit re-renders the table via `annotations` and
+// re-serializes the WHOLE store to localStorage (see useLocalStorage), so
+// batching keystrokes into one write instead of one per key is the point.
+const NOTE_COMMIT_DEBOUNCE_MS = 300;
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1,   // asc: lower = better
@@ -243,22 +250,43 @@ export default function DraftBoard() {
     return hideDrafted ? sorted.filter((p) => !draftedSet.has(p.id)) : sorted;
   }, [ranked, filter, query, hideDrafted, draftedSet, sortKey, sortDir, scoring, roster]);
 
-  const toggleDrafted = (id: string) =>
-    setDrafted((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+  // useCallback (not a plain closure) so this reference is stable across
+  // DraftBoard renders — setDrafted itself is a stable useState setter, so
+  // the only dependency never changes. Passed straight through to the
+  // memoized Row below; a fresh closure every render would defeat that memo
+  // for every row, every render.
+  const toggleDrafted = useCallback(
+    (id: string) =>
+      setDrafted((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+      ),
+    [setDrafted]
+  );
 
   // Toggle a player in/out of the compare panel (max 3).
   // When a removal would leave fewer than 2 players, clear the list (closes modal).
-  const toggleCompare = (id: string) =>
-    setCompareIds((prev) => {
-      if (prev.includes(id)) {
-        const next = prev.filter((x) => x !== id);
-        return next.length < 2 ? [] : next;
-      }
-      if (prev.length >= 3) return prev;
-      return [...prev, id];
-    });
+  // useCallback for the same identity-stability reason as toggleDrafted above.
+  const toggleCompare = useCallback(
+    (id: string) =>
+      setCompareIds((prev) => {
+        if (prev.includes(id)) {
+          const next = prev.filter((x) => x !== id);
+          return next.length < 2 ? [] : next;
+        }
+        if (prev.length >= 3) return prev;
+        return [...prev, id];
+      }),
+    [setCompareIds]
+  );
+
+  // Same identity-stability reasoning: setAnnotations is a stable useState
+  // setter, so this callback never changes reference, so passing it to every
+  // Row never defeats React.memo.
+  const handleAnnotation = useCallback(
+    (id: string, patch: Partial<PlayerAnnotation>) =>
+      setAnnotations((prev) => updateAnnotation(prev, SEASON, id, patch)),
+    [setAnnotations]
+  );
 
   // Tier dividers and replacement line only make sense on the default rank sort.
   const isRankSort = sortKey === "rank" && sortDir === 1;
@@ -266,6 +294,55 @@ export default function DraftBoard() {
     filter !== "ALL" && !query.trim() && isRankSort && baselines
       ? baselines[filter].rank
       : null;
+
+  // Per-row derived values (market reference, value-vs-market, risk, tier/
+  // replacement dividers), hoisted out of the JSX map and memoized. These
+  // used to be recomputed for every one of ~1000 rows on *every* DraftBoard
+  // render — including a render triggered by editing a single row's note,
+  // since that inline `rows.map(...)` in JSX ran unconditionally regardless
+  // of whether `rows` itself had changed. `annotations` is deliberately not
+  // a dependency here (same as it isn't for `rows`), so an annotation-only
+  // re-render is a cache hit and does zero per-row work.
+  const rowData = useMemo(
+    () =>
+      rows.map((p, i) => {
+        const prev = rows[i - 1];
+        // Single-position: break on any tier change (including first row).
+        // ALL positions: break only when consecutive same-position players
+        // change tier — avoids spurious breaks across different positions.
+        const tierBreak =
+          !query.trim() &&
+          isRankSort &&
+          (filter !== "ALL"
+            ? !prev || prev.tier !== p.tier
+            : !!prev && prev.position === p.position && prev.tier !== p.tier);
+        const replBreak =
+          replRank !== null &&
+          p.posRank > replRank &&
+          (!prev || prev.posRank <= replRank);
+        const market = marketReference(p, scoring, roster);
+        // valueVsMarket returns null for K/DEF (forced to the bottom of the
+        // board by design, see rankPlayers in lib/vbd.ts) and for players
+        // with no consensus ADP data.
+        const value = valueVsMarket(p, scoring, roster);
+        const risk = assessRisk(p);
+        return {
+          p,
+          rank: filter === "ALL" ? p.overallRank : p.posRank,
+          adp: market.sleeper,
+          espnAdp: market.espn,
+          value,
+          risk: risk.score,
+          riskExplanation: `${risk.factors.join("; ")} · ${risk.confidence} confidence estimate`,
+          actualPoints: p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null,
+          trend: trendMap[p.id] ?? 0,
+          isDrafted: draftedSet.has(p.id),
+          tierBreak,
+          replBreak,
+        };
+      }),
+    [rows, filter, query, isRankSort, replRank, scoring, roster, trendMap, draftedSet]
+  );
 
   return (
     <div className="flex flex-col gap-6 lg:flex-row">
@@ -402,7 +479,7 @@ export default function DraftBoard() {
                   <SortTh label="Proj" sk="proj" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
                   <th
                     className="px-3 py-2 text-right font-medium text-zinc-500"
-                    title="2025 season total, PPR scoring"
+                    title="2025 season total, scored under your active scoring settings"
                   >
                     2025
                   </th>
@@ -414,52 +491,28 @@ export default function DraftBoard() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((p, i) => {
-                  const prev = rows[i - 1];
-                  // Single-position: break on any tier change (including first row).
-                  // ALL positions: break only when consecutive same-position players
-                  // change tier — avoids spurious breaks across different positions.
-                  const tierBreak =
-                    !query.trim() &&
-                    isRankSort &&
-                    (filter !== "ALL"
-                      ? !prev || prev.tier !== p.tier
-                      : !!prev && prev.position === p.position && prev.tier !== p.tier);
-                  const replBreak =
-                    replRank !== null &&
-                    p.posRank > replRank &&
-                    (!prev || prev.posRank <= replRank);
-                  const isDrafted = draftedSet.has(p.id);
-                  const market = marketReference(p, scoring, roster);
-                  // valueVsMarket returns null for K/DEF (forced to the
-                  // bottom of the board by design, see rankPlayers in
-                  // lib/vbd.ts) and for players with no consensus ADP data.
-                  const value = valueVsMarket(p, scoring, roster);
-                  const risk = assessRisk(p);
-                  const trend = trendMap[p.id] ?? 0;
-                  return (
-                    <Row
-                      key={p.id}
-                      p={p}
-                      rank={filter === "ALL" ? p.overallRank : p.posRank}
-                      adp={market.sleeper}
-                      espnAdp={market.espn}
-                      value={value}
-                      risk={risk.score}
-                      riskExplanation={`${risk.factors.join("; ")} · ${risk.confidence} confidence estimate`}
-                      actualPoints={p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null}
-                      annotation={annotations[annotationKey(SEASON, p.id)] ?? EMPTY_ANNOTATION}
-                      onAnnotation={(patch) => setAnnotations((prev) => updateAnnotation(prev, SEASON, p.id, patch))}
-                      trend={trend}
-                      isDrafted={isDrafted}
-                      tierBreak={tierBreak}
-                      replBreak={replBreak}
-                      onToggle={() => toggleDrafted(p.id)}
-                      inCompare={compareIds.includes(p.id)}
-                      onCompare={() => toggleCompare(p.id)}
-                    />
-                  );
-                })}
+                {rowData.map((r) => (
+                  <Row
+                    key={r.p.id}
+                    p={r.p}
+                    rank={r.rank}
+                    adp={r.adp}
+                    espnAdp={r.espnAdp}
+                    value={r.value}
+                    risk={r.risk}
+                    riskExplanation={r.riskExplanation}
+                    actualPoints={r.actualPoints}
+                    annotation={annotations[annotationKey(SEASON, r.p.id)] ?? EMPTY_ANNOTATION}
+                    onAnnotation={handleAnnotation}
+                    trend={r.trend}
+                    isDrafted={r.isDrafted}
+                    tierBreak={r.tierBreak}
+                    replBreak={r.replBreak}
+                    onToggle={toggleDrafted}
+                    inCompare={compareIds.includes(r.p.id)}
+                    onCompare={toggleCompare}
+                  />
+                ))}
                 {rows.length === 0 && (
                   <tr>
                     <td colSpan={11} className="px-3 py-8 text-center text-zinc-500">
@@ -498,7 +551,26 @@ export default function DraftBoard() {
   );
 }
 
-function Row({
+// Memoized so that an annotation edit on ONE row (e.g. typing a note) doesn't
+// re-render all ~1000 other rows. This only pays off because every prop
+// passed in from DraftBoard is identity-stable across an annotation-only
+// re-render:
+//  - p: from the memoized `ranked`/`rows`/`rowData` chain, which doesn't
+//    depend on `annotations` — same object reference.
+//  - rank/adp/espnAdp/value/risk/riskExplanation/actualPoints/trend/
+//    isDrafted/tierBreak/replBreak: primitives (or a string, which JS always
+//    compares by value), sourced from the memoized `rowData` — same values.
+//  - annotation: `annotations[key] ?? EMPTY_ANNOTATION`. EMPTY_ANNOTATION is
+//    a module-level constant, so untouched rows always get that exact
+//    reference. For a row that previously had a note, updateAnnotation
+//    (lib/annotations.ts) does `{ ...store, [key]: next }` — every *other*
+//    key's value is carried over unchanged, so only the edited row's
+//    `annotation` object identity actually changes.
+//  - onAnnotation/onToggle/onCompare: useCallback-wrapped in DraftBoard with
+//    only stable useState setters as deps, so they never change reference.
+// A plain inline arrow function or freshly-built object for any of these
+// would defeat memo(); none of them are.
+const Row = memo(function Row({
   p,
   rank,
   adp,
@@ -526,17 +598,76 @@ function Row({
   riskExplanation: string;
   actualPoints: number | null;
   annotation: PlayerAnnotation;
-  onAnnotation: (patch: Partial<PlayerAnnotation>) => void;
+  onAnnotation: (id: string, patch: Partial<PlayerAnnotation>) => void;
   trend: number;
   isDrafted: boolean;
   tierBreak: boolean;
   replBreak: boolean;
-  onToggle: () => void;
+  onToggle: (id: string) => void;
   inCompare: boolean;
-  onCompare: () => void;
+  onCompare: (id: string) => void;
 }) {
   const riskColor =
     risk >= 7 ? "text-rose-400" : risk >= 4 ? "text-amber-400" : "text-emerald-400";
+
+  // Local buffer for the note text so typing feels instant even though the
+  // commit to the shared annotation store is debounced (see
+  // NOTE_COMMIT_DEBOUNCE_MS above — every commit re-serializes the WHOLE
+  // annotation store to localStorage via useLocalStorage). Target/avoid
+  // still commit immediately through `annotation` — they're infrequent
+  // clicks, not the perf problem.
+  const [localNote, setLocalNoteState] = useState(annotation.note);
+  const localNoteRef = useRef(annotation.note);
+  // Last note value *this row* itself sent to the store. Lets the sync
+  // effect below tell "the store changed under us" (e.g. localStorage
+  // hydration finishing after mount) apart from "the store just caught up
+  // with what we typed" — only the former should overwrite an in-progress
+  // local edit.
+  const lastSentNoteRef = useRef(annotation.note);
+  const noteTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setLocalNote = (value: string) => {
+    localNoteRef.current = value;
+    setLocalNoteState(value);
+  };
+
+  useEffect(() => {
+    if (annotation.note !== lastSentNoteRef.current) {
+      lastSentNoteRef.current = annotation.note;
+      setLocalNote(annotation.note);
+    }
+  }, [annotation.note]);
+
+  const commitNote = () => {
+    if (noteTimeoutRef.current !== null) {
+      clearTimeout(noteTimeoutRef.current);
+      noteTimeoutRef.current = null;
+    }
+    lastSentNoteRef.current = localNoteRef.current;
+    onAnnotation(p.id, { note: localNoteRef.current });
+  };
+
+  // Flush a pending debounced write on unmount — e.g. the row scrolls out of
+  // a filtered/searched view mid-keystroke — so the last keystrokes before
+  // that aren't silently dropped.
+  useEffect(() => {
+    return () => {
+      if (noteTimeoutRef.current !== null) commitNote();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally mount/unmount only; commitNote reads current values via refs
+  }, []);
+
+  function handleNoteChange(event: ChangeEvent<HTMLInputElement>) {
+    const value = event.target.value;
+    setLocalNote(value);
+    if (noteTimeoutRef.current !== null) clearTimeout(noteTimeoutRef.current);
+    noteTimeoutRef.current = setTimeout(commitNote, NOTE_COMMIT_DEBOUNCE_MS);
+  }
+
+  function handleNoteBlur() {
+    if (noteTimeoutRef.current !== null) commitNote();
+  }
+
   return (
     <>
       {replBreak && (
@@ -594,9 +725,9 @@ function Row({
             ) : null}
           </div>
           <div className="mt-1 flex max-w-md items-center gap-1">
-            <button type="button" aria-pressed={annotation.target} onClick={() => onAnnotation({ target: !annotation.target })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.target ? "border-amber-400/50 text-amber-400" : "border-zinc-700 text-zinc-600"}`}>Target</button>
-            <button type="button" aria-pressed={annotation.avoid} onClick={() => onAnnotation({ avoid: !annotation.avoid, target: annotation.avoid ? annotation.target : false })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.avoid ? "border-rose-400/50 text-rose-400" : "border-zinc-700 text-zinc-600"}`}>Avoid</button>
-            <input aria-label={`Note for ${p.name}`} value={annotation.note} onChange={(event) => onAnnotation({ note: event.target.value })} placeholder="Note…" className="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-950 px-1.5 py-0.5 text-[10px] text-zinc-300 placeholder-zinc-700 focus:border-emerald-500 focus:outline-none" />
+            <button type="button" aria-pressed={annotation.target} onClick={() => onAnnotation(p.id, { target: !annotation.target })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.target ? "border-amber-400/50 text-amber-400" : "border-zinc-700 text-zinc-600"}`}>Target</button>
+            <button type="button" aria-pressed={annotation.avoid} onClick={() => onAnnotation(p.id, { avoid: !annotation.avoid, target: annotation.avoid ? annotation.target : false })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.avoid ? "border-rose-400/50 text-rose-400" : "border-zinc-700 text-zinc-600"}`}>Avoid</button>
+            <input aria-label={`Note for ${p.name}`} value={localNote} onChange={handleNoteChange} onBlur={handleNoteBlur} placeholder="Note…" className="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-950 px-1.5 py-0.5 text-[10px] text-zinc-300 placeholder-zinc-700 focus:border-emerald-500 focus:outline-none" />
           </div>
         </td>
         <td className="px-2 py-2 text-center">
@@ -665,7 +796,7 @@ function Row({
         <td className="px-2 py-2 text-center">
           <div className="flex items-center justify-center gap-1.5">
             <button
-              onClick={onToggle}
+              onClick={() => onToggle(p.id)}
               className={`rounded-md border px-2 py-1 text-xs transition ${
                 isDrafted
                   ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
@@ -675,7 +806,7 @@ function Row({
               {isDrafted ? "Undo" : "Draft"}
             </button>
             <button
-              onClick={onCompare}
+              onClick={() => onCompare(p.id)}
               title={inCompare ? "Remove from compare" : "Add to compare"}
               className={`text-base leading-none transition ${
                 inCompare ? "text-sky-400" : "text-zinc-600 hover:text-sky-400"
@@ -688,4 +819,5 @@ function Row({
       </tr>
     </>
   );
-}
+});
+Row.displayName = "Row";
