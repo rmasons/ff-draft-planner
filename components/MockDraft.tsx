@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
@@ -16,16 +16,22 @@ import { encodeStored, parseStored } from "@/lib/persistence";
 import { marketReference } from "@/lib/market";
 import {
   chooseCpuPickOrBestAvailable,
+  fillLineupSlots,
   gradeLetter,
   gradePick,
   keeperValue,
+  leagueOpenSlots,
   mergeKeepersNonDestructive,
   ownerForPick,
   pickNumberForSlot,
   pollBackoffDelay,
   positionalRun,
+  rosterConfigFromLeague,
   rosterSlots,
   seededRandom,
+  selectSuggestedPick,
+  startableByPosition,
+  SLEEPER_SLOT_ELIGIBLE,
   survivalEstimate,
   transitionDraft,
 } from "@/lib/draft";
@@ -78,18 +84,7 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
 
 // POS_BADGE / UNKNOWN_BADGE now come from @/lib/ui (shared across screens).
 
-const SLOT_ELIGIBLE: Record<string, string[]> = {
-  QB: ["QB"], RB: ["RB"], WR: ["WR"], TE: ["TE"], K: ["K"], DEF: ["DEF"],
-  FLEX: ["RB", "WR", "TE"],
-  WRRB_FLEX: ["RB", "WR"],
-  REC_FLEX: ["WR", "TE"],
-  SUPER_FLEX: ["QB", "RB", "WR", "TE"],
-  BN: ["QB", "RB", "WR", "TE", "K", "DEF"],
-};
-const SLOT_PRIORITY: Record<string, number> = {
-  K: 0, DEF: 1, QB: 2, RB: 3, WR: 4, TE: 5,
-  WRRB_FLEX: 6, REC_FLEX: 7, FLEX: 8, SUPER_FLEX: 9, BN: 10,
-};
+const SLOT_ELIGIBLE = SLEEPER_SLOT_ELIGIBLE;
 const SLOT_DISPLAY: Record<string, string> = {
   WRRB_FLEX: "FLEX", REC_FLEX: "FLEX", SUPER_FLEX: "SF",
 };
@@ -107,30 +102,9 @@ function assignRoster(
   myPicks: MockPick[],
   playerById: Map<string, RankedPlayer>
 ): RosterSlot[] {
-  const avail = myPicks.map((pick, idx) => ({
-    idx,
-    pos: playerById.get(pick.playerId)?.position ?? pick.playerPos ?? "",
-    pick,
-  }));
-  const used = new Set<number>();
-  const assigned: Array<MockPick | null> = new Array(rosterPositions.length).fill(null);
-
-  // Sort indices by restrictiveness so leftover players fall to bench
-  const byPriority = rosterPositions
-    .map((_, i) => i)
-    .sort((a, b) =>
-      (SLOT_PRIORITY[rosterPositions[a]] ?? 99) - (SLOT_PRIORITY[rosterPositions[b]] ?? 99)
-    );
-  for (const si of byPriority) {
-    const eligible = new Set(SLOT_ELIGIBLE[rosterPositions[si]] ?? []);
-    for (const av of avail) {
-      if (!used.has(av.idx) && eligible.has(av.pos)) {
-        assigned[si] = av.pick;
-        used.add(av.idx);
-        break;
-      }
-    }
-  }
+  // A restored pick may carry only Sleeper's raw `playerPos` metadata.
+  const positions = myPicks.map((pick) => playerById.get(pick.playerId)?.position ?? pick.playerPos ?? "");
+  const assigned = fillLineupSlots(rosterPositions, positions).map((pi) => (pi === null ? null : myPicks[pi]));
 
   // Number duplicate labels (RB1/RB2 etc.; single slots stay unnumbered)
   const labelCount: Record<string, number> = {};
@@ -291,22 +265,66 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => { cancelled = true; };
   }, []);
 
+  // The roster shape everything config-derived is computed from: VOR
+  // baselines, ADP format, CPU roster legality, and the pick grid. Prefers the
+  // imported league's real shape over the Cheat Sheet config, which is only a
+  // stand-in for "no league imported yet".
+  const effectiveRoster = useMemo(() => {
+    const base = importedTeams ? { ...roster, teams: importedTeams } : roster;
+    return leagueRosterPositions.length > 0 ? rosterConfigFromLeague(leagueRosterPositions, base) : base;
+  }, [roster, importedTeams, leagueRosterPositions]);
+
+  // Sleeper leagues can skip K and/or DEF entirely; don't make the CPU fill
+  // slots the league doesn't have.
+  const leagueHasKDef = useMemo(
+    () => leagueRosterPositions.length === 0 || leagueRosterPositions.some((p) => p === "K" || p === "DEF"),
+    [leagueRosterPositions]
+  );
+
+  const numTeams = effectiveRoster.teams;
+  const numRounds =
+    importedRounds ??
+    Math.max(10, effectiveRoster.qb + effectiveRoster.rb + effectiveRoster.wr + effectiveRoster.te + effectiveRoster.flex + effectiveRoster.superflex + effectiveRoster.bench + 2);
+
+  // Position lookup built from the raw pool, not from `ranked` — the live
+  // draft state feeds rankPlayers, so it can't depend on its output. Falls
+  // back to a pick's own metadata for anyone missing from the pool.
+  const positionById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of players ?? []) m.set(p.id, p.position);
+    for (const pick of picks) if (!m.has(pick.playerId) && pick.playerPos) m.set(pick.playerId, pick.playerPos);
+    return m;
+  }, [players, picks]);
+
+  // One team's roster template: the imported league's if there is one.
+  const leagueSlotTemplate = useMemo(
+    (): string[] =>
+      leagueRosterPositions.length > 0 ? leagueRosterPositions : rosterSlots(effectiveRoster, leagueHasKDef),
+    [leagueRosterPositions, effectiveRoster, leagueHasKDef]
+  );
+
+  // Dynamic replacement level, once there's a board to measure against.
+  // Preseason (and on the Cheat Sheet) baselines stay static — there's no
+  // draft to be relative to.
+  const liveDraftState = useMemo(() => {
+    if (!started || picks.length === 0) return undefined;
+    return {
+      drafted: new Set(picks.map((p) => p.playerId)),
+      openSlots: leagueOpenSlots(picks, (id) => positionById.get(id), leagueSlotTemplate, numTeams),
+    };
+  }, [started, picks, positionById, leagueSlotTemplate, numTeams]);
+
   // Keep the full rankPlayers() result (not just `.players`) so the
   // replacement-level baselines are available to pass down to ScarcityChart.
   // Calling with `players ?? []` (instead of an early-return null) keeps
   // `baselines` a real (if all-zero) Baselines object before players load,
   // so downstream code never has to null-check it.
   const rankResult = useMemo(
-    () => rankPlayers(players ?? [], scoring, roster, method),
-    [players, scoring, roster, method]
+    () => rankPlayers(players ?? [], scoring, effectiveRoster, method, liveDraftState),
+    [players, scoring, effectiveRoster, method, liveDraftState]
   );
   const ranked = rankResult.players;
   const baselines = rankResult.baselines;
-
-  const numTeams = importedTeams ?? roster.teams;
-  const numRounds =
-    importedRounds ??
-    Math.max(10, roster.qb + roster.rb + roster.wr + roster.te + roster.flex + roster.superflex + roster.bench + 2);
 
   // Which pick numbers are already filled (supports non-sequential keeper picks)
   const pickedNums = useMemo(() => new Set(picks.map((p) => p.pickNumber)), [picks]);
@@ -364,8 +382,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         case "proj": return (a.points - b.points) * sortDir;
         case "vor": return (a.vbd - b.vbd) * sortDir;
         case "adp": {
-          const va = marketReference(a, scoring, roster).consensus;
-          const vb = marketReference(b, scoring, roster).consensus;
+          const va = marketReference(a, scoring, effectiveRoster).consensus;
+          const vb = marketReference(b, scoring, effectiveRoster).consensus;
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
@@ -374,7 +392,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         case "value": {
           // "Value" = consensus ADP minus overall rank (higher = bigger steal).
           const val = (p: RankedPlayer): number | null => {
-            const consensus = marketReference(p, scoring, roster).consensus;
+            const consensus = marketReference(p, scoring, effectiveRoster).consensus;
             return consensus === null ? null : consensus - p.overallRank;
           };
           const va = val(a), vb = val(b);
@@ -386,7 +404,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         default: return 0;
       }
     });
-  }, [ranked, draftedIds, filter, query, sortKey, sortDir, scoring, roster, watchlist, annotations]);
+  }, [ranked, draftedIds, filter, query, sortKey, sortDir, scoring, effectiveRoster, watchlist, annotations]);
 
   // Compact available-player list for board view sidebar
   const boardAvailable = useMemo(() => {
@@ -412,7 +430,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       if (pick.isKeeper) return [];
       const player = playerById.get(pick.playerId);
       if (!player) return [];
-      const market = marketReference(player, scoring, roster);
+      const market = marketReference(player, scoring, effectiveRoster);
       const value = gradePick(market.consensus, pick.pickNumber);
       return value === null ? [] : [{ pick, player, value, marketAdp: market.consensus }];
     });
@@ -421,7 +439,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const letter = gradeLetter(avgValue);
     const sorted = [...graded].sort((a, b) => b.value - a.value);
     return { letter, avgValue, sorted };
-  }, [isDone, draftMode, myPicks, playerById, scoring, roster]);
+  }, [isDone, draftMode, myPicks, playerById, scoring, effectiveRoster]);
 
   // Position availability counts for the draft strip
   const positionCounts = useMemo(
@@ -447,47 +465,104 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [watchlist, draftedIds]
   );
 
+  // How many of each position the user already rosters, for the depth discount.
+  const heldByPosition = useMemo(() => {
+    const counts: Partial<Record<Position, number>> = {};
+    for (const { player } of myPlayers) {
+      if (player) counts[player.position] = (counts[player.position] ?? 0) + 1;
+    }
+    return counts;
+  }, [myPlayers]);
+
   // Unfilled starter slots (excludes bench). Only meaningful in CPU mode with a Sleeper import.
   const unfilledStarterSlots = useMemo((): RosterSlot[] => {
     if (!myRosterSlots) return [];
     return myRosterSlots.filter((s) => s.slotType !== "BN" && s.pick === null);
   }, [myRosterSlots]);
 
-  // Best available pick suggestion, weighted by VOR. Requires roster structure from a Sleeper import.
-  const bestPickSuggestion = useMemo((): { player: RankedPlayer; isBench: boolean } | null => {
+  // Next pick number this user owns after the current one (null if none left).
+  const nextUserPickNum = useMemo((): number | null => {
+    const lastPick = numTeams * numRounds;
+    for (let n = currentPickNum + 1; n <= lastPick; n++) {
+      if (ownerForPick(n, numTeams, tradeRecords) === userSlot) return n;
+    }
+    return null;
+  }, [currentPickNum, numTeams, numRounds, tradeRecords, userSlot]);
+
+  // Picks the user still owns, counting the one on the clock. Skips pick
+  // numbers already filled, so keepers taken out of order don't inflate it.
+  const userPicksRemaining = useMemo(() => {
+    if (isDone) return 0;
+    let count = 0;
+    for (let n = currentPickNum; n <= numTeams * numRounds; n++) {
+      if (!pickedNums.has(n) && ownerForPick(n, numTeams, tradeRecords) === userSlot) count++;
+    }
+    return count;
+  }, [isDone, currentPickNum, numTeams, numRounds, tradeRecords, userSlot, pickedNums]);
+
+  // Positional runs in the recent live picks, keyed by position.
+  const runsByPosition = useMemo(() => {
+    const m = new Map<Position, { position: Position; count: number; window: number }>();
+    for (const r of positionalRun(picks, playerById)) m.set(r.position, r);
+    return m;
+  }, [picks, playerById]);
+
+  // Undrafted players grouped by position, each list best-first. `ranked` is
+  // VBD-descending, and within one position VBD is just points minus a shared
+  // constant, so each list comes out points-descending — which makes
+  // `list[i + 1]` the next-best remaining option at that player's position.
+  const availableByPosition = useMemo(() => {
+    const byPos = new Map<Position, RankedPlayer[]>();
+    const indexOf = new Map<string, number>();
+    for (const p of ranked) {
+      if (draftedIds.has(p.id)) continue;
+      let list = byPos.get(p.position);
+      if (!list) { list = []; byPos.set(p.position, list); }
+      indexOf.set(p.id, list.length);
+      list.push(p);
+    }
+    return { byPos, indexOf };
+  }, [ranked, draftedIds]);
+
+  /**
+   * Score one candidate the way the recommendation claims to: VOR, plus the
+   * tier cliff behind them, plus how unlikely they are to survive to the
+   * user's next pick, plus positional-run pressure.
+   */
+  const evaluateCandidate = useCallback((player: RankedPlayer) => {
+    const market = marketReference(player, scoring, effectiveRoster);
+    const survival = nextUserPickNum === null ? null : survivalEstimate(market.consensus, currentPickNum, nextUserPickNum);
+    const list = availableByPosition.byPos.get(player.position);
+    const index = availableByPosition.indexOf.get(player.id);
+    const nextAtPosition = list !== undefined && index !== undefined ? list[index + 1] : undefined;
+    const cliff = nextAtPosition ? Math.max(0, player.points - nextAtPosition.points) : 0;
+    const run = runsByPosition.get(player.position);
+    const score = player.vbd + cliff * 0.75 + (survival === null ? 0 : (1 - survival) * 8) + (run ? 2 : 0);
+    return { nextPick: nextUserPickNum, survival, cliff, run, score, marketLabel: market.label };
+  }, [scoring, effectiveRoster, nextUserPickNum, currentPickNum, availableByPosition, runsByPosition]);
+
+  // Best pick suggestion. Requires roster structure from a Sleeper import;
+  // see selectSuggestedPick for why K/DEF are gated and why every candidate
+  // is scored rather than taking the first eligible one.
+  const bestPickSuggestion = useMemo(() => {
     if (!isUserTurn || draftMode !== "cpu" || !myRosterSlots) return null;
     const available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
-    if (available.length === 0) return null;
-    const byVor = [...available].sort((a, b) => b.vbd - a.vbd);
+    return selectSuggestedPick(
+      available,
+      {
+        openStarterSlotTypes: unfilledStarterSlots.map((s) => s.slotType),
+        picksRemaining: userPicksRemaining,
+        startable: startableByPosition(myRosterSlots.map((s) => s.slotType)),
+        held: heldByPosition,
+      },
+      (player) => evaluateCandidate(player).score
+    );
+  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots, annotations, evaluateCandidate, userPicksRemaining, heldByPosition]);
 
-    if (unfilledStarterSlots.length > 0) {
-      for (const player of byVor) {
-        for (const slot of unfilledStarterSlots) {
-          const eligible = SLOT_ELIGIBLE[slot.slotType] ?? [];
-          if (eligible.includes(player.position)) {
-            return { player, isBench: false };
-          }
-        }
-      }
-    }
-
-    // All starters filled — suggest the highest-VOR bench pick
-    return { player: byVor[0], isBench: true };
-  }, [isUserTurn, draftMode, myRosterSlots, ranked, draftedIds, unfilledStarterSlots, annotations]);
-
-  const recommendationContext = useMemo(() => {
-    if (!bestPickSuggestion) return null;
-    let nextPick = currentPickNum + 1;
-    while (nextPick <= numTeams * numRounds && ownerForPick(nextPick, numTeams, tradeRecords) !== userSlot) nextPick++;
-    const market = marketReference(bestPickSuggestion.player, scoring, roster);
-    const survival = nextPick <= numTeams * numRounds ? survivalEstimate(market.consensus, currentPickNum, nextPick) : null;
-    const nextAtPosition = ranked.find((player) => !draftedIds.has(player.id) && player.position === bestPickSuggestion.player.position && player.id !== bestPickSuggestion.player.id);
-    const cliff = nextAtPosition ? Math.max(0, bestPickSuggestion.player.points - nextAtPosition.points) : 0;
-    const runs = positionalRun(picks, playerById);
-    const run = runs.find((item) => item.position === bestPickSuggestion.player.position);
-    const score = bestPickSuggestion.player.vbd + cliff * 0.75 + (survival === null ? 0 : (1 - survival) * 8) + (run ? 2 : 0);
-    return { nextPick, survival, cliff, run, score, marketLabel: market.label };
-  }, [bestPickSuggestion, currentPickNum, numTeams, numRounds, tradeRecords, userSlot, scoring, roster, ranked, draftedIds, picks, playerById]);
+  const recommendationContext = useMemo(
+    () => (bestPickSuggestion ? evaluateCandidate(bestPickSuggestion.player) : null),
+    [bestPickSuggestion, evaluateCandidate]
+  );
 
   // Keeper search results (setup screen only)
   const keeperSearchResults = useMemo(() => {
@@ -509,7 +584,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     if (pendingKeepers.length === 0 || ranked.length === 0) return [];
     return pendingKeepers.map((k) => {
       const player = playerById.get(k.playerId);
-      const consensusAdp = player ? marketReference(player, scoring, roster).consensus : null;
+      const consensusAdp = player ? marketReference(player, scoring, effectiveRoster).consensus : null;
       const { pickEquivalent, surplus } = keeperValue(k.round, k.teamSlot, numTeams, consensusAdp);
       let verdict: "keep" | "borderline" | "cut" | null = null;
       if (surplus !== null) {
@@ -519,7 +594,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       }
       return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
     });
-  }, [pendingKeepers, ranked, playerById, numTeams, scoring, roster]);
+  }, [pendingKeepers, ranked, playerById, numTeams, scoring, effectiveRoster]);
 
   // CPU auto-pick: market-aware, roster-valid, need-aware, and reproducible.
   useEffect(() => {
@@ -532,12 +607,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         const player = playerById.get(pick.playerId);
         return player ? [{ id: player.id, position: player.position }] : [];
       });
-      const configuredSlots = rosterSlots(roster);
+      const configuredSlots = rosterSlots(effectiveRoster, leagueHasKDef);
       // Fall back to best-available (bench-anything) once the roster's slots
       // are full — e.g. an imported league with more rounds than the local
       // roster config has slots for — so the CPU always has a legal pick and
       // the draft can't stall waiting on a pick that will never come.
-      const best = chooseCpuPickOrBestAvailable(available, teamPlayers, configuredSlots, (player) => marketReference(player, scoring, roster).consensus, seededRandom(currentPickNum * 1009 + currentTeamSlot));
+      const best = chooseCpuPickOrBestAvailable(available, teamPlayers, configuredSlots, (player) => marketReference(player, scoring, effectiveRoster).consensus, seededRandom(currentPickNum * 1009 + currentTeamSlot));
 
       if (best) {
         setPicks((prev) => [
@@ -549,7 +624,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => clearTimeout(timer);
   }, [
     started, draftMode, isUserTurn, isDone, ranked, draftedIds,
-    currentTeamSlot, currentPickNum, picks, playerById, roster, scoring, annotations,
+    currentTeamSlot, currentPickNum, picks, playerById, effectiveRoster, leagueHasKDef, scoring, annotations,
   ]);
 
   useEffect(() => {
@@ -660,7 +735,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       let avgAdpStr = "";
       let valueStr = "";
       if (player) {
-        const avg = marketReference(player, scoring, roster).consensus;
+        const avg = marketReference(player, scoring, effectiveRoster).consensus;
         if (avg !== null) {
           avgAdpStr = avg.toFixed(1);
           const val = avg - pick.pickNumber;
@@ -1607,7 +1682,15 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                 {bestPickSuggestion && (
                   <button
                     onClick={() => pickPlayer(bestPickSuggestion.player.id)}
-                    title={recommendationContext ? `${recommendationContext.marketLabel}; score ${recommendationContext.score.toFixed(1)} = VOR, tier cliff, next-pick scarcity, and run context` : undefined}
+                    title={
+                      recommendationContext
+                        ? `${recommendationContext.marketLabel}; score ${recommendationContext.score.toFixed(1)} = VOR, tier cliff, next-pick scarcity, and run context` +
+                          (bestPickSuggestion.forced
+                            ? "; every remaining pick must fill a starter"
+                            : `; roster need weighted ${Math.round(bestPickSuggestion.needWeight * 100)}%`) +
+                          (rankResult.dynamic ? "; replacement level is live" : "")
+                        : undefined
+                    }
                     className="flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-1 text-xs transition hover:bg-emerald-500/15"
                   >
                     <span className="text-zinc-500">
@@ -1627,7 +1710,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       {bestPickSuggestion.player.vbd > 0 ? "+" : ""}
                       {bestPickSuggestion.player.vbd.toFixed(1)}
                     </span>
-                    {recommendationContext?.survival !== null && recommendationContext?.survival !== undefined && (
+                    {recommendationContext?.survival != null && recommendationContext.nextPick != null && (
                       <span className="text-zinc-500">· {Math.round(recommendationContext.survival * 100)}% to #{recommendationContext.nextPick}</span>
                     )}
                     {recommendationContext && recommendationContext.cliff > 0 && <span className="text-amber-400">· cliff {recommendationContext.cliff.toFixed(1)}</span>}
@@ -1723,7 +1806,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                         {p.vbd > 0 ? "+" : ""}{p.vbd.toFixed(1)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums text-zinc-400">
-                        {marketReference(p, scoring, roster).consensus?.toFixed(1) ?? "—"}
+                        {marketReference(p, scoring, effectiveRoster).consensus?.toFixed(1) ?? "—"}
                       </td>
                       {isUserTurn && (
                         <td className="px-2 py-2 text-center">
