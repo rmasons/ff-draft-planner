@@ -174,3 +174,320 @@ export async function fetchKeptPlayerIds(
   }
   return [...ids];
 }
+
+interface RawDraftForKeepers {
+  league_id?: string;
+  settings?: { teams?: number };
+  // Keys are draft-slot strings ("1".."teams"), values are roster ids —
+  // same shape MockDraft's traded-pick parsing inverts (handleImport).
+  slot_to_roster_id?: Record<string, number> | null;
+}
+
+interface RawDraftPick {
+  pick_no: number;
+  draft_slot: number;
+  player_id: string | null;
+  is_keeper: true | null;
+}
+
+interface RawLeagueRosterForKeepers {
+  roster_id: number;
+  keepers: string[] | null;
+}
+
+/**
+ * A keeper resolved from a league, before it's turned into a mock-draft
+ * pending keeper. `teamSlot`/`round` are nullable because one of the two
+ * source mechanisms (see fetchLeagueKeepers) can't supply them.
+ */
+export interface LeagueKeeper {
+  playerId: string;
+  /** Draft slot 1..teams, or null when the roster→slot mapping is unavailable. */
+  teamSlot: number | null;
+  /** Round from the draft board, or null when Sleeper did not supply one. */
+  round: number | null;
+}
+
+export interface LeagueKeeperResult {
+  keepers: LeagueKeeper[];
+  /** Which mechanism supplied the data — drives the UI message. */
+  source: "board" | "rosters";
+}
+
+/**
+ * Sleeper exposes pre-draft keepers through two different, mutually
+ * exclusive mechanisms:
+ *
+ *  1. The draft board (`/draft/<id>/picks`, entries with `is_keeper ===
+ *     true`). Once Sleeper has materialized keepers onto the board, each
+ *     keeper pick carries both `pick_no` (→ round) and `draft_slot` (→
+ *     team), because it's a real slot in the snake order. This is strictly
+ *     richer than the rosters mechanism below, so it wins outright whenever
+ *     it has anything to say.
+ *  2. League rosters (`/league/<id>/rosters`, each roster's `keepers`
+ *     array). Available as soon as managers designate keepers — well before
+ *     the board exists — but a roster only records *which players* are
+ *     kept, never what round they cost. The round is a per-league keeper
+ *     rule Sleeper doesn't model, so it has to come from the user by hand.
+ *
+ * The two mechanisms key players differently (draft slot vs. roster id), so
+ * resolving a roster's owner to a draft slot requires inverting the draft's
+ * `slot_to_roster_id` map.
+ */
+export async function fetchLeagueKeepers(draftId: string): Promise<LeagueKeeperResult> {
+  const draftRes = await fetch(`${BASE_URL}/draft/${draftId}`, {
+    headers: { accept: "application/json" },
+  });
+  if (!draftRes.ok) throw new Error(`Draft not found (${draftRes.status})`);
+  const draft: RawDraftForKeepers = await draftRes.json();
+  const teams = draft.settings?.teams ?? 12;
+
+  // Board first: is_keeper picks carry a real round, so when any exist the
+  // rosters endpoint is never even consulted (see doc comment above).
+  let picks: RawDraftPick[] = [];
+  try {
+    const picksRes = await fetch(`${BASE_URL}/draft/${draftId}/picks`, {
+      headers: { accept: "application/json" },
+    });
+    if (picksRes.ok) {
+      const data = await picksRes.json();
+      if (Array.isArray(data)) picks = data;
+    }
+  } catch { /* non-critical -- fall through to the rosters mechanism */ }
+
+  const boardKeepers = picks.filter((p) => p.is_keeper === true);
+  if (boardKeepers.length > 0) {
+    const seen = new Set<string>();
+    const keepers: LeagueKeeper[] = [];
+    for (const p of boardKeepers) {
+      if (!p.player_id || seen.has(p.player_id)) continue;
+      seen.add(p.player_id);
+      keepers.push({
+        playerId: p.player_id,
+        teamSlot: p.draft_slot,
+        round: Math.ceil(p.pick_no / teams),
+      });
+    }
+    return { keepers, source: "board" };
+  }
+
+  // Rosters mechanism: no round is ever available here, so it's left null
+  // for every keeper — the caller (MockDraft) treats that as "unconfirmed"
+  // and makes the user set one before the draft can start.
+  if (!draft.league_id) return { keepers: [], source: "rosters" };
+
+  let rosters: RawLeagueRosterForKeepers[] = [];
+  try {
+    const rostersRes = await fetch(`${BASE_URL}/league/${draft.league_id}/rosters`, {
+      headers: { accept: "application/json" },
+    });
+    if (rostersRes.ok) {
+      const data = await rostersRes.json();
+      if (Array.isArray(data)) rosters = data;
+    }
+  } catch { /* non-critical -- returns whatever we have (possibly nothing) */ }
+
+  const rosterToSlot = new Map<number, number>();
+  if (draft.slot_to_roster_id) {
+    for (const [slotStr, rosterId] of Object.entries(draft.slot_to_roster_id)) {
+      rosterToSlot.set(rosterId, Number(slotStr));
+    }
+  }
+
+  const seen = new Set<string>();
+  const keepers: LeagueKeeper[] = [];
+  for (const roster of rosters) {
+    for (const playerId of roster.keepers ?? []) {
+      if (!playerId || seen.has(playerId)) continue;
+      seen.add(playerId);
+      keepers.push({ playerId, teamSlot: rosterToSlot.get(roster.roster_id) ?? null, round: null });
+    }
+  }
+  return { keepers, source: "rosters" };
+}
+
+export interface KeeperRoundConvention {
+  /** Rounds in the CURRENT draft that keepers occupy, ascending. */
+  rounds: number[];
+  /** League id the convention was read from (the previous season's league). */
+  sourceLeagueId: string;
+  /** The season string of that league, for the UI message. May be "" if the
+   *  season lookup itself failed — non-fatal, see step 3 below. */
+  sourceSeason: string;
+  /** The rounds keepers occupied in that prior draft, ascending. */
+  priorRounds: number[];
+}
+
+interface RawDraftForConvention {
+  league_id?: string;
+  settings?: { rounds?: number };
+}
+
+interface RawLeagueForConvention {
+  previous_league_id?: string | null;
+  season?: string;
+}
+
+interface RawDraftListEntry {
+  draft_id: string;
+  type?: string;
+  sport?: string;
+}
+
+interface RawPickForConvention {
+  round: number;
+  is_keeper: boolean | null;
+}
+
+/**
+ * Infers a league's keeper-round convention — "keepers always occupy the
+ * last N rounds of the draft" — from that league's own draft history, and
+ * maps it onto the current draft. Used by MockDraft to fill in the round for
+ * keepers that came from the rosters mechanism (see fetchLeagueKeepers
+ * above), which never carries one.
+ *
+ * ## Why this exists
+ *
+ * A roster-mechanism keeper records *which* player is kept, never what
+ * round they cost — that cost is a per-league house rule Sleeper doesn't
+ * model at all. Left alone, every such keeper lands at a placeholder round
+ * and blocks Start Draft until the user fixes each one by hand.
+ *
+ * Many keeper leagues use the simplest possible rule: keepers always cost
+ * the last N rounds of the draft — e.g. rounds 13 and 14 of a 14-round
+ * draft, every year, regardless of who's kept. When that pattern holds,
+ * this function reads it straight off last season's draft and reapplies it
+ * to the current season's draft length. Verified against a real 12-team,
+ * 14-round league whose 2025 keepers occupied EXACTLY rounds 13 and 14 (12
+ * keepers apiece, round 12 completely untouched) — the convention this
+ * function looks for.
+ *
+ * ## What it deliberately does NOT do
+ *
+ * It does not try to recover which specific round any individual keeper
+ * cost (there's no reliable within-team ordering signal — see
+ * assignKeeperRounds in lib/draft.ts for why), and it does not attempt to
+ * recognize any OTHER convention, such as "a keeper costs the round it was
+ * drafted in the year before." That's a real rule some leagues use, but
+ * nothing in Sleeper's data reliably distinguishes it from noise here, and
+ * asserting a specific round on a wrong guess is worse than leaving the
+ * keeper unconfirmed for the user. If the prior draft's keeper rounds don't
+ * form a clean trailing block, this returns null — exactly as if no
+ * convention existed — and the caller falls back to manual entry.
+ *
+ * ## Algorithm
+ *
+ * 1. Fetch the current draft for its `league_id` and `settings.rounds`
+ *    (`currentRounds`). Null if either is missing.
+ * 2. Fetch that league for `previous_league_id`. Null if absent — a league
+ *    with no recorded predecessor has no history to read a convention from.
+ * 3. Fetch the previous league for its `season`, used only for the UI
+ *    message. Non-fatal: falls back to `""` on failure.
+ * 4. Fetch the previous league's drafts and pick the snake/nfl one (or the
+ *    first entry, if none match) as the source of evidence. Null if there
+ *    are none.
+ * 5. Fetch every pick of that prior draft.
+ * 6. `priorTotalRounds` = the max `round` across all picks. The keeper
+ *    rounds are the distinct `round` values carrying at least one
+ *    `is_keeper === true` pick (N of them, ascending). Null if there are
+ *    none.
+ * 7. Validate the convention is really "the last N rounds": the keeper
+ *    rounds must equal the exact contiguous block
+ *    `[priorTotalRounds - N + 1 .. priorTotalRounds]`, no gaps and nothing
+ *    outside it. A league that instead charges "the round the player went
+ *    in last year" scatters keepers throughout the draft and correctly
+ *    fails this check.
+ * 8. Require each of those rounds to be *predominantly* keepers — at least
+ *    80% of the picks in the round. Without this, a coincidence (a couple
+ *    of ordinary late keepers landing in the final rounds of a league that
+ *    doesn't actually use this convention) could pass step 7 by accident.
+ * 9. Map N onto the CURRENT draft: the convention becomes that draft's own
+ *    last N rounds, `[currentRounds - N + 1 .. currentRounds]`. Null if
+ *    `currentRounds < N` — nowhere to put them.
+ *
+ * Every fetch degrades to `null` on failure or an unexpected shape rather
+ * than throwing — this is a best-effort enhancement layered on a working
+ * manual-entry flow, never a reason the keeper import itself should fail.
+ */
+export async function inferKeeperRoundConvention(
+  draftId: string
+): Promise<KeeperRoundConvention | null> {
+  let currentRounds: number;
+  let leagueId: string;
+  try {
+    const draft: RawDraftForConvention = await sleepFetch(`${BASE_URL}/draft/${draftId}`);
+    if (!draft.league_id || !draft.settings?.rounds) return null;
+    leagueId = draft.league_id;
+    currentRounds = draft.settings.rounds;
+  } catch {
+    return null;
+  }
+
+  let previousLeagueId: string;
+  try {
+    const league: RawLeagueForConvention = await sleepFetch(`${BASE_URL}/league/${leagueId}`);
+    if (!league.previous_league_id) return null;
+    previousLeagueId = league.previous_league_id;
+  } catch {
+    return null;
+  }
+
+  let sourceSeason = "";
+  try {
+    const priorLeague: RawLeagueForConvention = await sleepFetch(`${BASE_URL}/league/${previousLeagueId}`);
+    sourceSeason = priorLeague.season ?? "";
+  } catch {
+    // Non-fatal -- the UI message just omits the season if this fails.
+  }
+
+  let priorDraftId: string;
+  try {
+    const drafts: RawDraftListEntry[] = await sleepFetch(`${BASE_URL}/league/${previousLeagueId}/drafts`);
+    if (!Array.isArray(drafts) || drafts.length === 0) return null;
+    const snake = drafts.find((d) => d.type === "snake" && d.sport === "nfl");
+    const chosen = snake ?? drafts[0];
+    if (!chosen?.draft_id) return null;
+    priorDraftId = chosen.draft_id;
+  } catch {
+    return null;
+  }
+
+  let picks: RawPickForConvention[];
+  try {
+    const data = await sleepFetch(`${BASE_URL}/draft/${priorDraftId}/picks`);
+    if (!Array.isArray(data) || data.length === 0) return null;
+    picks = data;
+  } catch {
+    return null;
+  }
+
+  const priorTotalRounds = picks.reduce((max, p) => Math.max(max, p.round), 0);
+  if (priorTotalRounds <= 0) return null;
+
+  const keeperRoundSet = new Set<number>();
+  for (const p of picks) if (p.is_keeper === true) keeperRoundSet.add(p.round);
+  if (keeperRoundSet.size === 0) return null;
+
+  const priorRounds = [...keeperRoundSet].sort((a, b) => a - b);
+  const n = priorRounds.length;
+
+  // Must be exactly the trailing block [priorTotalRounds - n + 1 .. priorTotalRounds].
+  const expectedStart = priorTotalRounds - n + 1;
+  for (let i = 0; i < n; i++) {
+    if (priorRounds[i] !== expectedStart + i) return null;
+  }
+
+  // Each keeper round must be predominantly keepers, not merely contain one
+  // -- guards against a coincidence rather than a real convention.
+  for (const round of priorRounds) {
+    const picksInRound = picks.filter((p) => p.round === round);
+    const keeperCount = picksInRound.filter((p) => p.is_keeper === true).length;
+    if (picksInRound.length === 0 || keeperCount / picksInRound.length < 0.8) return null;
+  }
+
+  if (currentRounds < n) return null;
+
+  const rounds = Array.from({ length: n }, (_, i) => currentRounds - n + 1 + i);
+
+  return { rounds, sourceLeagueId: previousLeagueId, sourceSeason, priorRounds };
+}

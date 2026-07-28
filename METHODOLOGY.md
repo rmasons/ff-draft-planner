@@ -18,6 +18,12 @@ Sleeper's active format (`ppr`, `half`, `std`, or `superflex`) is authoritative.
 
 Pick value is `compatible market ADP − acquisition pick`. A player with ADP 40 selected at pick 25 is `+15`; at pick 55 the same player is `−15`. Keeper cost uses the keeper's team slot in true snake order: in a 12-team league, slot 3 costs pick 3 in round 1 and pick 22 in round 2.
 
+Keepers imported from Sleeper come from whichever of two mechanisms has data. A materialized draft board gives the player, the team, and the round, because a keeper there occupies a real slot in the snake. League rosters give only the player and the team — Sleeper records who is kept but never what the keep costs, since that is a per-league rule it does not model.
+
+When the round is missing it is inferred from the league's previous season, and only from one recognizable convention: keepers occupying the final rounds of that draft. The prior draft's keeper rounds must form an unbroken block ending at its last round, and each of those rounds must be at least four-fifths keepers, before the same number of trailing rounds is claimed in the current draft. Anything else — keepers scattered by the round a player was originally drafted, or a couple of late keepers that merely happen to sit near the end — is not recognized and yields no inference. Which of a team's keepers takes which round is not recoverable from the source data and is not a convention; the highest-projected keeper is assigned the earliest and therefore most expensive round, which cannot overstate a keeper's surplus. Every imported round remains editable.
+
+A keeper whose round could be neither read nor inferred carries no cost at all, so its pick equivalent, surplus, and keep/cut verdict are withheld rather than computed against a placeholder, and the draft will not start while any remain unset.
+
 ## CPU drafts and recommendations
 
 CPU candidate scores combine compatible market ADP, open starter needs, tier scarcity, an early K/DEF penalty, and bounded seeded variance. Candidates that cannot fit a legal completed roster are rejected. The same pick state produces the same seed and result; this is plausible simulation, not a model of a particular manager.

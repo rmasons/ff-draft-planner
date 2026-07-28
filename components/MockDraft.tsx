@@ -14,13 +14,17 @@ import { annotationKey, updateAnnotation, type AnnotationStore } from "@/lib/ann
 import { validAnnotationStore, validRoster, validScoring } from "@/lib/validation";
 import { encodeStored, parseStored } from "@/lib/persistence";
 import { marketReference } from "@/lib/market";
+import { fetchLeagueKeepers, inferKeeperRoundConvention, type KeeperRoundConvention } from "@/lib/sleeper-league";
 import {
+  assignKeeperRounds,
   chooseCpuPickOrBestAvailable,
   fillLineupSlots,
   gradeLetter,
   gradePick,
+  keeperConflict,
   keeperValue,
   leagueOpenSlots,
+  mergeImportedKeepers,
   mergeKeepersNonDestructive,
   ownerForPick,
   pickNumberForSlot,
@@ -35,6 +39,7 @@ import {
   SLEEPER_SLOT_ELIGIBLE,
   survivalEstimate,
   transitionDraft,
+  type KeeperCandidate,
 } from "@/lib/draft";
 
 interface MockPick {
@@ -56,6 +61,13 @@ interface PendingKeeper {
   playerId: string;
   teamSlot: number;
   round: number;
+  /**
+   * False only for keepers imported from Sleeper's roster mechanism, which
+   * carries no draft round. Such a keeper's round is a placeholder the user
+   * must set — its cost, and therefore the whole keep/cut verdict, is
+   * meaningless until they do.
+   */
+  roundConfirmed?: boolean;
 }
 
 interface SleeperDraft {
@@ -126,6 +138,15 @@ function assignRoster(
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
 
+/** Renders inferred keeper rounds for the import status line, e.g. "round 14"
+ *  for a single round or "rounds 13–14" (en dash) for a contiguous range.
+ *  `rounds` is always ascending and contiguous by construction — see
+ *  inferKeeperRoundConvention's trailing-block validation. */
+function keeperRoundsPhrase(rounds: number[]): string {
+  if (rounds.length <= 1) return `round ${rounds[0]}`;
+  return `rounds ${rounds[0]}–${rounds[rounds.length - 1]}`;
+}
+
 function SortTh({
   label, sk, sortKey, sortDir, onSort, className,
 }: {
@@ -184,6 +205,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   const [keeperSlot, setKeeperSlot] = useState(1);
   const [keeperRound, setKeeperRound] = useState(1);
   const [keeperError, setKeeperError] = useState<string | null>(null);
+  const [keeperImporting, setKeeperImporting] = useState(false);
+  const [keeperImportError, setKeeperImportError] = useState<string | null>(null);
+  const [keeperImportSummary, setKeeperImportSummary] = useState<string | null>(null);
 
   // Export / copy state
   const [copiedRoster, setCopiedRoster] = useState(false);
@@ -595,14 +619,24 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return pendingKeepers.map((k) => {
       const player = playerById.get(k.playerId);
       const consensusAdp = player ? marketReference(player, scoring, effectiveRoster).consensus : null;
-      const { pickEquivalent, surplus } = keeperValue(k.round, k.teamSlot, numTeams, consensusAdp);
+      // A rosters-imported keeper sits at a placeholder round 1 until the user
+      // sets its real cost, and every part of this verdict is a function of
+      // that cost — so reporting one would be inventing a recommendation out
+      // of a number Sleeper never gave us. Round 1 is also the most expensive
+      // slot, which would bias every unconfirmed row toward "Cut". Withhold
+      // the whole valuation instead; the row reappears the moment a round is
+      // picked. See the roundConfirmed comment on PendingKeeper.
+      const confirmed = k.roundConfirmed !== false;
+      const { pickEquivalent, surplus } = confirmed
+        ? keeperValue(k.round, k.teamSlot, numTeams, consensusAdp)
+        : { pickEquivalent: null, surplus: null };
       let verdict: "keep" | "borderline" | "cut" | null = null;
       if (surplus !== null) {
         if (surplus > 8) verdict = "keep";
         else if (surplus >= 0) verdict = "borderline";
         else verdict = "cut";
       }
-      return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
+      return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict, confirmed };
     });
   }, [pendingKeepers, ranked, playerById, numTeams, scoring, effectiveRoster]);
 
@@ -661,6 +695,20 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   }
 
   function startDraft() {
+    // A keeper imported from Sleeper's rosters mechanism (no round in the
+    // source data — see fetchLeagueKeepers) defaults to round 1 until the
+    // user sets a real one. Starting with that placeholder still in place
+    // would silently draft it at the wrong pick and grade it against a
+    // meaningless keeper-value verdict, so this blocks the same way the
+    // pick-collision guard below does: stay on the setup screen, surface the
+    // error, don't start.
+    const unconfirmed = pendingKeepers.filter((k) => k.roundConfirmed === false).length;
+    if (unconfirmed > 0) {
+      setKeeperError(
+        `${unconfirmed} keeper${unconfirmed !== 1 ? "s" : ""} still need${unconfirmed === 1 ? "s" : ""} a round set — Sleeper didn't publish one. Set ${unconfirmed !== 1 ? "them" : "it"} above before starting.`
+      );
+      return;
+    }
     if (pendingKeepers.length > 0) {
       const keeperPicks: MockPick[] = pendingKeepers.map((k) => {
         const player = playerById.get(k.playerId);
@@ -714,6 +762,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setUserLookupError(null);
     setPendingKeepers([]);
     setKeeperError(null);
+    setKeeperImporting(false);
+    setKeeperImportError(null);
+    setKeeperImportSummary(null);
     setBoardFilter("ALL");
     setTeamNames({});
     setLeagueRosterPositions([]);
@@ -801,29 +852,104 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   function addKeeper() {
     if (!keeperPlayerId) return;
     setKeeperError(null);
-    const pickNum = pickNumberForSlot(keeperRound, keeperSlot, numTeams);
-    if (pendingKeepers.some((k) => pickNumberForSlot(k.round, k.teamSlot, numTeams) === pickNum)) {
+    // Manual entry always has a real, user-chosen round, so it's confirmed
+    // by construction — see keeperConflict for why that flag matters.
+    const candidate: KeeperCandidate = { playerId: keeperPlayerId, teamSlot: keeperSlot, round: keeperRound, roundConfirmed: true };
+    const others: KeeperCandidate[] = pendingKeepers.map((k) => ({
+      playerId: k.playerId, teamSlot: k.teamSlot, round: k.round, roundConfirmed: k.roundConfirmed !== false,
+    }));
+    const conflict = keeperConflict(candidate, others, picks, numTeams);
+    if (conflict === "collision-pending-keeper") {
       setKeeperError(`Round ${keeperRound} for ${teamLabel(keeperSlot)} is already assigned to another keeper.`);
       return;
     }
-    // pendingKeepers only checks other pending keepers — it never checked
-    // pickedNums (existing picks, e.g. from a Sleeper import or a draft that
-    // was reset back to setup with picks already made). Without this check
-    // startDraft's Map-based merge would silently overwrite that pick.
-    if (pickedNums.has(pickNum)) {
+    // Existing picks (e.g. from a Sleeper import, or a draft reset back to
+    // setup with picks already made) — without this check, startDraft's
+    // merge would silently collide with that pick.
+    if (conflict === "collision-existing-pick") {
+      const pickNum = pickNumberForSlot(keeperRound, keeperSlot, numTeams);
       setKeeperError(`Pick #${pickNum} (Round ${keeperRound}, ${teamLabel(keeperSlot)}) is already taken by an existing pick.`);
       return;
     }
-    if (pendingKeepers.some((k) => k.playerId === keeperPlayerId)) {
+    if (conflict === "duplicate-pending-keeper") {
       setKeeperError("That player is already set as a keeper.");
+      return;
+    }
+    if (conflict === "duplicate-drafted-player") {
+      setKeeperError("That player has already been drafted.");
       return;
     }
     setPendingKeepers((prev) => [
       ...prev,
-      { playerId: keeperPlayerId, teamSlot: keeperSlot, round: keeperRound },
+      { playerId: keeperPlayerId, teamSlot: keeperSlot, round: keeperRound, roundConfirmed: true },
     ]);
     setKeeperSearch("");
     setKeeperPlayerId(null);
+  }
+
+  // Bulk keeper import from Sleeper — see fetchLeagueKeepers for the two
+  // source mechanisms. mergeImportedKeepers runs the batch through the same
+  // keeperConflict validator addKeeper uses, so an imported candidate is
+  // rejected for exactly the same reasons a manual add would be: already
+  // pending, already drafted, or a pick-number collision (only checked once
+  // its round is confirmed).
+  async function handleImportKeepers() {
+    const id = draftId.trim();
+    if (!id) return;
+    setKeeperImporting(true);
+    setKeeperImportError(null);
+    setKeeperImportSummary(null);
+    try {
+      const result = await fetchLeagueKeepers(id);
+
+      // Board-sourced keepers already carry a real round, so there's
+      // nothing to infer. Rosters-sourced keepers never do (see
+      // fetchLeagueKeepers) — try to fill them in from this league's own
+      // keeper-round convention (see inferKeeperRoundConvention) before
+      // merging. A failure here just means no convention was found; it must
+      // never fail the import itself.
+      let convention: KeeperRoundConvention | null = null;
+      let importedKeepers = result.keepers;
+      if (result.source === "rosters") {
+        try {
+          convention = await inferKeeperRoundConvention(id);
+        } catch {
+          convention = null;
+        }
+        importedKeepers = assignKeeperRounds(
+          result.keepers,
+          convention?.rounds ?? null,
+          (playerId) => playerById.get(playerId)?.points ?? 0
+        );
+      }
+
+      const { keepers, added, upgraded, skipped } = mergeImportedKeepers(
+        pendingKeepers.map((k) => ({
+          playerId: k.playerId, teamSlot: k.teamSlot, round: k.round, roundConfirmed: k.roundConfirmed !== false,
+        })),
+        importedKeepers,
+        picks,
+        numTeams
+      );
+      setPendingKeepers(keepers);
+
+      const skippedNote = skipped > 0 ? ` · ${skipped} skipped (already drafted or duplicated)` : "";
+      const upgradedNote = upgraded > 0 ? ` · ${upgraded} round${upgraded !== 1 ? "s" : ""} filled in from the board` : "";
+      const countLabel = `${added} keeper${added !== 1 ? "s" : ""}`;
+      const summary =
+        result.source === "board"
+          ? `Imported ${countLabel} from the draft board.${upgradedNote}${skippedNote}`
+          : convention
+            // sourceSeason is best-effort — the prior league's detail fetch is
+            // allowed to fail without losing the convention itself.
+            ? `Imported ${countLabel} from league rosters · rounds set from your ${convention.sourceSeason || "previous"} draft, where keepers took ${keeperRoundsPhrase(convention.priorRounds)}.${skippedNote}`
+            : `Imported ${countLabel} from league rosters — Sleeper doesn't publish keeper rounds, so set each round below.${skippedNote}`;
+      setKeeperImportSummary(summary);
+    } catch (e) {
+      setKeeperImportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setKeeperImporting(false);
+    }
   }
 
   async function connectLiveDraft() {
@@ -1122,6 +1248,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const importedKeepers = picks.filter((p) => p.isKeeper);
     const slotOptions = Array.from({ length: numTeams }, (_, i) => i + 1);
     const roundOptions = Array.from({ length: numRounds }, (_, i) => i + 1);
+    const unconfirmedKeeperCount = pendingKeepers.filter((k) => k.roundConfirmed === false).length;
 
     return (
       <div className="flex items-start justify-center py-12">
@@ -1225,15 +1352,61 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             ) : (
               /* Manual keeper entry (fresh drafts) */
               <div>
+                {draftId.trim() && (
+                  <div className="mb-2">
+                    <button
+                      onClick={handleImportKeepers}
+                      disabled={keeperImporting}
+                      className="w-full rounded-lg border border-zinc-700 px-3 py-2 text-xs text-zinc-300 transition hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40"
+                    >
+                      {keeperImporting ? "Importing keepers…" : "Import keepers from Sleeper"}
+                    </button>
+                    {keeperImportError && <p className="mt-1.5 text-xs text-rose-400">{keeperImportError}</p>}
+                    {keeperImportSummary && <p className="mt-1.5 text-xs text-emerald-400">{keeperImportSummary}</p>}
+                  </div>
+                )}
+
                 {pendingKeepers.length > 0 && (
                   <div className="mb-2 space-y-1">
                     {pendingKeepers.map((k, i) => {
                       const player = playerById.get(k.playerId);
                       const pickNum = pickNumberForSlot(k.round, k.teamSlot, numTeams);
+                      const confirmed = k.roundConfirmed !== false;
                       return (
-                        <div key={i} className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/50 px-3 py-1.5 text-xs">
-                          <span className="shrink-0 text-zinc-500">Rd {k.round} · {teamLabel(k.teamSlot)} · #{pickNum}</span>
+                        <div
+                          key={i}
+                          className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs ${
+                            confirmed ? "border-zinc-700/50 bg-zinc-900/50" : "border-amber-500/30 bg-amber-500/5"
+                          }`}
+                        >
                           <span className="min-w-0 flex-1 truncate text-zinc-200">{player?.name ?? k.playerId}</span>
+                          <select
+                            value={k.teamSlot}
+                            onChange={(e) => {
+                              const teamSlot = Number(e.target.value);
+                              setPendingKeepers((prev) => prev.map((p, j) => (j === i ? { ...p, teamSlot } : p)));
+                            }}
+                            className="shrink-0 rounded border border-zinc-700 bg-zinc-900 px-1 py-1 text-zinc-100 focus:border-emerald-500 focus:outline-none"
+                          >
+                            {slotOptions.map((n) => <option key={n} value={n}>{teamLabel(n)}</option>)}
+                          </select>
+                          <select
+                            value={k.round}
+                            onChange={(e) => {
+                              const round = Number(e.target.value);
+                              // Editing the round is how the user resolves an
+                              // unconfirmed (rosters-imported) row — see the
+                              // roundConfirmed doc comment on PendingKeeper.
+                              setPendingKeepers((prev) => prev.map((p, j) => (j === i ? { ...p, round, roundConfirmed: true } : p)));
+                            }}
+                            className={`shrink-0 rounded border bg-zinc-900 px-1 py-1 focus:outline-none ${
+                              confirmed ? "border-zinc-700 text-zinc-100 focus:border-emerald-500" : "border-amber-500/50 text-amber-400 focus:border-amber-400"
+                            }`}
+                          >
+                            {roundOptions.map((n) => <option key={n} value={n}>R{n}</option>)}
+                          </select>
+                          <span className="shrink-0 text-zinc-600">#{pickNum}</span>
+                          {!confirmed && <span className="shrink-0 font-medium text-amber-400">set round</span>}
                           <button
                             onClick={() => setPendingKeepers((prev) => prev.filter((_, j) => j !== i))}
                             className="shrink-0 text-zinc-600 hover:text-zinc-400"
@@ -1303,7 +1476,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
             <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-900/30 p-4">
               <h3 className="mb-3 text-sm font-semibold text-zinc-300">Keeper Value Analysis</h3>
               <div className="space-y-2">
-                {keeperAnalysis.map(({ keeper, player, pickEquivalent, consensusAdp, surplus, verdict }, i) => {
+                {keeperAnalysis.map(({ keeper, player, pickEquivalent, consensusAdp, surplus, verdict, confirmed }, i) => {
                   const pos = player?.position;
                   const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
                   const verdictIcon = verdict === "keep" ? "🟢" : verdict === "borderline" ? "🟡" : "🔴";
@@ -1315,6 +1488,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                           <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}>{pos}</span>
                         )}
                         <span className="font-medium text-zinc-100">{player?.name ?? keeper.playerId}</span>
+                        {!confirmed && (
+                          <span className="ml-auto shrink-0 text-xs font-medium text-amber-400">Set a round to value</span>
+                        )}
                         {verdict && (
                           <span className="ml-auto flex items-center gap-1 text-xs font-medium">
                             {verdictIcon}{" "}
@@ -1326,9 +1502,13 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       </div>
                       <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs">
                         <span className="text-zinc-500">Keep cost</span>
-                        <span className="text-zinc-300">Round {keeper.round}</span>
+                        <span className={confirmed ? "text-zinc-300" : "text-zinc-500"}>
+                          {confirmed ? `Round ${keeper.round}` : "—"}
+                        </span>
                         <span className="text-zinc-500">Pick equivalent</span>
-                        <span className="text-zinc-300">#{pickEquivalent}</span>
+                        <span className={pickEquivalent !== null ? "text-zinc-300" : "text-zinc-500"}>
+                          {pickEquivalent !== null ? `#${pickEquivalent}` : "—"}
+                        </span>
                         <span className="text-zinc-500">ADP</span>
                         <span className="text-zinc-300">{consensusAdp !== null ? consensusAdp.toFixed(1) : "—"}</span>
                         <span className="text-zinc-500">ADP surplus</span>
@@ -1414,7 +1594,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               {picks.length > 0
                 ? `Continue Draft (${picks.length} picks already made)`
                 : pendingKeepers.length > 0
-                ? `Start Draft (${pendingKeepers.length} keeper${pendingKeepers.length !== 1 ? "s" : ""} set)`
+                ? unconfirmedKeeperCount > 0
+                  ? `Start Draft (${unconfirmedKeeperCount} keeper round${unconfirmedKeeperCount !== 1 ? "s" : ""} need${unconfirmedKeeperCount === 1 ? "s" : ""} to be set)`
+                  : `Start Draft (${pendingKeepers.length} keeper${pendingKeepers.length !== 1 ? "s" : ""} set)`
                 : "Start Mock Draft"}
             </button>
           )}

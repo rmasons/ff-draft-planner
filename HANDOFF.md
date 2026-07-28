@@ -52,7 +52,7 @@ The release command validates required Sleeper data, unique IDs, supported posit
 |---|---|
 | `lib/types.ts` | Domain types: `Player`, `ScoringConfig`, `RosterConfig`, `RankedPlayer`, `Position` (`QB/RB/WR/TE/K/DEF`) |
 | `lib/sleeper.ts` | Fetch + normalize Sleeper projections; `SEASON` constant (derived from today's date); in-module 12h memo; raw 2025 stats fetch |
-| `lib/sleeper-league.ts` | Sleeper user/league lookup; `mapLeagueToConfig` maps a league's scoring/roster settings onto our config; `fetchKeptPlayerIds` for keeper/dynasty leagues |
+| `lib/sleeper-league.ts` | Sleeper user/league lookup; `mapLeagueToConfig` maps a league's scoring/roster settings onto our config; `fetchKeptPlayerIds` for keeper/dynasty leagues; `fetchLeagueKeepers` resolves keepers with team slot + round (draft board preferred, league rosters as fallback); `inferKeeperRoundConvention` reads the keep cost off the previous season's draft when rosters supplied no round |
 | `lib/espn.ts` | Fetch + normalize ESPN ADP (12h memo), fuzzy name matching (`normalizeName`, strips trailing Jr./Sr./II-IV suffixes) |
 | `lib/byes.ts` | 2026 team → bye week static map (filled) |
 | `lib/scoring.ts` | `fantasyPoints`/`fantasyPointsForStats` — raw stats → points under a scoring config; K/DEF use Sleeper's precomputed `pts_std` |

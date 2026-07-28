@@ -511,6 +511,213 @@ export function keeperValue(round: number, teamSlot: number, teams: number, mark
   return { pickEquivalent, surplus: marketAdp === null ? null : pickEquivalent - marketAdp };
 }
 
+export interface KeeperCandidate {
+  playerId: string;
+  teamSlot: number;
+  round: number;
+  /** False for a keeper whose round Sleeper never supplied (see
+   *  fetchLeagueKeepers in lib/sleeper-league.ts) and the user hasn't fixed
+   *  yet. See keeperConflict for why this changes which rules apply. */
+  roundConfirmed: boolean;
+}
+
+interface KeeperExistingPick {
+  pickNumber: number;
+  playerId: string;
+  isKeeper?: boolean;
+}
+
+export type KeeperConflict =
+  | "collision-pending-keeper"
+  | "collision-existing-pick"
+  | "duplicate-pending-keeper"
+  | "duplicate-drafted-player";
+
+/**
+ * Single source of truth for "can this keeper candidate be added" — shared
+ * by MockDraft's one-at-a-time manual "Add" form and its bulk Sleeper
+ * import, so the two paths can never disagree about what counts as a
+ * collision. Returns the first conflict found, or null if the candidate is
+ * clear to add.
+ *
+ * Pick-number collisions (via pickNumberForSlot) are only checked when the
+ * candidate's round is confirmed. A keeper imported from Sleeper's rosters
+ * mechanism (as opposed to the draft board) carries no round at all, so
+ * every such candidate defaults to round 1 until the user sets one for
+ * real — and would then all compute the *same* pickNumberForSlot and
+ * "collide" with each other, for a reason that has nothing to do with an
+ * actual scheduling conflict. The duplicate-player checks still apply
+ * unconditionally: the same player can never legitimately be two keepers,
+ * regardless of what round either claims.
+ */
+export function keeperConflict(
+  candidate: KeeperCandidate,
+  otherKeepers: KeeperCandidate[],
+  existingPicks: KeeperExistingPick[],
+  numTeams: number,
+): KeeperConflict | null {
+  if (candidate.roundConfirmed) {
+    const pickNum = pickNumberForSlot(candidate.round, candidate.teamSlot, numTeams);
+    if (otherKeepers.some((k) => k.roundConfirmed && pickNumberForSlot(k.round, k.teamSlot, numTeams) === pickNum)) {
+      return "collision-pending-keeper";
+    }
+    if (existingPicks.some((p) => p.pickNumber === pickNum && !p.isKeeper)) {
+      return "collision-existing-pick";
+    }
+  }
+  if (otherKeepers.some((k) => k.playerId === candidate.playerId)) return "duplicate-pending-keeper";
+  if (existingPicks.some((p) => p.playerId === candidate.playerId)) return "duplicate-drafted-player";
+  return null;
+}
+
+/** A keeper as it arrives from Sleeper, before defaults are applied. */
+export interface ImportedKeeper {
+  playerId: string;
+  teamSlot: number | null;
+  round: number | null;
+}
+
+/**
+ * Folds a batch of Sleeper-imported keepers into the pending list, applying
+ * the same `keeperConflict` rules a manual add goes through. Returns the
+ * whole new list plus a per-outcome tally for the status line.
+ *
+ * A missing `teamSlot` or `round` becomes 1, with `roundConfirmed: false`
+ * marking the round as a placeholder rather than a real keep cost.
+ *
+ * The one case that is neither "add" nor "skip" is an *upgrade*: a player
+ * already pending from an earlier rosters-mechanism import carries a
+ * placeholder round, and once Sleeper materializes the draft board the same
+ * player comes back with a real one. Rejecting that as a duplicate would
+ * discard the only authoritative cost the API will ever hand us and leave
+ * the user to guess it. So a confirmed round overwrites an unconfirmed one —
+ * never the reverse, since a round the user set by hand outranks a default.
+ */
+export function mergeImportedKeepers(
+  pending: KeeperCandidate[],
+  incoming: ImportedKeeper[],
+  existingPicks: KeeperExistingPick[],
+  numTeams: number,
+): { keepers: KeeperCandidate[]; added: number; upgraded: number; skipped: number } {
+  // Copied so the conflict checks below see each accepted candidate as they
+  // go — two incoming rows can collide with each other, not just with the
+  // rows that were already pending.
+  const keepers: KeeperCandidate[] = pending.map((k) => ({ ...k }));
+  let added = 0;
+  let upgraded = 0;
+  let skipped = 0;
+
+  for (const raw of incoming) {
+    const candidate: KeeperCandidate = {
+      playerId: raw.playerId,
+      teamSlot: raw.teamSlot ?? 1,
+      round: raw.round ?? 1,
+      roundConfirmed: raw.round !== null,
+    };
+    const existing = keepers.find((k) => k.playerId === candidate.playerId);
+    if (existing && !existing.roundConfirmed && candidate.roundConfirmed) {
+      existing.teamSlot = candidate.teamSlot;
+      existing.round = candidate.round;
+      existing.roundConfirmed = true;
+      upgraded++;
+      continue;
+    }
+    if (keeperConflict(candidate, keepers, existingPicks, numTeams)) { skipped++; continue; }
+    keepers.push(candidate);
+    added++;
+  }
+  return { keepers, added, upgraded, skipped };
+}
+
+/**
+ * Fills in `round` for keepers whose round Sleeper never supplied (the
+ * rosters mechanism — see fetchLeagueKeepers in lib/sleeper-league.ts),
+ * using a per-league "keepers occupy the same N rounds every year"
+ * convention inferred by inferKeeperRoundConvention there. This is a
+ * best-effort inference layered on top of the real data, not a fact
+ * recovered from Sleeper — the API has no way to say which round a
+ * roster-mechanism keeper actually costs. All this can do is place it
+ * consistently with how the league has always run its keeper rounds.
+ *
+ * Grouping is by `teamSlot`: within a team, the round-less keepers are
+ * sorted by `valueOf` DESCENDING and paired with `conventionRounds`
+ * ASCENDING, so the highest-valued keeper takes the earliest (most
+ * "expensive") round. That pairing is arbitrary, not recovered — checking
+ * it against a real league's multi-year history found no reliable
+ * within-team ordering rule at all (the better-valued keeper sat in the
+ * LATER round more often than the earlier one, 8 of 12 teams). Given no
+ * real signal to sort by, this deliberately picks the pessimistic pairing:
+ * charging the best keeper the steepest cost can only understate a
+ * keeper's surplus value, never overstate it, so a wrong guess here biases
+ * toward "set them free and re-check" rather than talking the user into a
+ * bad keep.
+ *
+ * A `teamSlot: null` group (no known team) is left entirely alone — with no
+ * team to reason about, there's no way to know which of that team's rounds
+ * are even free. A team with more round-less keepers than convention rounds
+ * available gets its surplus left at `round: null` too; those keepers stay
+ * unconfirmed for the user to resolve by hand, same as if no convention had
+ * been found. And any convention round a team already holds via a
+ * board-confirmed `round` (present in the input, never touched by this
+ * function) is skipped for that team, so an inference can never collide
+ * with authoritative data.
+ *
+ * Ties in `valueOf` break on `playerId` so that re-running an import over
+ * the same data always produces the same assignment.
+ */
+export function assignKeeperRounds(
+  keepers: ImportedKeeper[],
+  conventionRounds: number[] | null,
+  valueOf: (playerId: string) => number,
+): ImportedKeeper[] {
+  if (!conventionRounds || conventionRounds.length === 0) {
+    return keepers.map((k) => ({ ...k }));
+  }
+  const ascendingRounds = [...conventionRounds].sort((a, b) => a - b);
+
+  // Rounds each team already holds via a confirmed (board) round, so an
+  // inferred round can never be assigned on top of real data.
+  const takenByTeam = new Map<number, Set<number>>();
+  for (const k of keepers) {
+    if (k.teamSlot !== null && k.round !== null) {
+      let taken = takenByTeam.get(k.teamSlot);
+      if (!taken) { taken = new Set(); takenByTeam.set(k.teamSlot, taken); }
+      taken.add(k.round);
+    }
+  }
+
+  // Round-less keepers, grouped by team. teamSlot: null keepers are excluded
+  // here (and therefore left untouched below) — see the doc comment above.
+  const byTeam = new Map<number, ImportedKeeper[]>();
+  for (const k of keepers) {
+    if (k.round !== null || k.teamSlot === null) continue;
+    let group = byTeam.get(k.teamSlot);
+    if (!group) { group = []; byTeam.set(k.teamSlot, group); }
+    group.push(k);
+  }
+
+  const assignedRound = new Map<ImportedKeeper, number>();
+  for (const [teamSlot, teamKeepers] of byTeam) {
+    const taken = takenByTeam.get(teamSlot);
+    const availableRounds = taken ? ascendingRounds.filter((r) => !taken.has(r)) : ascendingRounds;
+    const byValueDesc = [...teamKeepers].sort((a, b) => {
+      const diff = valueOf(b.playerId) - valueOf(a.playerId);
+      return diff !== 0 ? diff : a.playerId.localeCompare(b.playerId);
+    });
+    // Surplus keepers (more round-less keepers than rounds available) fall
+    // off the end of availableRounds and are simply never assigned here,
+    // leaving their round null.
+    byValueDesc.forEach((keeper, i) => {
+      if (i < availableRounds.length) assignedRound.set(keeper, availableRounds[i]);
+    });
+  }
+
+  return keepers.map((k) => {
+    const round = assignedRound.get(k);
+    return round === undefined ? { ...k } : { ...k, round };
+  });
+}
+
 /**
  * Merge keeper picks into an existing pick list keyed by pickNumber, without
  * ever silently overwriting a real (non-keeper) pick already at that slot —
