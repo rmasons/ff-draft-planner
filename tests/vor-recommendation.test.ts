@@ -7,7 +7,7 @@ import {
   rosterConfigFromLeague,
   rosterSlots,
   selectSuggestedPick,
-  startableByPosition,
+  depthCapacityByPosition,
 } from "../lib/draft";
 import { rankPlayers } from "../lib/vbd";
 import { adpKeyFor } from "../lib/presets";
@@ -231,8 +231,30 @@ describe("selectSuggestedPick — roster need is a weight, not a filter", () => 
 describe("bench depth decays linearly with saturation", () => {
   const lineup = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF", "BN", "BN", "BN"];
 
-  it("counts a flexible slot toward every position it accepts", () => {
-    expect(startableByPosition(lineup)).toEqual({ QB: 1, RB: 3, WR: 3, TE: 2, K: 1, DEF: 1 });
+  it("shares a flexible slot fractionally across the positions it accepts", () => {
+    const cap = depthCapacityByPosition(lineup);
+    expect(cap.QB).toBe(1);
+    expect(cap.RB).toBeCloseTo(7 / 3);
+    expect(cap.WR).toBeCloseTo(7 / 3);
+    expect(cap.TE).toBeCloseTo(4 / 3);
+    expect(cap.K).toBe(1);
+    expect(cap.DEF).toBe(1);
+  });
+
+  it("discounts a second tight end that only the shared FLEX could start", () => {
+    // The bug: a FLEX credited in full made a second TE worth full value.
+    const cap = depthCapacityByPosition(lineup);
+    expect(depthValueFactor(1, cap.TE)).toBeCloseTo(5 / 7); // ~0.714, was 1.0
+  });
+
+  it("keeps a third receiver near full value as a normal flex starter", () => {
+    const cap = depthCapacityByPosition(lineup);
+    expect(depthValueFactor(2, cap.WR)).toBeCloseTo(0.8);
+  });
+
+  it("keeps a second quarterback at full value in superflex, half in a one-QB league", () => {
+    expect(depthValueFactor(1, depthCapacityByPosition([...lineup, "SUPER_FLEX"]).QB)).toBe(1);
+    expect(depthValueFactor(1, depthCapacityByPosition(lineup).QB)).toBe(0.5);
   });
 
   it("holds full value until the lineup is stocked, then decays to zero", () => {
@@ -254,7 +276,7 @@ describe("bench depth decays linearly with saturation", () => {
     // 1-QB lineup he is worth half — 15, behind the receiver who is still
     // startable and so undiscounted.
     const board = [ranked("qb-2nd", "QB", 30), ranked("wr-3rd", "WR", 20)];
-    const startable = startableByPosition(lineup);
+    const startable = depthCapacityByPosition(lineup);
     expect(selectSuggestedPick(board, { openStarterSlotTypes: [], picksRemaining: 5, startable, held: { QB: 1, WR: 2 } }, scoreByVor)?.player.id)
       .toBe("wr-3rd");
     // With no quarterback yet, the same board goes the other way.
@@ -266,7 +288,7 @@ describe("bench depth decays linearly with saturation", () => {
     // The regression: a discounted-to-zero QB scores 0, which beats every
     // sub-replacement player left late in a draft, so it would win anyway.
     const board = [ranked("qb-7th", "QB", 40), ranked("rb-depth", "RB", -5)];
-    const startable = startableByPosition(lineup);
+    const startable = depthCapacityByPosition(lineup);
     const result = selectSuggestedPick(
       board, { openStarterSlotTypes: [], picksRemaining: 4, startable, held: { QB: 6, RB: 2 } }, scoreByVor
     );
@@ -279,7 +301,7 @@ describe("bench depth decays linearly with saturation", () => {
     const sf = [...lineup, "SUPER_FLEX"];
     const result = selectSuggestedPick(
       board,
-      { openStarterSlotTypes: ["SUPER_FLEX"], picksRemaining: 1, startable: startableByPosition(sf), held: { QB: 6, RB: 6 } },
+      { openStarterSlotTypes: ["SUPER_FLEX"], picksRemaining: 1, startable: depthCapacityByPosition(sf), held: { QB: 6, RB: 6 } },
       scoreByVor
     );
     expect(result?.forced).toBe(true);
@@ -290,7 +312,7 @@ describe("bench depth decays linearly with saturation", () => {
     const board = [ranked("qb-7th", "QB", 40), ranked("rb-7th", "RB", 10)];
     const result = selectSuggestedPick(
       board,
-      { openStarterSlotTypes: [], picksRemaining: 1, startable: startableByPosition(lineup), held: { QB: 6, RB: 6 } },
+      { openStarterSlotTypes: [], picksRemaining: 1, startable: depthCapacityByPosition(lineup), held: { QB: 6, RB: 6 } },
       scoreByVor
     );
     expect(result).not.toBeNull();
@@ -300,6 +322,21 @@ describe("bench depth decays linearly with saturation", () => {
   it("applies no discount when the caller supplies no lineup", () => {
     const board = [ranked("qb-7th", "QB", 40), ranked("rb-depth", "RB", 10)];
     expect(selectSuggestedPick(board, ctx([], 4), scoreByVor)?.player.id).toBe("qb-7th");
+  });
+
+  it("no longer lets a surplus tight end out-rank a real flex receiver", () => {
+    // Held: a starting QB, a starting TE, two WRs. Only a FLEX is open, which
+    // both the second TE and a third WR could fill. The TE has the higher raw
+    // VOR, so with the old full-credit FLEX it topped the pick; discounting the
+    // shared second-TE start flips it to the more startable receiver.
+    const board = [ranked("te-2nd", "TE", 17), ranked("wr-3rd", "WR", 16)];
+    const cap = depthCapacityByPosition(lineup);
+    const result = selectSuggestedPick(
+      board,
+      { openStarterSlotTypes: ["FLEX"], picksRemaining: 10, startable: cap, held: { QB: 1, TE: 1, WR: 2 } },
+      scoreByVor
+    );
+    expect(result?.player.id).toBe("wr-3rd");
   });
 });
 

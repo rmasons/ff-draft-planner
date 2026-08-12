@@ -35,7 +35,7 @@ import {
   rosterSlots,
   seededRandom,
   selectSuggestedPick,
-  startableByPosition,
+  depthCapacityByPosition,
   SLEEPER_SLOT_ELIGIBLE,
   survivalEstimate,
   transitionDraft,
@@ -586,7 +586,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       {
         openStarterSlotTypes: unfilledStarterSlots.map((s) => s.slotType),
         picksRemaining: userPicksRemaining,
-        startable: startableByPosition(myRosterSlots.map((s) => s.slotType)),
+        startable: depthCapacityByPosition(myRosterSlots.map((s) => s.slotType)),
         held: heldByPosition,
       },
       (player) => evaluateCandidate(player).score

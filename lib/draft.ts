@@ -124,18 +124,46 @@ const NEED_BONUS_DEDICATED = 25;
 const NEED_BONUS_FLEXIBLE = 12;
 
 /**
- * How many of each position a lineup could start, counting every flexible slot
- * toward each position it accepts. The totals deliberately overlap — a single
- * FLEX counts for RB, WR and TE — because the question each answers is "how
- * many of these could I get on the field", not "how many will I".
+ * Effective startable capacity per position, for the depth discount only (see
+ * depthValueFactor). Dedicated slots count as one guaranteed start each.
+ *
+ * Flexible slots are *shared*, so they are credited fractionally rather than
+ * counted in full toward every position they accept: a single FLEX cannot start
+ * a third RB and a third WR and a second TE at once, yet crediting it fully to
+ * each — the old behavior — is exactly what made a second TE (or a
+ * superflex-less second QB) look like a free starter and top the board.
+ *
+ * Each flexible slot spreads one starter's worth of credit across its eligible
+ * positions, with one deliberate exception: SUPER_FLEX credits QB in full,
+ * because in practice a superflex is a second quarterback slot. That keeps a
+ * second QB at full value in superflex while a shared FLEX only nudges it.
+ *
+ * The result is fractional on purpose; depthValueFactor takes a real-valued
+ * capacity. A position with no eligible slot still comes out at zero, so the
+ * "can't field one" guard there is unaffected.
  */
-export function startableByPosition(lineupSlotTypes: string[]): Record<Position, number> {
-  const counts: Record<Position, number> = { QB: 0, RB: 0, WR: 0, TE: 0, K: 0, DEF: 0 };
+const FLEX_CAPACITY_CREDIT: Record<string, Partial<Record<Position, number>>> = {
+  FLEX: { RB: 1 / 3, WR: 1 / 3, TE: 1 / 3 },
+  WRRB_FLEX: { RB: 1 / 2, WR: 1 / 2 },
+  REC_FLEX: { WR: 1 / 2, TE: 1 / 2 },
+  SUPER_FLEX: { QB: 1, RB: 1 / 4, WR: 1 / 4, TE: 1 / 4 },
+};
+
+export function depthCapacityByPosition(lineupSlotTypes: string[]): Record<Position, number> {
+  const capacity: Record<Position, number> = { QB: 0, RB: 0, WR: 0, TE: 0, K: 0, DEF: 0 };
   for (const slot of lineupSlotTypes) {
     if (slot === "BN") continue;
-    for (const position of SLEEPER_SLOT_ELIGIBLE[slot] ?? []) counts[position]++;
+    const flexCredit = FLEX_CAPACITY_CREDIT[slot];
+    if (flexCredit) {
+      for (const [position, credit] of Object.entries(flexCredit)) {
+        capacity[position as Position] += credit;
+      }
+    } else if (slot in capacity) {
+      // A dedicated slot (QB/RB/WR/TE/K/DEF) is one guaranteed start.
+      capacity[slot as Position] += 1;
+    }
   }
-  return counts;
+  return capacity;
 }
 
 /**
@@ -167,7 +195,7 @@ export interface SuggestionContext {
   openStarterSlotTypes: string[];
   /** Picks this team still owns, counting the one on the clock. */
   picksRemaining: number;
-  /** How many of each position the lineup can start (see startableByPosition).
+  /** How many of each position the lineup can start (see depthCapacityByPosition).
    *  Positions absent here get no depth discount. */
   startable?: Partial<Record<Position, number>>;
   /** How many of each position this team already rosters. */
