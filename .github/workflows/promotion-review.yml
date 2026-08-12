@@ -7,6 +7,8 @@ name: Promotion Review
 #
 # Pair this with branch protection on `test` and `main` that requires the
 # `promotion-review` check — see PIPELINE.md.
+#
+# Two-stage repo (dev -> main, no `test` tier): change `branches` below to [main].
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -48,8 +50,8 @@ jobs:
             Review thoroughly, in priority order:
               1. Correctness — logic errors, off-by-one, wrong assumptions, broken
                  control flow, data-shape mismatches between server and client.
-              2. Security — injection, secrets, auth/authorization gaps, unsafe
-                 input, missing ownership checks on writes.
+              2. Security — injection, secrets, auth/authorization gaps, IDOR,
+                 unsafe input, missing ownership checks on writes.
               3. Data integrity — cache key/versioning, race conditions, money/
                  score math, anything that could corrupt or mis-attribute data.
               4. Error handling & edge cases — empty states, nulls, failed calls,
@@ -65,12 +67,24 @@ jobs:
             Do NOT raise style, formatting, naming, praise, or speculation you
             cannot ground in the diff — at any severity.
 
+            You have NO build tooling in this job: you cannot run tsc, the test
+            suite, linters, or the build. NEVER report that any of them fail —
+            that is a hallucination and it wedges a promotion. Type and build
+            concerns are at most `low`, phrased as "worth verifying", and only
+            when visible in the diff itself. The repo's own CI check reports the
+            real build/test status.
+
             For EACH real finding: post an inline comment on the exact line
             (confirmed: true) explaining the problem and the fix.
 
-            Then you MUST write your machine-readable verdict to a file named
-            review-verdict.json in the repository root (use the Write tool), with
-            EXACTLY this schema:
+            Your single most important output is the machine-readable verdict
+            file. Write it BEFORE anything else that could exhaust your turns —
+            in particular, BEFORE posting the summary comment below. The gate
+            FAILS CLOSED if this file is missing, so it must exist even when
+            there are ZERO findings ({"verdict":"pass","findings":[]}).
+
+            Write it to a file named review-verdict.json in the repository root
+            (use the Write tool), with EXACTLY this schema:
               {
                 "verdict": "pass" | "block",
                 "findings": [
@@ -83,21 +97,31 @@ jobs:
                 severity (critical/high/medium/low).
               - verdict: "block" if ANY finding is high or critical, else "pass".
                 (The gate enforces this from severities regardless.)
-            Finally post ONE short top-level summary with
+            ONLY AFTER review-verdict.json has been written, post ONE short
+            top-level summary with
               gh pr comment ${{ github.event.pull_request.number }} --body "..."
-            (the verdict and a one-line rationale). Writing review-verdict.json is
-            mandatory — write it even when there are ZERO findings
-            ({"verdict":"pass","findings":[]}). It must be your final action.
+            (the verdict and a one-line rationale).
           claude_args: |
-            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*)"
+            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob,Write,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cat:*),Bash(ls:*)"
 
       - name: Enforce verdict
         run: |
           if [ ! -f review-verdict.json ]; then
             # No verdict file. Distinguish a real model error (fail closed) from a
             # clean review that simply didn't write the file (pass).
+            #
+            # Read is_error as a RAW value — do NOT use jq's `// "true"` fallback
+            # here. jq's `//` treats boolean false as empty, so
+            # `(.is_error) // "true"` yields "true" for a SUCCESSFUL run
+            # (is_error:false) and wedges the gate on every no-file run. Default
+            # to fail-closed only when the output is genuinely missing/unreadable
+            # (jq prints nothing or "null").
             OUT="$RUNNER_TEMP/claude-execution-output.json"
-            if [ -f "$OUT" ] && [ "$(jq -r 'if type=="array" then ([.[]|select(.type=="result")][-1].is_error) else .is_error end // "true"' "$OUT" 2>/dev/null)" = "true" ]; then
+            IS_ERR="true"
+            if [ -f "$OUT" ]; then
+              IS_ERR=$(jq -r 'if type=="array" then ([.[]|select(.type=="result")][-1].is_error) else .is_error end' "$OUT" 2>/dev/null)
+            fi
+            if [ "$IS_ERR" != "false" ]; then
               echo "::error::Review could not run (model error) — failing closed."
               exit 1
             fi
