@@ -722,7 +722,13 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   useEffect(() => {
     if (!started || draftMode !== "cpu" || isUserTurn || isDone || ranked.length === 0) return;
     const timer = setTimeout(() => {
-      const available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
+      let available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
+      // The user's "avoid" list is a personal do-not-draft preference; it must
+      // never be able to starve CPU opponents into a stall. If filtering by it
+      // empties the pool, ignore it and let the CPU pick from anyone undrafted.
+      if (available.length === 0) {
+        available = ranked.filter((p) => !draftedIds.has(p.id));
+      }
       if (available.length === 0 || currentTeamSlot === null) return;
 
       const teamPlayers = picks.filter((pick) => pick.teamSlot === currentTeamSlot).flatMap((pick) => {
@@ -2025,6 +2031,9 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
                       key={p.id}
                       onClick={() => pickPlayer(p.id)}
                       onKeyDown={(event) => {
+                        // Ignore keys that bubbled up from a nested control (the star/target
+                        // button, the Pick button): activating those must not also draft the row.
+                        if (event.target !== event.currentTarget) return;
                         if (isUserTurn && (event.key === "Enter" || event.key === " ")) {
                           event.preventDefault();
                           pickPlayer(p.id);
