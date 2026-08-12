@@ -2,6 +2,7 @@
 
 import { memo, useMemo } from "react";
 import type { Position, RankedPlayer } from "@/lib/types";
+import { POS_BADGE, UNKNOWN_BADGE } from "@/lib/ui";
 
 export interface BoardPick {
   pickNumber: number;
@@ -30,14 +31,7 @@ interface Props {
   teamNames?: Record<number, string>;
 }
 
-const POS_BADGE: Record<Position, string> = {
-  QB: "bg-rose-500/20 text-rose-300 border-rose-500/40",
-  RB: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40",
-  WR: "bg-sky-500/20 text-sky-300 border-sky-500/40",
-  TE: "bg-amber-500/20 text-amber-300 border-amber-500/40",
-  K: "bg-violet-500/20 text-violet-300 border-violet-500/40",
-  DEF: "bg-orange-500/20 text-orange-300 border-orange-500/40",
-};
+// POS_BADGE / UNKNOWN_BADGE now come from @/lib/ui (shared across screens).
 
 function pickNumForCell(round: number, slot: number, numTeams: number): number {
   const base = (round - 1) * numTeams;
@@ -63,14 +57,18 @@ const BoardCell = memo(function BoardCell({ pickNum, pick, tradedTo, isCurrent, 
     const player = playerById.get(pick.playerId);
     const name = player?.name ?? pick.playerName ?? pick.playerId;
     const pos = (player?.position ?? pick.playerPos) as Position | undefined;
-    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : undefined;
+    // Same known-position-with-fallback pattern used in MockDraft.tsx: a
+    // recognized Position gets its POS_BADGE color, anything else (e.g. a
+    // raw Sleeper metadata position string that doesn't match) falls back
+    // to the shared UNKNOWN_BADGE styling instead of hiding the badge.
+    const badgeClass = pos && pos in POS_BADGE ? POS_BADGE[pos] : UNKNOWN_BADGE;
     const displayName = lastNameOf(name);
 
     return (
       <td className={`min-w-[88px] max-w-[110px] px-1.5 py-1.5 align-top ${isUserCol ? "bg-emerald-500/5" : ""}`}>
         <div className="flex flex-col gap-0.5">
           <div className="flex items-center gap-1">
-            {pos && badgeClass && (
+            {pos && (
               <span className={`shrink-0 rounded border px-1 py-px text-[9px] font-bold ${badgeClass}`}>
                 {pos}
               </span>

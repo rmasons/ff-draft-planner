@@ -21,7 +21,9 @@ export default function AppShell() {
     if (next === mode) return;
     if (
       draftActive &&
-      !window.confirm("Leave the mock draft? Your current progress will be lost.")
+      !window.confirm(
+        "Leave this draft? A live draft connection would need to be reconnected. (In-progress mock drafts are saved and restored.)"
+      )
     ) {
       return;
     }

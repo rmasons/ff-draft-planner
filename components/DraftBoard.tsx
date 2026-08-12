@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { POSITIONS, ALL_POSITIONS } from "@/lib/types";
 import {
@@ -10,8 +10,23 @@ import {
   type Baselines,
 } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { SEASON } from "@/lib/sleeper";
+import { POS_BADGE, POS_DOT } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import ConfigPanel from "./ConfigPanel";
+import { marketReference, valueVsMarket } from "@/lib/market";
+import { assessRisk } from "@/lib/risk";
+import { fantasyPointsForStats } from "@/lib/scoring";
+import { annotationKey, EMPTY_ANNOTATION, updateAnnotation, type AnnotationStore, type PlayerAnnotation } from "@/lib/annotations";
+import {
+  validRoster,
+  validScoring,
+  validDraftedIds,
+  validBaselineMethod,
+  validAnnotationStore,
+  validAdpSnapshot,
+  type AdpSnapshot,
+} from "@/lib/validation";
 import PlayerCompare from "./PlayerCompare";
 
 type Filter = "ALL" | Position;
@@ -19,17 +34,12 @@ type SortKey = "rank" | "proj" | "vor" | "adp" | "value" | "risk";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-interface AdpSnapshot {
-  ts: number;
-  data: Record<string, number>;
-  // Which adpKey (ppr/half/std/superflex, see adpKeyFor) the snapshot's `data`
-  // was computed under. Consensus ADP differs by scoring/roster format, so a
-  // snapshot seeded under one key is meaningless compared against another —
-  // this lets us detect a format switch and rebuild instead of showing bogus
-  // trend arrows. Optional so snapshots persisted before this field existed
-  // are handled gracefully (treated as a mismatch, see trendMap below).
-  adpKey?: string;
-}
+// Typing a note updates the input's local state immediately (so it feels
+// responsive) but only commits to the shared annotation store after a short
+// pause in typing — every commit re-renders the table via `annotations` and
+// re-serializes the WHOLE store to localStorage (see useLocalStorage), so
+// batching keystrokes into one write instead of one per key is the point.
+const NOTE_COMMIT_DEBOUNCE_MS = 300;
 
 const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1,   // asc: lower = better
@@ -40,58 +50,44 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   risk: -1,  // desc: higher risk first (surface the most dangerous picks)
 };
 
-function riskScore(p: Player): number {
-  let score = 1;
-  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
-  else if (p.injuryStatus === "Out") score += 5;
-  else if (p.injuryStatus === "Doubtful") score += 4;
-  // Questionable is weighted light: this is a pre-draft tool used mostly in
-  // the summer, when "Questionable" tags are largely stale offseason noise
-  // (leftover from limited practice participation, etc.) rather than a real
-  // week-to-week game-status signal — full weight here overstates the risk.
-  else if (p.injuryStatus === "Questionable") score += 1;
-  if (p.injuryNotes?.includes("Surgery")) score += 2;
-  if (p.yearsExp === 0) score += 1;
-  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
-  return Math.min(score, 10);
-}
-
 const TIER_COLORS = [
   "#34d399", "#60a5fa", "#c084fc", "#fbbf24",
   "#fb7185", "#22d3ee", "#a3e635", "#f472b6",
 ];
 const tierColor = (tier: number) => TIER_COLORS[(tier - 1) % TIER_COLORS.length];
 
-const POS_BADGE: Record<Position, string> = {
-  QB:  "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB:  "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR:  "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE:  "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K:   "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-const POS_DOT: Record<Position, string> = {
-  QB:  "#fb7185",
-  RB:  "#34d399",
-  WR:  "#38bdf8",
-  TE:  "#fbbf24",
-  K:   "#a78bfa",
-  DEF: "#fb923c",
-};
+function SortTh({
+  label, sk, sortKey, sortDir, onSort, className, subLabel,
+}: {
+  label: string; sk: SortKey; sortKey: SortKey; sortDir: 1 | -1;
+  onSort: (key: SortKey) => void; className?: string; subLabel?: string;
+}) {
+  const active = sortKey === sk;
+  return (
+    <th aria-sort={active ? (sortDir === 1 ? "ascending" : "descending") : "none"} className={`select-none px-3 py-2 font-medium ${active ? "text-emerald-400" : "text-zinc-500"} ${className ?? ""}`}>
+      <button type="button" onClick={() => onSort(sk)} className="rounded px-1 transition hover:text-zinc-200 focus-visible:outline-2 focus-visible:outline-emerald-400">
+        {label}{subLabel && <span className="ml-1 font-normal text-zinc-600">{subLabel}</span>}
+        <span className="ml-0.5 text-[10px]">{active ? sortDir === 1 ? " ↑" : " ↓" : <span className="text-zinc-700"> ⇅</span>}</span>
+      </button>
+    </th>
+  );
+}
 
 export default function DraftBoard() {
   const [players, setPlayers] = useState<Player[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [season, setSeason] = useState<string>("");
 
-  const [scoring, setScoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING);
-  const [roster, setRoster] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
-  const [method, setMethod] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
-  const [drafted, setDrafted] = useLocalStorage<string[]>("ffdp.drafted", []);
-  const [snapshot, setSnapshot, snapshotHydrated] = useLocalStorage<AdpSnapshot | null>(
+  const [scoring, setScoring, , scoringError] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [roster, setRoster, , rosterError] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
+  const [method, setMethod, , methodError] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS", validBaselineMethod);
+  const [drafted, setDrafted, , draftedError] = useLocalStorage<string[]>("ffdp.drafted", [], validDraftedIds);
+  const [snapshot, setSnapshot, snapshotHydrated, snapshotError] = useLocalStorage<AdpSnapshot | null>(
     "ffdp.adp-snapshot",
     null,
+    validAdpSnapshot,
   );
+  const [annotations, setAnnotations, , annotationsError] = useLocalStorage<AnnotationStore>("ffdp.annotations", {}, validAnnotationStore);
 
   const [filter, setFilter] = useState<Filter>("ALL");
   const [query, setQuery] = useState("");
@@ -99,6 +95,22 @@ export default function DraftBoard() {
   const [sortKey, setSortKey] = useState<SortKey>("rank");
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [dismissedStorageNotice, setDismissedStorageNotice] = useState(false);
+
+  const storageErrors = useMemo(
+    () =>
+      (
+        [
+          ["Scoring settings", scoringError],
+          ["Roster settings", rosterError],
+          ["Ranking method", methodError],
+          ["Drafted players", draftedError],
+          ["ADP trend snapshot", snapshotError],
+          ["Player notes", annotationsError],
+        ] as [string, string | null][]
+      ).filter((entry): entry is [string, string] => entry[1] !== null),
+    [scoringError, rosterError, methodError, draftedError, snapshotError, annotationsError]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -127,49 +139,47 @@ export default function DraftBoard() {
     if (!players || !snapshotHydrated) return;
     setSnapshot((prev) => {
       const now = Date.now();
-      // Still fresh AND seeded under the currently-active adpKey → keep it.
-      // A missing adpKey (snapshot from before this field existed) or a key
-      // that doesn't match the current scoring/roster format both count as
-      // a mismatch and force a rebuild below.
-      if (prev && prev.adpKey === adpKey && now - prev.ts <= SEVEN_DAYS_MS) return prev;
+      // Still fresh AND seeded under the currently-active adpKey AND season →
+      // keep it. A missing/mismatched adpKey (format switch, or a snapshot
+      // from before this field existed) or a missing/mismatched season (a
+      // snapshot left over from a prior season — same format, stale
+      // consensus numbers) both count as a mismatch and force a rebuild.
+      if (prev && prev.adpKey === adpKey && prev.season === SEASON && now - prev.ts <= SEVEN_DAYS_MS) return prev;
       // Build a new baseline from the current consensus ADP.
       const data: Record<string, number> = {};
       for (const p of players) {
-        const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-        const es = p.adp.espn >= 999 ? null : p.adp.espn;
-        const srcs = [sl, es].filter((x): x is number => x !== null);
-        if (srcs.length > 0) {
-          data[p.id] = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-        }
+        const market = marketReference(p, scoring, roster);
+        if (market.consensus !== null) data[p.id] = market.consensus;
       }
-      return { ts: now, data, adpKey };
+      return { ts: now, data, adpKey, season: SEASON };
     });
-  }, [players, snapshotHydrated, adpKey, setSnapshot]);
+  }, [players, snapshotHydrated, adpKey, setSnapshot, scoring, roster]);
 
   // Map player_id → trend delta (positive = rising, negative = falling).
-  // Only populated when a fresh (≤7 day old) snapshot exists from a prior load.
+  // Only populated when a fresh snapshot exists from a prior load — the
+  // seeding effect above rebuilds `snapshot` as soon as it's stale (or from a
+  // mismatched adpKey), so `snapshot` itself is the freshness signal; reading
+  // Date.now() again here would be an impure call during render.
   const trendMap = useMemo<Record<string, number>>(() => {
     if (!players || !snapshot || !snapshotHydrated) return {};
-    if (Date.now() - snapshot.ts > SEVEN_DAYS_MS) return {};
     // Snapshot was seeded under a different adpKey (format switch, or an old
-    // snapshot from before adpKey was tracked) — its ADP values aren't
-    // comparable to the current consensus, so bail out rather than show
-    // bogus trend arrows. The seeding effect above will rebuild it shortly.
-    if (snapshot.adpKey !== adpKey) return {};
+    // snapshot from before adpKey was tracked) or a different season (a
+    // snapshot left over from a prior season, or from before season was
+    // tracked) — its ADP values aren't comparable to the current consensus,
+    // so bail out rather than show bogus trend arrows. The seeding effect
+    // above will rebuild it shortly.
+    if (snapshot.adpKey !== adpKey || snapshot.season !== SEASON) return {};
     const map: Record<string, number> = {};
     for (const p of players) {
       const snapAdp = snapshot.data[p.id];
       if (snapAdp === undefined) continue;
-      const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-      const es = p.adp.espn >= 999 ? null : p.adp.espn;
-      const srcs = [sl, es].filter((x): x is number => x !== null);
-      if (srcs.length === 0) continue;
-      const currentConsensus = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      const currentConsensus = marketReference(p, scoring, roster).consensus;
+      if (currentConsensus === null) continue;
       // Positive → snapshotAdp was higher → player is now drafted earlier → rising
       map[p.id] = snapAdp - currentConsensus;
     }
     return map;
-  }, [players, snapshot, snapshotHydrated, adpKey]);
+  }, [players, snapshot, snapshotHydrated, adpKey, scoring, roster]);
 
   const { ranked, baselines } = useMemo(() => {
     if (!players) return { ranked: [] as RankedPlayer[], baselines: null as Baselines | null };
@@ -211,61 +221,72 @@ export default function DraftBoard() {
         case "vor":
           return (a.vbd - b.vbd) * sortDir;
         case "adp": {
-          const va = a.adp[adpKey] >= 999 ? null : a.adp[adpKey];
-          const vb = b.adp[adpKey] >= 999 ? null : b.adp[adpKey];
+          const va = marketReference(a, scoring, roster).consensus;
+          const vb = marketReference(b, scoring, roster).consensus;
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
           return (va - vb) * sortDir;
         }
         case "value": {
-          const getVal = (p: RankedPlayer): number | null => {
-            // K/DEF overallRank is forced to the bottom of the board by
-            // design (see rankPlayers in lib/vbd.ts), so consensus ADP minus
-            // overallRank is always a huge, meaningless negative number for
-            // them. Treat as "no value" so they group with the other
-            // no-value players instead of dragging the value sort down.
-            if (p.position === "K" || p.position === "DEF") return null;
-            const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-            const es = p.adp.espn >= 999 ? null : p.adp.espn;
-            const srcs = [sl, es].filter((x): x is number => x !== null);
-            if (!srcs.length) return null;
-            const consensus = srcs.reduce((acc, n) => acc + n, 0) / srcs.length;
-            return consensus - p.overallRank;
-          };
-          const va = getVal(a);
-          const vb = getVal(b);
+          // Returns null for K/DEF (their overallRank is forced to the bottom
+          // of the board by design, see rankPlayers in lib/vbd.ts, so ADP
+          // minus overallRank would be a huge, meaningless negative number)
+          // and for players with no consensus ADP data.
+          const va = valueVsMarket(a, scoring, roster);
+          const vb = valueVsMarket(b, scoring, roster);
           if (va === null && vb === null) return 0;
           if (va === null) return 1;
           if (vb === null) return -1;
           return (va - vb) * sortDir;
         }
         case "risk":
-          return (riskScore(a) - riskScore(b)) * sortDir;
+          return (assessRisk(a).score - assessRisk(b).score) * sortDir;
         default:
           return 0;
       }
     });
 
     return hideDrafted ? sorted.filter((p) => !draftedSet.has(p.id)) : sorted;
-  }, [ranked, filter, query, hideDrafted, draftedSet, sortKey, sortDir, adpKey]);
+  }, [ranked, filter, query, hideDrafted, draftedSet, sortKey, sortDir, scoring, roster]);
 
-  const toggleDrafted = (id: string) =>
-    setDrafted((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+  // useCallback (not a plain closure) so this reference is stable across
+  // DraftBoard renders — setDrafted itself is a stable useState setter, so
+  // the only dependency never changes. Passed straight through to the
+  // memoized Row below; a fresh closure every render would defeat that memo
+  // for every row, every render.
+  const toggleDrafted = useCallback(
+    (id: string) =>
+      setDrafted((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+      ),
+    [setDrafted]
+  );
 
   // Toggle a player in/out of the compare panel (max 3).
   // When a removal would leave fewer than 2 players, clear the list (closes modal).
-  const toggleCompare = (id: string) =>
-    setCompareIds((prev) => {
-      if (prev.includes(id)) {
-        const next = prev.filter((x) => x !== id);
-        return next.length < 2 ? [] : next;
-      }
-      if (prev.length >= 3) return prev;
-      return [...prev, id];
-    });
+  // useCallback for the same identity-stability reason as toggleDrafted above.
+  const toggleCompare = useCallback(
+    (id: string) =>
+      setCompareIds((prev) => {
+        if (prev.includes(id)) {
+          const next = prev.filter((x) => x !== id);
+          return next.length < 2 ? [] : next;
+        }
+        if (prev.length >= 3) return prev;
+        return [...prev, id];
+      }),
+    [setCompareIds]
+  );
+
+  // Same identity-stability reasoning: setAnnotations is a stable useState
+  // setter, so this callback never changes reference, so passing it to every
+  // Row never defeats React.memo.
+  const handleAnnotation = useCallback(
+    (id: string, patch: Partial<PlayerAnnotation>) =>
+      setAnnotations((prev) => updateAnnotation(prev, SEASON, id, patch)),
+    [setAnnotations]
+  );
 
   // Tier dividers and replacement line only make sense on the default rank sort.
   const isRankSort = sortKey === "rank" && sortDir === 1;
@@ -274,35 +295,58 @@ export default function DraftBoard() {
       ? baselines[filter].rank
       : null;
 
-  function SortTh({
-    label,
-    sk,
-    className,
-    subLabel,
-  }: {
-    label: string;
-    sk: SortKey;
-    className?: string;
-    subLabel?: string;
-  }) {
-    const active = sortKey === sk;
-    return (
-      <th
-        onClick={() => handleSort(sk)}
-        className={`cursor-pointer select-none px-3 py-2 font-medium transition hover:text-zinc-200 ${
-          active ? "text-emerald-400" : "text-zinc-500"
-        } ${className ?? ""}`}
-      >
-        {label}
-        {subLabel && <span className="ml-1 font-normal text-zinc-600">{subLabel}</span>}
-        <span className="ml-0.5 text-[10px]">
-          {active
-            ? sortDir === 1 ? " ↑" : " ↓"
-            : <span className="text-zinc-700"> ⇅</span>}
-        </span>
-      </th>
-    );
-  }
+  // Per-row derived values (market reference, value-vs-market, risk, tier/
+  // replacement dividers), hoisted out of the JSX map and memoized. These
+  // used to be recomputed for every one of ~1000 rows on *every* DraftBoard
+  // render — including a render triggered by editing a single row's note,
+  // since that inline `rows.map(...)` in JSX ran unconditionally regardless
+  // of whether `rows` itself had changed. `annotations` is deliberately not
+  // a dependency here (same as it isn't for `rows`), so an annotation-only
+  // re-render is a cache hit and does zero per-row work.
+  const rowData = useMemo(
+    () =>
+      rows.map((p, i) => {
+        const prev = rows[i - 1];
+        // Single-position: break on any tier change (including first row).
+        // ALL positions: break only when consecutive same-position players
+        // change tier — avoids spurious breaks across different positions.
+        const tierBreak =
+          !query.trim() &&
+          isRankSort &&
+          (filter !== "ALL"
+            ? !prev || prev.tier !== p.tier
+            : !!prev && prev.position === p.position && prev.tier !== p.tier);
+        // replRank is the replacement player's OWN 1-based positional rank
+        // (baselines[filter].rank), so the divider must break AT that rank —
+        // the replacement player is the first row below the line — not one
+        // row later. Using `> replRank` here drew the line one player too late.
+        const replBreak =
+          replRank !== null &&
+          p.posRank >= replRank &&
+          (!prev || prev.posRank < replRank);
+        const market = marketReference(p, scoring, roster);
+        // valueVsMarket returns null for K/DEF (forced to the bottom of the
+        // board by design, see rankPlayers in lib/vbd.ts) and for players
+        // with no consensus ADP data.
+        const value = valueVsMarket(p, scoring, roster);
+        const risk = assessRisk(p);
+        return {
+          p,
+          rank: filter === "ALL" ? p.overallRank : p.posRank,
+          adp: market.sleeper,
+          espnAdp: market.espn,
+          value,
+          risk: risk.score,
+          riskExplanation: `${risk.factors.join("; ")} · ${risk.confidence} confidence estimate`,
+          actualPoints: p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null,
+          trend: trendMap[p.id] ?? 0,
+          isDrafted: draftedSet.has(p.id),
+          tierBreak,
+          replBreak,
+        };
+      }),
+    [rows, filter, query, isRankSort, replRank, scoring, roster, trendMap, draftedSet]
+  );
 
   return (
     <div className="flex flex-col gap-6 lg:flex-row">
@@ -319,6 +363,31 @@ export default function DraftBoard() {
       />
 
       <main className="min-w-0 flex-1">
+        {storageErrors.length > 0 && !dismissedStorageNotice && (
+          <div className="mb-4 flex items-start justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+            <div>
+              <p className="font-medium">Some saved data couldn&apos;t be loaded and was reset:</p>
+              <ul className="mt-1 list-disc pl-5 text-amber-300/90">
+                {storageErrors.map(([label, message]) => (
+                  <li key={label}>
+                    {label}: {message}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-1 text-xs text-amber-300/70">
+                The original saved value(s) were kept in a backup key (same name plus &quot;.corrupt&quot;) in case you need to recover them.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDismissedStorageNotice(true)}
+              className="shrink-0 rounded px-2 py-1 text-xs text-amber-300 underline hover:text-amber-100"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {/* Baseline summary — skill positions only */}
         {baselines && (
           <div className="mb-4 rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
@@ -403,82 +472,51 @@ export default function DraftBoard() {
         )}
 
         {players && (
-          <div className="overflow-hidden rounded-xl border border-zinc-800">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800" tabIndex={0} aria-label="Draft rankings table">
+            <table className="min-w-[940px] w-full text-sm">
               <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                 <tr>
-                  <SortTh label="#" sk="rank" className="text-left" />
+                  <SortTh label="#" sk="rank" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-left" />
                   <th className="px-3 py-2 text-left font-medium text-zinc-500">Player</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Pos</th>
                   <th className="px-2 py-2 text-center font-medium text-zinc-500">Tier</th>
-                  <SortTh label="Proj" sk="proj" className="text-right" />
+                  <SortTh label="Proj" sk="proj" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
                   <th
                     className="px-3 py-2 text-right font-medium text-zinc-500"
-                    title="2025 season total, PPR scoring"
+                    title="2025 season total, scored under your active scoring settings"
                   >
                     2025
                   </th>
-                  <SortTh label="VOR" sk="vor" className="text-right" />
-                  <SortTh label="ADP" sk="adp" className="text-right" subLabel="SL·ESPN" />
-                  <SortTh label="Val" sk="value" className="text-right" />
-                  <SortTh label="Risk" sk="risk" className="text-center" />
+                  <SortTh label="VOR" sk="vor" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                  <SortTh label="ADP" sk="adp" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" subLabel={adpKey === "ppr" ? "SL·ESPN" : "Sleeper"} />
+                  <SortTh label="Val" sk="value" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-right" />
+                  <SortTh label="Risk" sk="risk" sortKey={sortKey} sortDir={sortDir} onSort={handleSort} className="text-center" />
                   <th className="px-2 py-2 text-center font-medium text-zinc-500"></th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((p, i) => {
-                  const prev = rows[i - 1];
-                  // Single-position: break on any tier change (including first row).
-                  // ALL positions: break only when consecutive same-position players
-                  // change tier — avoids spurious breaks across different positions.
-                  const tierBreak =
-                    !query.trim() &&
-                    isRankSort &&
-                    (filter !== "ALL"
-                      ? !prev || prev.tier !== p.tier
-                      : !!prev && prev.position === p.position && prev.tier !== p.tier);
-                  const replBreak =
-                    replRank !== null &&
-                    p.posRank > replRank &&
-                    (!prev || prev.posRank <= replRank);
-                  const isDrafted = draftedSet.has(p.id);
-                  const adpRaw = p.adp[adpKey];
-                  const adpDisplay = adpRaw >= 999 ? null : adpRaw;
-                  const espnAdp = p.adp.espn >= 999 ? null : p.adp.espn;
-                  const adpSources = [adpDisplay, espnAdp].filter((x): x is number => x !== null);
-                  const consensusAdp = adpSources.length > 0
-                    ? adpSources.reduce((a, b) => a + b, 0) / adpSources.length
-                    : null;
-                  // K/DEF overallRank is forced to the bottom by design (see
-                  // rankPlayers), so Val would always read as a huge, bogus
-                  // negative number for them — show "—" instead.
-                  const value =
-                    p.position === "K" || p.position === "DEF"
-                      ? null
-                      : consensusAdp !== null
-                      ? consensusAdp - p.overallRank
-                      : null;
-                  const risk = riskScore(p);
-                  const trend = trendMap[p.id] ?? 0;
-                  return (
-                    <Row
-                      key={p.id}
-                      p={p}
-                      rank={filter === "ALL" ? p.overallRank : p.posRank}
-                      adp={adpDisplay}
-                      espnAdp={espnAdp}
-                      value={value}
-                      risk={risk}
-                      trend={trend}
-                      isDrafted={isDrafted}
-                      tierBreak={tierBreak}
-                      replBreak={replBreak}
-                      onToggle={() => toggleDrafted(p.id)}
-                      inCompare={compareIds.includes(p.id)}
-                      onCompare={() => toggleCompare(p.id)}
-                    />
-                  );
-                })}
+                {rowData.map((r) => (
+                  <Row
+                    key={r.p.id}
+                    p={r.p}
+                    rank={r.rank}
+                    adp={r.adp}
+                    espnAdp={r.espnAdp}
+                    value={r.value}
+                    risk={r.risk}
+                    riskExplanation={r.riskExplanation}
+                    actualPoints={r.actualPoints}
+                    annotation={annotations[annotationKey(SEASON, r.p.id)] ?? EMPTY_ANNOTATION}
+                    onAnnotation={handleAnnotation}
+                    trend={r.trend}
+                    isDrafted={r.isDrafted}
+                    tierBreak={r.tierBreak}
+                    replBreak={r.replBreak}
+                    onToggle={toggleDrafted}
+                    inCompare={compareIds.includes(r.p.id)}
+                    onCompare={toggleCompare}
+                  />
+                ))}
                 {rows.length === 0 && (
                   <tr>
                     <td colSpan={11} className="px-3 py-8 text-center text-zinc-500">
@@ -502,6 +540,8 @@ export default function DraftBoard() {
       {compareIds.length >= 2 && (
         <PlayerCompare
           players={ranked.filter((p) => compareIds.includes(p.id))}
+          scoring={scoring}
+          roster={roster}
           onClose={() => setCompareIds([])}
           onRemove={(id) =>
             setCompareIds((prev) => {
@@ -515,13 +555,36 @@ export default function DraftBoard() {
   );
 }
 
-function Row({
+// Memoized so that an annotation edit on ONE row (e.g. typing a note) doesn't
+// re-render all ~1000 other rows. This only pays off because every prop
+// passed in from DraftBoard is identity-stable across an annotation-only
+// re-render:
+//  - p: from the memoized `ranked`/`rows`/`rowData` chain, which doesn't
+//    depend on `annotations` — same object reference.
+//  - rank/adp/espnAdp/value/risk/riskExplanation/actualPoints/trend/
+//    isDrafted/tierBreak/replBreak: primitives (or a string, which JS always
+//    compares by value), sourced from the memoized `rowData` — same values.
+//  - annotation: `annotations[key] ?? EMPTY_ANNOTATION`. EMPTY_ANNOTATION is
+//    a module-level constant, so untouched rows always get that exact
+//    reference. For a row that previously had a note, updateAnnotation
+//    (lib/annotations.ts) does `{ ...store, [key]: next }` — every *other*
+//    key's value is carried over unchanged, so only the edited row's
+//    `annotation` object identity actually changes.
+//  - onAnnotation/onToggle/onCompare: useCallback-wrapped in DraftBoard with
+//    only stable useState setters as deps, so they never change reference.
+// A plain inline arrow function or freshly-built object for any of these
+// would defeat memo(); none of them are.
+const Row = memo(function Row({
   p,
   rank,
   adp,
   espnAdp,
   value,
   risk,
+  riskExplanation,
+  actualPoints,
+  annotation,
+  onAnnotation,
   trend,
   isDrafted,
   tierBreak,
@@ -536,16 +599,79 @@ function Row({
   espnAdp: number | null;
   value: number | null;
   risk: number;
+  riskExplanation: string;
+  actualPoints: number | null;
+  annotation: PlayerAnnotation;
+  onAnnotation: (id: string, patch: Partial<PlayerAnnotation>) => void;
   trend: number;
   isDrafted: boolean;
   tierBreak: boolean;
   replBreak: boolean;
-  onToggle: () => void;
+  onToggle: (id: string) => void;
   inCompare: boolean;
-  onCompare: () => void;
+  onCompare: (id: string) => void;
 }) {
   const riskColor =
     risk >= 7 ? "text-rose-400" : risk >= 4 ? "text-amber-400" : "text-emerald-400";
+
+  // Local buffer for the note text so typing feels instant even though the
+  // commit to the shared annotation store is debounced (see
+  // NOTE_COMMIT_DEBOUNCE_MS above — every commit re-serializes the WHOLE
+  // annotation store to localStorage via useLocalStorage). Target/avoid
+  // still commit immediately through `annotation` — they're infrequent
+  // clicks, not the perf problem.
+  const [localNote, setLocalNoteState] = useState(annotation.note);
+  const localNoteRef = useRef(annotation.note);
+  // Last note value *this row* itself sent to the store. Lets the sync
+  // effect below tell "the store changed under us" (e.g. localStorage
+  // hydration finishing after mount) apart from "the store just caught up
+  // with what we typed" — only the former should overwrite an in-progress
+  // local edit.
+  const lastSentNoteRef = useRef(annotation.note);
+  const noteTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setLocalNote = (value: string) => {
+    localNoteRef.current = value;
+    setLocalNoteState(value);
+  };
+
+  useEffect(() => {
+    if (annotation.note !== lastSentNoteRef.current) {
+      lastSentNoteRef.current = annotation.note;
+      setLocalNote(annotation.note);
+    }
+  }, [annotation.note]);
+
+  const commitNote = () => {
+    if (noteTimeoutRef.current !== null) {
+      clearTimeout(noteTimeoutRef.current);
+      noteTimeoutRef.current = null;
+    }
+    lastSentNoteRef.current = localNoteRef.current;
+    onAnnotation(p.id, { note: localNoteRef.current });
+  };
+
+  // Flush a pending debounced write on unmount — e.g. the row scrolls out of
+  // a filtered/searched view mid-keystroke — so the last keystrokes before
+  // that aren't silently dropped.
+  useEffect(() => {
+    return () => {
+      if (noteTimeoutRef.current !== null) commitNote();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally mount/unmount only; commitNote reads current values via refs
+  }, []);
+
+  function handleNoteChange(event: ChangeEvent<HTMLInputElement>) {
+    const value = event.target.value;
+    setLocalNote(value);
+    if (noteTimeoutRef.current !== null) clearTimeout(noteTimeoutRef.current);
+    noteTimeoutRef.current = setTimeout(commitNote, NOTE_COMMIT_DEBOUNCE_MS);
+  }
+
+  function handleNoteBlur() {
+    if (noteTimeoutRef.current !== null) commitNote();
+  }
+
   return (
     <>
       {replBreak && (
@@ -554,7 +680,7 @@ function Row({
             colSpan={11}
             className="border-y border-dashed border-zinc-600 bg-zinc-800/40 px-3 py-1 text-center text-[11px] font-semibold uppercase tracking-widest text-zinc-400"
           >
-            ▼ Replacement level · players below have negative VOR
+            ▼ Replacement level · replacement band starts here
           </td>
         </tr>
       )}
@@ -602,6 +728,11 @@ function Row({
               </span>
             ) : null}
           </div>
+          <div className="mt-1 flex max-w-md items-center gap-1">
+            <button type="button" aria-pressed={annotation.target} onClick={() => onAnnotation(p.id, { target: !annotation.target })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.target ? "border-amber-400/50 text-amber-400" : "border-zinc-700 text-zinc-600"}`}>Target</button>
+            <button type="button" aria-pressed={annotation.avoid} onClick={() => onAnnotation(p.id, { avoid: !annotation.avoid, target: annotation.avoid ? annotation.target : false })} className={`rounded border px-1.5 py-0.5 text-[10px] ${annotation.avoid ? "border-rose-400/50 text-rose-400" : "border-zinc-700 text-zinc-600"}`}>Avoid</button>
+            <input aria-label={`Note for ${p.name}`} value={localNote} onChange={handleNoteChange} onBlur={handleNoteBlur} placeholder="Note…" className="min-w-0 flex-1 rounded border border-zinc-800 bg-zinc-950 px-1.5 py-0.5 text-[10px] text-zinc-300 placeholder-zinc-700 focus:border-emerald-500 focus:outline-none" />
+          </div>
         </td>
         <td className="px-2 py-2 text-center">
           <span
@@ -622,8 +753,8 @@ function Row({
           {p.points.toFixed(1)}
         </td>
         <td className="px-3 py-2 text-right tabular-nums">
-          {p.actualPts2025 != null
-            ? <span className="text-zinc-400">{p.actualPts2025.toFixed(1)}</span>
+          {actualPoints != null
+            ? <span className="text-zinc-400">{actualPoints.toFixed(1)}</span>
             : <span className="text-zinc-600">—</span>}
         </td>
         <td
@@ -663,13 +794,13 @@ function Row({
             ? value.toFixed(1)
             : "~0"}
         </td>
-        <td className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
+        <td title={riskExplanation} className={`px-3 py-2 text-center tabular-nums font-semibold ${riskColor}`}>
           {risk}
         </td>
         <td className="px-2 py-2 text-center">
           <div className="flex items-center justify-center gap-1.5">
             <button
-              onClick={onToggle}
+              onClick={() => onToggle(p.id)}
               className={`rounded-md border px-2 py-1 text-xs transition ${
                 isDrafted
                   ? "border-zinc-700 text-zinc-500 hover:text-zinc-300"
@@ -679,7 +810,7 @@ function Row({
               {isDrafted ? "Undo" : "Draft"}
             </button>
             <button
-              onClick={onCompare}
+              onClick={() => onCompare(p.id)}
               title={inCompare ? "Remove from compare" : "Add to compare"}
               className={`text-base leading-none transition ${
                 inCompare ? "text-sky-400" : "text-zinc-600 hover:text-sky-400"
@@ -692,4 +823,5 @@ function Row({
       </tr>
     </>
   );
-}
+});
+Row.displayName = "Row";

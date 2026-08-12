@@ -1,39 +1,12 @@
 "use client";
 
-import type { Player, Position, RankedPlayer } from "@/lib/types";
+import type { RankedPlayer, RosterConfig, ScoringConfig } from "@/lib/types";
+import { marketReference, valueVsMarket } from "@/lib/market";
+import { assessRisk } from "@/lib/risk";
+import { fantasyPointsForStats } from "@/lib/scoring";
+import { POS_BADGE } from "@/lib/ui";
 
-// ---------- helpers (not exported from DraftBoard — duplicated here) ----------
-
-function riskScore(p: Player): number {
-  let score = 1;
-  if (p.injuryStatus === "IR" || p.injuryStatus === "PUP") score += 7;
-  else if (p.injuryStatus === "Out") score += 5;
-  else if (p.injuryStatus === "Doubtful") score += 4;
-  else if (p.injuryStatus === "Questionable") score += 2;
-  if (p.injuryNotes?.includes("Surgery")) score += 2;
-  if (p.yearsExp === 0) score += 1;
-  if (p.yearsExp !== null && p.yearsExp >= 10) score += 1;
-  return Math.min(score, 10);
-}
-
-const POS_BADGE: Record<Position, string> = {
-  QB:  "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB:  "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR:  "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE:  "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K:   "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-
-/** Consensus ADP (Sleeper PPR + ESPN avg) and value-over-ADP. */
-function adpAndVal(p: RankedPlayer): { adp: number | null; val: number | null } {
-  const sl = p.adp.ppr >= 999 ? null : p.adp.ppr;
-  const es = p.adp.espn >= 999 ? null : p.adp.espn;
-  const srcs = [sl, es].filter((x): x is number => x !== null);
-  if (srcs.length === 0) return { adp: null, val: null };
-  const adp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
-  return { adp, val: adp - p.overallRank };
-}
+// ---------- helpers ----------
 
 /**
  * Returns the set of indices tied for best (max or min).
@@ -84,17 +57,31 @@ function StatRow({
 
 export interface Props {
   players: RankedPlayer[];
+  // The caller's current scoring/roster format, matching what fed rankPlayers
+  // (see marketReference/valueVsMarket in lib/market.ts). Without this,
+  // ADP/value here would silently assume one format even in
+  // superflex/half/standard leagues.
+  scoring: ScoringConfig;
+  roster: RosterConfig;
   onClose: () => void;
   onRemove: (id: string) => void;
 }
 
-export default function PlayerCompare({ players, onClose, onRemove }: Props) {
+export default function PlayerCompare({ players, scoring, roster, onClose, onRemove }: Props) {
   // Pre-compute derived stats once per player.
-  const stats = players.map((p) => ({ risk: riskScore(p), ...adpAndVal(p) }));
+  const stats = players.map((p) => ({
+    risk: assessRisk(p).score,
+    adp: marketReference(p, scoring, roster).consensus,
+    val: valueVsMarket(p, scoring, roster),
+    // Recompute from raw stats under the ACTIVE scoring config, matching how
+    // DraftBoard renders "2025 Actual" — the stored actualPts2025 field is a
+    // legacy PPR-only total and would be wrong for std/half-PPR leagues.
+    actual: p.actualStats2025 ? fantasyPointsForStats(p.position, p.actualStats2025, scoring) : null,
+  }));
 
   // Best-value index sets for each highlightable stat row.
   const bestProj   = bestIdx(players.map((p) => p.points),        "max");
-  const bestActual = bestIdx(players.map((p) => p.actualPts2025), "max");
+  const bestActual = bestIdx(stats.map((s) => s.actual),          "max");
   const bestVor    = bestIdx(players.map((p) => p.vbd),           "max");
   const bestRank   = bestIdx(players.map((p) => p.overallRank),   "min");
   const bestVal    = bestIdx(stats.map((s) => s.val),             "max");
@@ -163,7 +150,7 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 label="Proj"
                 highlight={bestProj}
                 cells={players.map((p) => (
-                  <span className="text-zinc-200">{p.points.toFixed(1)}</span>
+                  <span key={p.id} className="text-zinc-200">{p.points.toFixed(1)}</span>
                 ))}
               />
 
@@ -171,11 +158,11 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
               <StatRow
                 label="2025 Actual"
                 highlight={bestActual}
-                cells={players.map((p) =>
-                  p.actualPts2025 != null ? (
-                    <span className="text-zinc-400">{p.actualPts2025.toFixed(1)}</span>
+                cells={stats.map((s, i) =>
+                  s.actual != null ? (
+                    <span key={players[i].id} className="text-zinc-400">{s.actual.toFixed(1)}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={players[i].id} className="text-zinc-600">—</span>
                   )
                 )}
               />
@@ -185,7 +172,7 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 label="VOR"
                 highlight={bestVor}
                 cells={players.map((p) => (
-                  <span className={`font-medium ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
+                  <span key={p.id} className={`font-medium ${p.vbd > 0 ? "text-emerald-400" : "text-zinc-500"}`}>
                     {p.vbd > 0 ? "+" : ""}
                     {p.vbd.toFixed(1)}
                   </span>
@@ -197,7 +184,7 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 label="Overall Rank"
                 highlight={bestRank}
                 cells={players.map((p) => (
-                  <span className="text-zinc-300">#{p.overallRank}</span>
+                  <span key={p.id} className="text-zinc-300">#{p.overallRank}</span>
                 ))}
               />
 
@@ -270,9 +257,9 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.bye != null ? (
-                    <span className="text-zinc-400">{p.bye}</span>
+                    <span key={p.id} className="text-zinc-400">{p.bye}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />
@@ -283,9 +270,9 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.injuryStatus ? (
-                    <span className="text-amber-400 text-xs">{p.injuryStatus}</span>
+                    <span key={p.id} className="text-amber-400 text-xs">{p.injuryStatus}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />
@@ -296,11 +283,11 @@ export default function PlayerCompare({ players, onClose, onRemove }: Props) {
                 highlight={noHighlight}
                 cells={players.map((p) =>
                   p.yearsExp === 0 ? (
-                    <span className="text-amber-400 text-xs">Rookie</span>
+                    <span key={p.id} className="text-amber-400 text-xs">Rookie</span>
                   ) : p.yearsExp !== null ? (
-                    <span className="text-zinc-400 text-xs">Yr {p.yearsExp + 1}</span>
+                    <span key={p.id} className="text-zinc-400 text-xs">Yr {p.yearsExp + 1}</span>
                   ) : (
-                    <span className="text-zinc-600">—</span>
+                    <span key={p.id} className="text-zinc-600">—</span>
                   )
                 )}
               />

@@ -1,21 +1,15 @@
-# DraftBoard — Session Handoff
+# DraftBoard — Maintainer Handoff
+
+## Current state
 
 > Working doc for a future Claude (or human) session picking up this project.
-> Last updated: docs refresh pass verifying against the shipped feature set
-> (K/DEF, byes, ESPN ADP, Mock Draft, Auction, Sleeper league import, ADP
-> trends, risk scores, player comparison, scarcity chart, promotion pipeline).
+> Last updated: roadmap correctness pass (market/risk/persistence/validation
+> engine work) reconciled with the parallel `dev` cluster fixes (PlayerCompare,
+> ScarcityChart, shared UI/badge helpers, promotion pipeline docs).
 
-## TL;DR
+DraftBoard is a Next.js 16.2.9 / React 19 / TypeScript application covering cheat-sheet, snake/mock/live REST sync, and auction workflows. The active data season is derived from today's date (`lib/sleeper.ts`, `SEASON`); raw 2025 stats provide the comparison column, scored under the active league settings. No deployment was performed.
 
-A polished **fantasy football draft toolkit** (Walter Picks–style cheat sheet,
-plus mock and auction draft simulators). Pulls live 2026 player projections
-from Sleeper's free API, enriches with ESPN ADP and 2025 actuals, and computes
-**fantasy points, VOR (value over replacement), and tiers** for *your* exact
-scoring and roster settings. Next.js + TypeScript, deployed on GitHub with a
-staged promotion pipeline.
-
-**Status:** Well past v1. All the "pending work" from the original scaffolding
-session has shipped (see "What's actually left" below for what remains).
+Before changing Next.js APIs, read the relevant bundled guide in `node_modules/next/dist/docs/` as required by `AGENTS.md`.
 
 ## Location & git
 
@@ -28,57 +22,59 @@ session has shipped (see "What's actually left" below for what remains).
   review (`.github/workflows/promotion-review.yml`) plus a build/typecheck
   check (`.github/workflows/build.yml`) — both required by branch protection
   on `test` and `main`.
-- Work is committed as it lands — this is not an uncommitted-working-tree
-  project anymore. Check `git log --oneline` and `git branch -a` for current
-  state; there are typically several short-lived `worktree-agent-*` /
-  `fix/*` branches from parallel agent sessions in flight.
 - **Never push directly to `test` or `main`** — always go through a PR so the
   blocking review runs.
 
 ## Stack
 
 - Next.js **16.2.9** (App Router, Turbopack), React **19**, TypeScript, Tailwind **v4**.
-- Node **26**, npm **11**.
 - ⚠️ Next 16 ships an `AGENTS.md` warning of breaking changes; bundled docs live in
   `node_modules/next/dist/docs/`. Read those before using unfamiliar APIs.
 - Tailwind v4 is CSS-based: `@import "tailwindcss"` + `@theme inline` in
   `app/globals.css` (no `tailwind.config.js`).
 
-## Product decisions (locked with the user)
+## Maintenance commands
 
-| Decision | Choice |
-|---|---|
-| Core feature | Pre-draft cheat sheet **plus** mock draft and auction simulators |
-| Scoring/roster | **Fully configurable** from day one, importable from a real Sleeper league |
-| Data source | Sleeper free API (no key) + ESPN ADP (no key) |
-| Tech | Polished TS web app, deployed via the `dev → test → main` pipeline |
-| VOR baseline | Switchable: VOLS default + VORP, baselines shown in UI |
+```bash
+npm run dev
+npm test
+npm run test:coverage
+npm run lint
+npm run build
+npm run release:check
+```
 
-**User context:** Mason works in Python + T-SQL and does **not** know JS/TS. He
-explicitly chose the TS app anyway — so *we* own/maintain the TypeScript; don't
-hand him TS to debug. Keep code clearly commented.
+The release command validates required Sleeper data, unique IDs, supported positions, season, and a non-empty pool. ESPN and history are optional and reported through source flags.
 
 ## Architecture
 
 | File | Role |
 |---|---|
 | `lib/types.ts` | Domain types: `Player`, `ScoringConfig`, `RosterConfig`, `RankedPlayer`, `Position` (`QB/RB/WR/TE/K/DEF`) |
-| `lib/sleeper.ts` | Fetch + normalize Sleeper projections; `SEASON` constant; in-module 12h memo; 2025 actuals fetch |
-| `lib/sleeper-league.ts` | Sleeper user/league lookup; `mapLeagueToConfig` maps a league's scoring/roster settings onto our config; `fetchKeptPlayerIds` for keeper/dynasty leagues |
-| `lib/espn.ts` | Fetch + normalize ESPN ADP (12h memo), fuzzy name matching (`normalizeName`) |
+| `lib/sleeper.ts` | Fetch + normalize Sleeper projections; `SEASON` constant (derived from today's date); in-module 12h memo; raw 2025 stats fetch |
+| `lib/sleeper-league.ts` | Sleeper user/league lookup; `mapLeagueToConfig` maps a league's scoring/roster settings onto our config; `fetchKeptPlayerIds` for keeper/dynasty leagues; `fetchLeagueKeepers` resolves keepers with team slot + round (draft board preferred, league rosters as fallback); `inferKeeperRoundConvention` reads the keep cost off the previous season's draft when rosters supplied no round |
+| `lib/espn.ts` | Fetch + normalize ESPN ADP (12h memo), fuzzy name matching (`normalizeName`, strips trailing Jr./Sr./II-IV suffixes) |
 | `lib/byes.ts` | 2026 team → bye week static map (filled) |
-| `lib/scoring.ts` | `fantasyPoints(player, scoring)` — raw stats → points; K/DEF use Sleeper's precomputed `pts_std` |
-| `lib/vbd.ts` | VOR engine: greedy replacement levels, tiers, `rankPlayers()`; K/DEF get a simple 1-starter-per-team baseline and are appended after skill positions in overall rank |
+| `lib/scoring.ts` | `fantasyPoints`/`fantasyPointsForStats` — raw stats → points under a scoring config; K/DEF use Sleeper's precomputed `pts_std` |
+| `lib/vbd.ts` | VOR engine: greedy replacement levels, tiers, `rankPlayers()`; replacement is always the first undrafted player (all positions, including K/DEF) |
+| `lib/market.ts` | `marketReference()`/`valueVsMarket()` — format-compatible consensus ADP (Sleeper authoritative outside PPR; ESPN supplements PPR only) and value-vs-market, shared by every screen |
+| `lib/risk.ts` | `assessRisk()` — evidence-based risk score with explainable factors + a confidence level |
+| `lib/draft.ts` | Snake-draft domain: pick/slot math, roster-slot assignment, CPU pick selection, grading, keeper value, positional runs, survival estimate, the draft status state machine |
+| `lib/auction.ts` | Auction budget/legality/suggested-value math ($1-per-open-slot reserves, hard max bid) |
+| `lib/annotations.ts` | Target/avoid/note annotations, keyed by season + player ID |
+| `lib/validation.ts` | Bounds-checked scoring/roster config validation |
+| `lib/persistence.ts` | Versioned `{ version, data }` browser-storage envelope, with migration from legacy unversioned shapes |
+| `lib/ui.ts` | Shared Tailwind class maps for position badges/dots, used across every screen |
 | `lib/presets.ts` | Scoring/roster presets + `adpKeyFor()` |
-| `app/api/players/route.ts` | GET → normalized, enriched player pool as JSON (Sleeper + ESPN ADP + 2025 actuals, merged in parallel; ESPN/actuals failures are non-fatal) |
+| `app/api/players/route.ts` | GET → normalized, enriched player pool as JSON (Sleeper + ESPN ADP + 2025 actuals, merged in parallel; ESPN/actuals failures are non-fatal); `unstable_cache` + shared CDN freshness headers |
 | `components/AppShell.tsx` | Tab switcher: Cheat Sheet / Mock Draft / Auction |
-| `components/DraftBoard.tsx` | Cheat sheet: config-driven recompute, filters, cross-off, ADP trend indicators, risk scores, value-vs-ADP column, compare-mode trigger |
+| `components/DraftBoard.tsx` | Cheat sheet: config-driven recompute, filters, cross-off, ADP trend indicators, risk scores, value-vs-market column, target/avoid/note annotations, compare-mode trigger |
 | `components/ConfigPanel.tsx` | Scoring/roster/VOR-method controls |
 | `components/LeagueImport.tsx` | Sleeper league lookup UI → `mapLeagueToConfig` / keeper merge |
-| `components/PlayerCompare.tsx` | Side-by-side player comparison modal |
-| `components/MockDraft.tsx` (~1,900 lines — the biggest component by far) | CPU / manual / live-sync draft modes, Sleeper draft import (traded picks, team names, keepers), post-draft letter grade vs. ADP, watchlist, CSV export |
+| `components/PlayerCompare.tsx` | Side-by-side player comparison modal (proj, 2025 actual, VOR, rank, market ADP/value, risk, bye, injury, age) |
+| `components/MockDraft.tsx` (~2,100 lines — the biggest component by far) | CPU / manual / live-sync draft modes, Sleeper draft import (traded picks, team names, keepers), post-draft letter grade vs. market, target/avoid-aware watchlist, board grid + scarcity chart views, CSV export |
 | `components/DraftBoardGrid.tsx` | Full draft board grid view (round × team), used inside Mock Draft |
-| `components/ScarcityChart.tsx` | Positional scarcity chart, used inside Mock Draft |
+| `components/ScarcityChart.tsx` | Positional scarcity chart (starters vs. depth remaining per position), used inside Mock Draft |
 | `components/AuctionDraft.tsx` | Auction draft: nomination/bidding flow, suggested-bid tracker against remaining budget |
 | `components/useLocalStorage.ts` | SSR-safe persisted state hook |
 
@@ -104,23 +100,28 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
   *any* of those three signals a real projection/market presence. This is what
   lets DEF through (DEF has `pts_std > 0` but `pts_ppr ≈ 0`).
 - A separate endpoint, `https://api.sleeper.com/stats/nfl/2025` (same query
-  shape), supplies the 2025 actuals (`fetch2025ActualPts`) — falls back to
-  `pts_std` when a position has no `pts_ppr`. It has its own 12h in-module memo,
-  independent from the projections memo.
+  shape), supplies raw 2025 stats (`fetch2025ActualStats`) so the client can
+  score them under the *active* league settings instead of a fixed PPR total.
+  It has its own 12h in-module memo, independent from the projections memo.
 - Both the projections and 2025-stats raw responses are **~3MB+** — over Next's
   2MB fetch-cache limit. So both fetch with `cache: "no-store"` and **memoize
   the normalized result in-module for 12h** (`TTL_MS` in `lib/sleeper.ts`).
   Don't try `next: { revalidate }` on the raw fetch — it silently fails to cache.
-- `SEASON` is hardcoded `"2026"` in `lib/sleeper.ts`. Bump it for a new season
-  (and refresh `lib/byes.ts` — see Gotchas).
+- `SEASON` is derived from today's date in `lib/sleeper.ts` (year rolls over in
+  March, so the offseason still reads as the prior season) — no manual bump
+  needed season to season. `lib/byes.ts` still needs a manual refresh (see
+  Annual rollover below).
 - League/user/draft endpoints (`lib/sleeper-league.ts`, and the Sleeper draft
   import in `MockDraft.tsx`) live on a different base URL:
   `https://api.sleeper.app/v1` (note: `.app`, not `.com` — the projections/stats
   endpoints above are `.com`). Don't conflate the two hosts.
 - The Mock Draft "Live Sync" mode polls Sleeper's documented REST API
-  (`GET https://api.sleeper.app/v1/draft/{id}/picks` every ~5 seconds, deduped
-  by pick number, stops when draft status is `complete`, error state after 3
-  consecutive failures). Uses no WebSocket.
+  (`GET https://api.sleeper.app/v1/draft/{id}/picks` every 8 seconds, only
+  while the tab is visible, mapping picks back to their true owner via traded-pick
+  records). It flips to a `stale` status after repeated consecutive failures
+  rather than erroring immediately on one dropped request. There is no
+  officially documented streaming protocol, so this is REST polling only —
+  don't reach for a WebSocket implementation here.
 
 ### VOR methodology (the core IP)
 
@@ -135,15 +136,18 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
     starters drafted → deeper baseline. Superflex makes QBs premium; TE-premium
     raises TEs and reshuffles flex.
 - **Two baseline methods (`BaselineMethod`):**
-  - **VOLS** (default) — "Value Over Last Starter": baseline = best player past all
-    starters.
+  - **VOLS** (default) — "Value Over Last Starter": baseline anchored at the
+    first undrafted player past all starters.
   - **VORP** — "bench depth": after starters, fill `bench × teams` more slots,
     prioritized by **value-over-last-starter** (NOT raw points — otherwise high-raw
     QBs wrongly flood the bench in 1-QB leagues). Deeper baseline → rewards scarce
     positions.
-- **K/DEF baseline** is simpler by design: 1 starter per team, no greedy flex
-  assignment (they don't feed FLEX/SUPERFLEX). They're always appended after
-  all skill positions in overall rank, regardless of VBD, so draft advice stays
+- **Replacement is always the first undrafted player at a position — for
+  every position, including K/DEF.** K/DEF use a simpler 1-starter-per-team
+  index (no greedy flex assignment, since they don't feed FLEX/SUPERFLEX), and
+  both `rank` and `points` come from that same single player, consistent with
+  the skill-position baselines. They're always appended after all skill
+  positions in overall rank, regardless of VBD, so draft advice stays
   conventional (skill positions before K/DEF).
 - **Tiers:** gap-based per position — new tier when the drop to the next player
   exceeds `1.5× average gap` (top-40 window).
@@ -158,32 +162,38 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
 All prefixed `ffdp.` — grep `ffdp\.` across `components/` to enumerate if this
 list drifts:
 - `ffdp.scoring`, `ffdp.roster`, `ffdp.method` — shared config, read by all
-  three tabs (Cheat Sheet, Mock Draft, Auction).
+  three tabs (Cheat Sheet, Mock Draft, Auction). Read/written through
+  `lib/persistence.ts`'s versioned envelope.
 - `ffdp.drafted` — cheat-sheet cross-off list.
+- `ffdp.annotations` — target/avoid/note annotations, keyed by season + player
+  ID, shared between the cheat sheet and mock draft. The Mock Draft watchlist
+  is *derived* from this (players flagged "target") rather than its own key.
 - `ffdp.adp-snapshot` — periodic ADP snapshot used to compute the 7-day trend
-  indicators on the cheat sheet.
-- `ffdp.draft-setup`, `ffdp.pending-keepers` — Mock Draft setup state.
+  indicators on the cheat sheet; tagged with the `adpKey` format it was seeded
+  under so a scoring/roster format switch doesn't produce bogus trend arrows.
+- `ffdp.draft-setup`, `ffdp.pending-keepers` — Mock Draft setup state
+  (`sessionStorage`, since it's transient import/connection context).
 - `ffdp.auction.wonPlayers`, `ffdp.auction.setup` — Auction tab state.
-- The Mock Draft **watchlist** is in-memory (`useState`), not persisted —
-  don't go looking for an `ffdp.watchlist` key, it doesn't exist.
 
-## How to run & verify
+## Locked product semantics
 
-```bash
-cd /Users/masonrussell/Development/ff-draft-planner
-npm install        # if fresh
-npm run dev        # opens on :3000, or next open port if taken
-npm run build      # type + lint check (always run before declaring done)
-```
+- Replacement is the first undrafted player at a position — every position,
+  including K/DEF.
+- Sleeper's format-specific ADP is authoritative outside PPR; ESPN ADP supplements PPR only.
+- Live sync is bounded, visibility-aware REST polling until Sleeper documents an official streaming protocol.
+- Pick grades compare compatible market ADP with the actual acquisition pick; keepers are separate.
+- Auction teams retain at least $1 for every remaining roster slot.
+- Historical totals are recalculated from raw stats with active scoring.
 
-**Verify the engine against live data** (pattern that's worked well):
-1. Start dev server in background, `curl http://localhost:<port>/api/players` to
-   confirm the data path.
-2. Write a `scratch-*.mts` that imports `lib/vbd` + `lib/presets`, fetches the API,
-   runs `rankPlayers` across formats, prints baselines + top players. Run with
-   `npx tsx scratch-*.mts`. Delete the scratch file after.
+## Data and caching
 
-## Gotchas (learned — don't rediscover)
+`/api/players` fetches Sleeper projections, ESPN PPR ADP, and Sleeper 2025 raw stats concurrently. Sleeper is required; optional sources degrade to empty maps. Normalized output uses the Next Data Cache for 12 hours and emits `s-maxage=43200, stale-while-revalidate=86400` for shared CDN reuse.
+
+## Persistence
+
+`useLocalStorage` reads/writes versioned envelopes through `lib/persistence.ts`. Existing keys migrate from their prior unversioned JSON shape. `ffdp.annotations` is season/player scoped and shared between cheat sheet and mock draft. Session-only Sleeper import state remains in `sessionStorage` because it contains transient draft connection context.
+
+## Gotchas
 
 - **`preview_start` MCP fails** with `EPERM: process.cwd ... uv_cwd` (sandbox can't
   spawn npm) in some environments. If browser screenshots aren't available, run
@@ -203,24 +213,17 @@ npm run build      # type + lint check (always run before declaring done)
 - The Sleeper projections host is `api.sleeper.com`; the users/leagues/drafts
   host is `api.sleeper.app` — easy to typo one for the other.
 
-## What's actually left
+## Annual rollover
 
-The original v1 punch list (value-vs-ADP column, K/DEF, byes, deploy +
-review-workflow install) has **all shipped** — verified against the code on
-this branch. What plausibly remains:
+1. `lib/byes.ts` needs a fresh bye-week map from a confirmed schedule (`SEASON`
+   itself now rolls over automatically from today's date, see Sleeper API
+   specifics above).
+2. Run `npm run release:check` and inspect optional-source flags.
+3. Update README/methodology examples if formulas or source contracts change.
 
-1. **`SEASON` bump** — `lib/sleeper.ts` hardcodes `"2026"`; will need updating
-   (and a fresh `lib/byes.ts`) for the following season.
-2. General polish/bug-fix work — check `git log` and open PRs/branches for
-   in-flight fixes (e.g. auction math, cheat-sheet polish, mock-draft logic)
-   before assuming a given area is unpolished from scratch.
-
-Confirm against the actual code before acting on any of the above — this list
-reflects a point-in-time read, and parallel agent work may have moved it.
-
-## House rules (from parent CLAUDE.md)
+See `METHODOLOGY.md` for reproducible formulas and `ROADMAP.md` for dependency and acceptance context.
 
 - `github-recovery-codes.txt` and any tokens/keys in the dev tree are **secrets** —
   never commit, echo, or include in a PR.
-- This repo uses the `dev → test → main` promotion pipeline (see "Branching /
+- This repo uses the `dev → test → main` promotion pipeline (see "Location &
   git" above) — never push directly to `test` or `main`.
