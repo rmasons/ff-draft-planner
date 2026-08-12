@@ -135,8 +135,8 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
     starters drafted → deeper baseline. Superflex makes QBs premium; TE-premium
     raises TEs and reshuffles flex.
 - **Two baseline methods (`BaselineMethod`):**
-  - **VOLS** (default) — "Value Over Last Starter": baseline = best player past all
-    starters.
+  - **VOLS** (default) — "Value Over Last Starter": baseline anchored at the
+    first player past all starters (points = band average from there, see below).
   - **VORP** — "bench depth": after starters, fill `bench × teams` more slots,
     prioritized by **value-over-last-starter** (NOT raw points — otherwise high-raw
     QBs wrongly flood the bench in 1-QB leagues). Deeper baseline → rewards scarce
@@ -145,6 +145,12 @@ client fetches once, then `rankPlayers()` recomputes points/VOR/tiers in a
   assignment (they don't feed FLEX/SUPERFLEX). They're always appended after
   all skill positions in overall rank, regardless of VBD, so draft advice stays
   conventional (skill positions before K/DEF).
+- **Baseline `points` is a band average, not a single player.** Every
+  baseline (QB/RB/WR/TE and K/DEF) averages the 5 players starting at the
+  replacement index instead of reading one player's projection, so one noisy
+  projection at the line no longer swings VOR for the whole position; K/DEF
+  were also re-indexed to the same "first past the last starter" convention
+  the skill positions use (previously they read the last starter itself).
 - **Tiers:** gap-based per position — new tier when the drop to the next player
   exceeds `1.5× average gap` (top-40 window).
 - VOR field on `RankedPlayer` is named `vbd` (legacy name; UI label is "VOR").

@@ -2,6 +2,8 @@
 
 import { useMemo } from "react";
 import type { RankedPlayer } from "@/lib/types";
+import type { Baselines } from "@/lib/vbd";
+import { POS_BADGE } from "@/lib/ui";
 
 interface Props {
   ranked: RankedPlayer[];
@@ -9,40 +11,24 @@ interface Props {
   numTeams: number;
   numRounds: number;
   currentPickNum: number;
+  /** Replacement-level baselines from rankPlayers(), used to define
+   *  position-relative "depth" below (see the depth calc in posData). */
+  baselines: Baselines;
 }
 
 type ChartPos = "RB" | "WR" | "TE" | "QB";
 
 const CHART_POSITIONS: ChartPos[] = ["RB", "WR", "TE", "QB"];
 
-const POS_CONFIG: Record<
-  ChartPos,
-  { badge: string; filled: string; depth: string; label: string }
-> = {
-  RB: {
-    badge: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-    filled: "bg-emerald-500",
-    depth: "bg-emerald-500/20",
-    label: "text-emerald-300",
-  },
-  WR: {
-    badge: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-    filled: "bg-sky-500",
-    depth: "bg-sky-500/20",
-    label: "text-sky-300",
-  },
-  TE: {
-    badge: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-    filled: "bg-amber-500",
-    depth: "bg-amber-500/20",
-    label: "text-amber-300",
-  },
-  QB: {
-    badge: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-    filled: "bg-rose-500",
-    depth: "bg-rose-500/20",
-    label: "text-rose-300",
-  },
+// Badge colors come from the shared @/lib/ui POS_BADGE map (they matched
+// this chart's old local copy exactly). The bar fill/depth colors and the
+// "starters" label color below are chart-specific presentation and have no
+// shared equivalent, so they stay local.
+const POS_CONFIG: Record<ChartPos, { filled: string; depth: string; label: string }> = {
+  RB: { filled: "bg-emerald-500", depth: "bg-emerald-500/20", label: "text-emerald-300" },
+  WR: { filled: "bg-sky-500", depth: "bg-sky-500/20", label: "text-sky-300" },
+  TE: { filled: "bg-amber-500", depth: "bg-amber-500/20", label: "text-amber-300" },
+  QB: { filled: "bg-rose-500", depth: "bg-rose-500/20", label: "text-rose-300" },
 };
 
 export default function ScarcityChart({
@@ -51,6 +37,7 @@ export default function ScarcityChart({
   numTeams,
   numRounds,
   currentPickNum,
+  baselines,
 }: Props) {
   const posData = useMemo(() => {
     return CHART_POSITIONS.map((pos) => {
@@ -58,10 +45,20 @@ export default function ScarcityChart({
         (p) => p.position === pos && !draftedIds.has(p.id)
       );
       const starters = undrafted.filter((p) => p.vbd > 0).length;
-      const depth = undrafted.filter((p) => p.vbd <= 0 && p.points > 50).length;
+      // "Depth" used to be a flat `points > 50` cutoff, which is position-
+      // agnostic — almost every QB clears 50 points, but only the deepest
+      // RBs do, so QB depth looked artificially huge next to RB. Instead,
+      // count a player as depth when they're at/below replacement level
+      // (vbd <= 0) but still within 80% of their OWN position's replacement
+      // baseline points — a position-relative cutoff instead of one flat
+      // number shared across positions with very different scoring scales.
+      const replacementPts = baselines[pos].points;
+      const depth = undrafted.filter(
+        (p) => p.vbd <= 0 && p.points >= 0.8 * replacementPts
+      ).length;
       return { pos, starters, depth, total: starters + depth };
     });
-  }, [ranked, draftedIds]);
+  }, [ranked, draftedIds, baselines]);
 
   const maxTotal = Math.max(...posData.map((d) => d.total), 1);
 
@@ -90,7 +87,7 @@ export default function ScarcityChart({
               <div className="mb-2 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <span
-                    className={`inline-block rounded border px-1.5 py-0.5 text-xs font-bold ${cfg.badge}`}
+                    className={`inline-block rounded border px-1.5 py-0.5 text-xs font-bold ${POS_BADGE[pos]}`}
                   >
                     {pos}
                   </span>
@@ -141,7 +138,7 @@ export default function ScarcityChart({
         </div>
         <div className="flex items-center gap-1.5">
           <div className="h-2.5 w-5 rounded-sm bg-zinc-700" />
-          <span>Depth (proj &gt; 50 pts)</span>
+          <span>Depth (&ge;80% of replacement baseline)</span>
         </div>
         <div className="ml-auto flex items-center gap-1.5">
           <span className="text-amber-400">amber</span>

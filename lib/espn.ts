@@ -20,6 +20,22 @@ interface EspnPlayer {
   ownership?: { averageDraftPosition?: number };
 }
 
+// Generational suffixes to strip from the END of a name only, so a Sleeper
+// name like "Marvin Harrison" matches ESPN's "Marvin Harrison Jr." (otherwise
+// they're treated as two different players and the ESPN ADP silently never
+// gets attached). Ordered longest-first in the alternation so "iii" isn't
+// half-consumed by the "ii" branch first.
+//
+// Test-by-hand examples (after the earlier normalization steps have already
+// lowercased + stripped punctuation, so "Jr." has become "jr"):
+//   "marvin harrison jr"   -> "marvin harrison"
+//   "michael pittman iii"  -> "michael pittman"
+//   "odell beckham jr"     -> "odell beckham"
+//   "amari cooper"         -> "amari cooper"      (no suffix, untouched)
+//   "oliver"               -> "oliver"            (contains "iv" but not as its own
+//                                                   trailing word, so untouched)
+const SUFFIX_RE = / (iii|ii|iv|v|jr|sr)$/;
+
 /** Normalize to lowercase ASCII letters + spaces for fuzzy name matching. */
 export function normalizeName(name: string): string {
   return name
@@ -28,7 +44,8 @@ export function normalizeName(name: string): string {
     .replace(/[̀-ͯ]/g, "") // strip accent marks
     .replace(/[^a-z ]/g, "")         // strip punctuation, apostrophes, dots
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    .replace(SUFFIX_RE, ""); // strip trailing generational suffix, e.g. "... jr"
 }
 
 const TTL_MS = 12 * 60 * 60 * 1000; // 12h

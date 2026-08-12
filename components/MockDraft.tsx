@@ -5,6 +5,8 @@ import type { Player, Position, RankedPlayer } from "@/lib/types";
 import { ALL_POSITIONS } from "@/lib/types";
 import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { adpKeyFor, DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
+import { consensusAdp } from "@/lib/adp";
+import { POS_BADGE, UNKNOWN_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
 import DraftBoardGrid from "./DraftBoardGrid";
 import ScarcityChart from "./ScarcityChart";
@@ -56,16 +58,7 @@ const SORT_DEFAULTS: Record<SortKey, 1 | -1> = {
   rank: 1, proj: -1, vor: -1, adp: 1, value: -1,
 };
 
-const POS_BADGE: Record<Position, string> = {
-  QB: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-  RB: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  WR: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  TE: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  K: "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  DEF: "bg-orange-500/15 text-orange-300 border-orange-500/30",
-};
-
-const UNKNOWN_BADGE = "bg-zinc-500/15 text-zinc-400 border-zinc-500/30";
+// POS_BADGE / UNKNOWN_BADGE now come from @/lib/ui (shared across screens).
 
 const SLOT_ELIGIBLE: Record<string, string[]> = {
   QB: ["QB"], RB: ["RB"], WR: ["WR"], TE: ["TE"], K: ["K"], DEF: ["DEF"],
@@ -340,10 +333,17 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     return () => { cancelled = true; };
   }, []);
 
-  const ranked = useMemo(() => {
-    if (!players) return [] as RankedPlayer[];
-    return rankPlayers(players, scoring, roster, method).players;
-  }, [players, scoring, roster, method]);
+  // Keep the full rankPlayers() result (not just `.players`) so the
+  // replacement-level baselines are available to pass down to ScarcityChart.
+  // Calling with `players ?? []` (instead of an early-return null) keeps
+  // `baselines` a real (if all-zero) Baselines object before players load,
+  // so downstream code never has to null-check it.
+  const rankResult = useMemo(
+    () => rankPlayers(players ?? [], scoring, roster, method),
+    [players, scoring, roster, method]
+  );
+  const ranked = rankResult.players;
+  const baselines = rankResult.baselines;
 
   const numTeams = importedTeams ?? roster.teams;
   const numRounds =
@@ -411,12 +411,10 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
           return (va - vb) * sortDir;
         }
         case "value": {
+          // "Value" = consensus ADP minus overall rank (higher = bigger steal).
           const val = (p: RankedPlayer): number | null => {
-            const sl = p.adp[adpKey] >= 999 ? null : p.adp[adpKey];
-            const es = p.adp.espn >= 999 ? null : p.adp.espn;
-            const srcs = [sl, es].filter((x): x is number => x !== null);
-            if (!srcs.length) return null;
-            return srcs.reduce((a, b) => a + b, 0) / srcs.length - p.overallRank;
+            const adp = consensusAdp(p, adpKey);
+            return adp === null ? null : adp - p.overallRank;
           };
           const va = val(a), vb = val(b);
           if (va === null && vb === null) return 0;
@@ -453,10 +451,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       if (pick.isKeeper) return [];
       const player = playerById.get(pick.playerId);
       if (!player) return [];
-      const srcs = [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn]
-        .filter((v): v is number => v < 999);
-      if (srcs.length === 0) return [];
-      const avgAdp = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+      // NOTE: this used to average FOUR ADP sources (ppr/half/std/espn).
+      // Standardized on the shared consensusAdp() helper — format-appropriate
+      // Sleeper ADP (via adpKey) + ESPN — same convention used everywhere else.
+      const avgAdp = consensusAdp(player, adpKey);
+      if (avgAdp === null) return [];
       // Value = how many picks LATER than the market average you got this
       // player. Positive = steal (you drafted him after the market would
       // have), negative = reach. Using the actual pick number (instead of
@@ -475,7 +474,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     else letter = "F";
     const sorted = [...graded].sort((a, b) => b.value - a.value);
     return { letter, avgValue, sorted };
-  }, [isDone, draftMode, myPicks, playerById]);
+  }, [isDone, draftMode, myPicks, playerById, adpKey]);
 
   // Position availability counts for the draft strip
   const positionCounts = useMemo(
@@ -552,22 +551,20 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       // Snake-draft pick number for this keeper's own team slot (not the
       // user's slot — a keeper can belong to any team in the league).
       const pickEquivalent = pickNumForCell(k.round, k.teamSlot, numTeams);
-      const srcs = player
-        ? [player.adp.ppr, player.adp.half, player.adp.std, player.adp.espn].filter(
-            (v): v is number => v < 999
-          )
-        : [];
-      const consensusAdp = srcs.length ? srcs.reduce((a, b) => a + b, 0) / srcs.length : null;
-      const surplus = consensusAdp === null ? null : pickEquivalent - consensusAdp;
+      // NOTE: this used to average FOUR ADP sources (ppr/half/std/espn).
+      // Standardized on the shared consensusAdp() helper, same as draftGrade
+      // above — format-appropriate Sleeper ADP (via adpKey) + ESPN.
+      const keeperAdp = player ? consensusAdp(player, adpKey) : null;
+      const surplus = keeperAdp === null ? null : pickEquivalent - keeperAdp;
       let verdict: "keep" | "borderline" | "cut" | null = null;
       if (surplus !== null) {
         if (surplus > 8) verdict = "keep";
         else if (surplus >= 0) verdict = "borderline";
         else verdict = "cut";
       }
-      return { keeper: k, player, pickEquivalent, consensusAdp, surplus, verdict };
+      return { keeper: k, player, pickEquivalent, consensusAdp: keeperAdp, surplus, verdict };
     });
-  }, [pendingKeepers, ranked, playerById, numTeams]);
+  }, [pendingKeepers, ranked, playerById, numTeams, adpKey]);
 
   // CPU auto-pick: ADP-weighted with positional need and jitter
   useEffect(() => {
@@ -740,11 +737,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       let avgAdpStr = "";
       let valueStr = "";
       if (player) {
-        const sl = player.adp[adpKey] >= 999 ? null : player.adp[adpKey];
-        const es = player.adp.espn >= 999 ? null : player.adp.espn;
-        const srcs = [sl, es].filter((x): x is number => x !== null);
-        if (srcs.length > 0) {
-          const avg = srcs.reduce((a, b) => a + b, 0) / srcs.length;
+        const avg = consensusAdp(player, adpKey);
+        if (avg !== null) {
           avgAdpStr = avg.toFixed(1);
           const val = avg - player.overallRank;
           valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
@@ -1593,6 +1587,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
               numTeams={numTeams}
               numRounds={numRounds}
               currentPickNum={currentPickNum}
+              baselines={baselines}
             />
           </div>
         ) : (

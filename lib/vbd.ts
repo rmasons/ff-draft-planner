@@ -25,10 +25,37 @@ export const BASELINE_LABELS: Record<BaselineMethod, string> = {
 export interface Baseline {
   /** Number of players at this position rostered above the replacement line. */
   rank: number;
-  /** Projected points of the replacement-level player. */
+  /** Replacement-level points: the AVERAGE of a small "band" of players
+   *  starting at the replacement index (5 players, clipped to the end of the
+   *  pool), not a single player's projection. A lone noisy/outlier projection
+   *  sitting right at the replacement line would otherwise shift every
+   *  player's VOR at that position — averaging a band smooths that out. This
+   *  is standard practice in mature VBD tools. See `bandAverage` below. */
   points: number;
 }
 export type Baselines = Record<Position, Baseline>;
+
+/** How many players go into the replacement-level averaging band. */
+const BASELINE_BAND_SIZE = 5;
+
+/**
+ * Average of `arr[startIdx .. startIdx + size - 1]` (clipped to the end of
+ * the array), rounded to 0.1 — used to compute a stabilized replacement-level
+ * "points" value instead of relying on one single player's projection.
+ *
+ * Edge cases (match the old single-player behavior so only the smoothing
+ * changes, not the fallback semantics):
+ *  - Empty array → 0.
+ *  - `startIdx` at or past the end of the array entirely → fall back to the
+ *    last player's raw points (not rounded/averaged — there's only one value).
+ */
+function bandAverage(arr: number[], startIdx: number, size: number): number {
+  if (arr.length === 0) return 0;
+  if (startIdx >= arr.length) return arr[arr.length - 1];
+  const band = arr.slice(startIdx, startIdx + size);
+  const avg = band.reduce((sum, v) => sum + v, 0) / band.length;
+  return Math.round(avg * 10) / 10;
+}
 
 export interface RankingResult {
   players: RankedPlayer[];
@@ -47,6 +74,10 @@ export interface RankingResult {
  * For VORP we then fill `bench × teams` more slots, but prioritized by
  * value-over-last-starter (not raw points) so we don't over-draft high-scoring
  * QBs to the bench in 1-QB leagues.
+ *
+ * `rank` (the number of players rostered above the line) is the raw greedy-fill
+ * count — the band averaging below only changes the baseline's `points`, not
+ * where the line itself falls.
  */
 function computeSkillBaselines(
   pointsByPos: Record<SkillPosition, number[]>, // each sorted desc
@@ -106,7 +137,7 @@ function computeSkillBaselines(
     const idx = started[pos];
     baselines[pos] = {
       rank: Math.min(idx, arr.length),
-      points: arr.length === 0 ? 0 : (arr[idx] ?? arr[arr.length - 1] ?? 0),
+      points: bandAverage(arr, idx, BASELINE_BAND_SIZE),
     };
   }
   return baselines;
@@ -147,6 +178,14 @@ function assignTiers(sortedPoints: number[]): number[] {
  * Overall rank order: skill positions (by VBD descending), then K, then DEF.
  * K/DEF are appended at the bottom regardless of VBD so draft advice stays
  * conventional — take skill positions before kickers and defenses.
+ *
+ * Note: because the baseline is now a BAND AVERAGE (see `bandAverage`) rather
+ * than the single first-past-the-line player, that first player (and a few
+ * after them) will typically score slightly ABOVE the average of their own
+ * band and end up with a small POSITIVE vbd, even though they're technically
+ * at/past the replacement line. This is expected and correct given the
+ * smoothing tradeoff (a later UI change updates the "replacement line" copy
+ * to reflect this).
  */
 export function rankPlayers(
   players: Player[],
@@ -175,17 +214,25 @@ export function rankPlayers(
   const skillBaselines = computeSkillBaselines(pointsByPos, roster, method);
 
   // K/DEF baseline: 1 starter per team (simple, no greedy flex assignment).
+  //
+  // Replacement index is `roster.teams` — the first player PAST the last
+  // starter — matching the skill-position convention (`started[pos]` above is
+  // also "first past the line", not "last starter"). This used to be
+  // `roster.teams - 1` (the last starter itself), which was inconsistent with
+  // how skill baselines are indexed; aligning it here shifts K/DEF VBD
+  // slightly (their baseline points now come from one slot later + the band
+  // average, rather than a single last-starter's projection).
   const kPoints = byPos.K.map((x) => x.points);
   const defPoints = byPos.DEF.map((x) => x.points);
   const baselines: Baselines = {
     ...skillBaselines,
     K: {
       rank: Math.min(roster.teams, kPoints.length),
-      points: kPoints[roster.teams - 1] ?? kPoints[kPoints.length - 1] ?? 0,
+      points: bandAverage(kPoints, roster.teams, BASELINE_BAND_SIZE),
     },
     DEF: {
       rank: Math.min(roster.teams, defPoints.length),
-      points: defPoints[roster.teams - 1] ?? defPoints[defPoints.length - 1] ?? 0,
+      points: bandAverage(defPoints, roster.teams, BASELINE_BAND_SIZE),
     },
   };
 
