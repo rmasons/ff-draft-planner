@@ -16,7 +16,9 @@ Once a draft is underway, replacement level is recomputed against the live board
 
 Sleeper's active format (`ppr`, `half`, `std`, or `superflex`) is authoritative. ESPN's PPR ADP is averaged with Sleeper only in PPR. Missing sources are omitted and never treated as pick 0 or 999.
 
-Pick value is `compatible market ADP − acquisition pick`. A player with ADP 40 selected at pick 25 is `+15`; at pick 55 the same player is `−15`. Keeper cost uses the keeper's team slot in true snake order: in a 12-team league, slot 3 costs pick 3 in round 1 and pick 22 in round 2.
+Pick value is `acquisition pick − compatible market ADP`. A player with ADP 40 selected at pick 25 is `−15` (a reach — taken earlier than ADP); at pick 55 the same player is `+15` (a steal — taken later than ADP). Keeper cost uses the keeper's team slot in true snake order: in a 12-team league, slot 3 costs pick 3 in round 1 and pick 22 in round 2.
+
+In a keeper league the kept players are off the board, so every available player's published ADP is stale relative to the reduced pool actually being drafted from. Pick value grades against a keeper-adjusted ADP instead: each available player's ADP is slid earlier by the count of kept players ranked ahead of it. This is why the best player available at 1.01 in a heavy-keeper league grades as chalk (value `0`) rather than as a fake steal against its unadjusted ADP.
 
 Keepers imported from Sleeper come from whichever of two mechanisms has data. A materialized draft board gives the player, the team, and the round, because a keeper there occupies a real slot in the snake. League rosters give only the player and the team — Sleeper records who is kept but never what the keep costs, since that is a per-league rule it does not model.
 

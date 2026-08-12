@@ -526,8 +526,25 @@ export function chooseCpuPickOrBestAvailable(
   )[0];
 }
 
+// Positive = steal (taken later than the player's ADP); negative = reach.
 export function gradePick(marketAdp: number | null, pickNumber: number): number | null {
-  return marketAdp === null ? null : marketAdp - pickNumber;
+  return marketAdp === null ? null : pickNumber - marketAdp;
+}
+
+/**
+ * Keeper-adjusted ADP: in a keeper league the kept players are off the
+ * board, so every available player effectively goes earlier than their
+ * published ADP. Slide a player's ADP earlier by the count of kept players
+ * ranked ahead of them (strictly better ADP). The strict `<` naturally
+ * excludes the player themselves, so this is safe to call on a keeper's own
+ * row. An empty keeperAdps list is a no-op, so non-keeper leagues are
+ * unaffected.
+ */
+export function keeperAdjustedAdp(rawAdp: number | null, keeperAdps: number[]): number | null {
+  if (rawAdp === null) return null;
+  let ahead = 0;
+  for (const a of keeperAdps) if (a < rawAdp) ahead++;
+  return rawAdp - ahead;
 }
 
 export function gradeLetter(average: number): "A" | "B" | "C" | "D" | "F" {

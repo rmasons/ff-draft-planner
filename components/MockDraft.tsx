@@ -21,6 +21,7 @@ import {
   fillLineupSlots,
   gradeLetter,
   gradePick,
+  keeperAdjustedAdp,
   keeperConflict,
   keeperValue,
   leagueOpenSlots,
@@ -463,6 +464,22 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     [myPicks, playerById]
   );
 
+  // Published ADPs of every kept player in the league. Kept players are off
+  // the board, so the pool the market's published ADP implied no longer
+  // exists; keeperAdjustedAdp uses this to slide available players' ADPs
+  // earlier for grading, survival odds, and the CSV value column.
+  const keeperAdps = useMemo(() => {
+    const out: number[] = [];
+    for (const p of picks) {
+      if (!p.isKeeper) continue;
+      const player = playerById.get(p.playerId);
+      if (!player) continue;
+      const adp = marketReference(player, scoring, effectiveRoster).consensus;
+      if (adp !== null) out.push(adp);
+    }
+    return out;
+  }, [picks, playerById, scoring, effectiveRoster]);
+
   const draftGrade = useMemo(() => {
     if (!isDone || draftMode !== "cpu") return null;
     const graded = myPicks.flatMap((pick) => {
@@ -471,16 +488,16 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       if (pick.isKeeper) return [];
       const player = playerById.get(pick.playerId);
       if (!player) return [];
-      const market = marketReference(player, scoring, effectiveRoster);
-      const value = gradePick(market.consensus, pick.pickNumber);
-      return value === null ? [] : [{ pick, player, value, marketAdp: market.consensus }];
+      const rawAdp = marketReference(player, scoring, effectiveRoster).consensus;
+      const value = gradePick(keeperAdjustedAdp(rawAdp, keeperAdps), pick.pickNumber);
+      return value === null ? [] : [{ pick, player, value, marketAdp: rawAdp }];
     });
     if (graded.length === 0) return null;
     const avgValue = graded.reduce((a, b) => a + b.value, 0) / graded.length;
     const letter = gradeLetter(avgValue);
     const sorted = [...graded].sort((a, b) => b.value - a.value);
     return { letter, avgValue, sorted };
-  }, [isDone, draftMode, myPicks, playerById, scoring, effectiveRoster]);
+  }, [isDone, draftMode, myPicks, playerById, scoring, effectiveRoster, keeperAdps]);
 
   // Position availability counts for the draft strip
   const positionCounts = useMemo(
@@ -565,7 +582,8 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
    */
   const evaluateCandidate = useCallback((player: RankedPlayer) => {
     const market = marketReference(player, scoring, effectiveRoster);
-    const survival = nextUserPickNum === null ? null : survivalEstimate(market.consensus, currentPickNum, nextUserPickNum);
+    const survival = nextUserPickNum === null ? null
+      : survivalEstimate(keeperAdjustedAdp(market.consensus, keeperAdps), currentPickNum, nextUserPickNum);
     const list = availableByPosition.byPos.get(player.position);
     const index = availableByPosition.indexOf.get(player.id);
     const nextAtPosition = list !== undefined && index !== undefined ? list[index + 1] : undefined;
@@ -573,7 +591,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     const run = runsByPosition.get(player.position);
     const score = player.vbd + cliff * 0.75 + (survival === null ? 0 : (1 - survival) * 8) + (run ? 2 : 0);
     return { nextPick: nextUserPickNum, survival, cliff, run, score, marketLabel: market.label };
-  }, [scoring, effectiveRoster, nextUserPickNum, currentPickNum, availableByPosition, runsByPosition]);
+  }, [scoring, effectiveRoster, nextUserPickNum, currentPickNum, availableByPosition, runsByPosition, keeperAdps]);
 
   // Best pick suggestion. Requires roster structure from a Sleeper import;
   // see selectSuggestedPick for why K/DEF are gated and why every candidate
@@ -796,11 +814,11 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       let avgAdpStr = "";
       let valueStr = "";
       if (player) {
-        const avg = marketReference(player, scoring, effectiveRoster).consensus;
-        if (avg !== null) {
-          avgAdpStr = avg.toFixed(1);
-          const val = avg - pick.pickNumber;
-          valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
+        const rawAdp = marketReference(player, scoring, effectiveRoster).consensus;
+        if (rawAdp !== null) {
+          avgAdpStr = rawAdp.toFixed(1);
+          const val = gradePick(keeperAdjustedAdp(rawAdp, keeperAdps), pick.pickNumber);
+          if (val !== null) valueStr = (val >= 0 ? "+" : "") + val.toFixed(1);
         }
       }
 

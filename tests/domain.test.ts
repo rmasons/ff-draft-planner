@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { auctionBudget, legalAuctionPurchase, teamAuctionValue } from "../lib/auction";
 import {
-  assignRoster, chooseCpuPick, gradeLetter, gradePick, keeperValue, ownerForPick,
+  assignRoster, chooseCpuPick, gradeLetter, gradePick, keeperAdjustedAdp, keeperValue, ownerForPick,
   pickNumberForSlot, positionalRun, rosterSlots, seededRandom, survivalEstimate,
   teamSlotForPick, transitionDraft,
 } from "../lib/draft";
@@ -50,9 +50,31 @@ describe("snake, ownership, grades, and state", () => {
   it("resolves traded ownership and corrected keeper/pick value", () => {
     expect(ownerForPick(22, 12, [{ round: 2, roster_id: 3, owner_id: 8 }])).toBe(8);
     expect(keeperValue(2, 3, 12, 30)).toEqual({ pickEquivalent: 22, surplus: -8 });
-    expect(gradePick(40, 25)).toBe(15);
-    expect(gradePick(40, 55)).toBe(-15);
+    // Positive = steal (taken later than ADP), negative = reach.
+    expect(gradePick(40, 25)).toBe(-15);
+    expect(gradePick(40, 55)).toBe(15);
     expect(gradeLetter(6)).toBe("A");
+  });
+
+  it("slides ADP earlier by the count of kept players ranked ahead", () => {
+    const allAhead = Array.from({ length: 24 }, (_, i) => i + 1);
+    expect(keeperAdjustedAdp(25, allAhead)).toBe(1); // 24 kept ahead → chalk pick at 1.01
+    expect(keeperAdjustedAdp(25, [])).toBe(25); // no-op in a non-keeper league
+    expect(keeperAdjustedAdp(null, [1, 2])).toBe(null);
+    expect(keeperAdjustedAdp(30, [30, 5])).toBe(29); // strict `<` excludes the equal value (self-exclusion)
+  });
+
+  it("grades keeper-adjusted ADP the way the draft grade UI intends", () => {
+    // Chalk pick: best available (raw ADP 25) has 24 keepers ranked ahead of
+    // it and gets taken at 1.01 — neutral, not a fake steal.
+    const allAhead = Array.from({ length: 24 }, (_, i) => i + 1);
+    expect(gradePick(keeperAdjustedAdp(25, allAhead), 1)).toBe(0);
+
+    // Genuine faller: raw ADP 20 with 5 keepers ahead (adjusted to 15), taken
+    // at pick 40 — a real steal.
+    const value = gradePick(keeperAdjustedAdp(20, [3, 6, 9, 12, 15]), 40);
+    expect(value).toBe(25);
+    expect(value! > 0).toBe(true);
   });
 
   it("rejects illegal draft transitions", () => {
