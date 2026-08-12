@@ -137,6 +137,26 @@ describe("fetchLeagueKeepers — draft endpoint failure", () => {
   });
 });
 
+describe("fetchLeagueKeepers — pasted-URL draft id normalization", () => {
+  it("uses the long draft id, not a short trailing numeric query param", async () => {
+    // A pasted share link with a trailing "?ref=5" — the old "last run of
+    // digits" extraction would grab "5"; it must grab the long draft id.
+    const { calls } = stubFetch({
+      "/draft/1234567890123456789": { league_id: "L7", settings: { teams: 4 }, slot_to_roster_id: {} },
+      "/draft/1234567890123456789/picks": [
+        { pick_no: 1, draft_slot: 1, player_id: "p1", is_keeper: true },
+      ],
+    });
+    const result = await fetchLeagueKeepers(
+      "https://sleeper.com/draft/nfl/1234567890123456789?ref=5"
+    );
+    expect(result.source).toBe("board");
+    expect(result.keepers).toEqual([{ playerId: "p1", teamSlot: 1, round: 1 }]);
+    expect(calls.some((u) => u.includes("/draft/1234567890123456789"))).toBe(true);
+    expect(calls.some((u) => u.includes("/draft/5"))).toBe(false);
+  });
+});
+
 describe("keeperConflict", () => {
   const numTeams = 12;
   const confirmed = (over: Partial<KeeperCandidate> = {}): KeeperCandidate => ({
