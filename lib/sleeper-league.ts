@@ -3,12 +3,16 @@ import type { RosterConfig, ScoringConfig } from "./types";
 const BASE_URL = "https://api.sleeper.app/v1";
 
 /** Normalize a user-typed Sleeper draft id: a pasted full URL is reduced to
- *  its trailing run of digits; a bare id passes through (URL-encoded).
- *  Shared by fetchLeagueKeepers and inferKeeperRoundConvention so a pasted
- *  URL behaves identically in both. */
+ *  its longest run of digits (the draft id) — Sleeper draft ids are long
+ *  digit strings, so taking the longest run (rather than the last) avoids
+ *  picking up a short trailing numeric query param (e.g. "?ref=5"); a bare
+ *  id passes through (URL-encoded). Shared by fetchLeagueKeepers and
+ *  inferKeeperRoundConvention so a pasted URL behaves identically in both. */
 function normalizeDraftId(draftId: string): string {
   const trimmed = String(draftId).trim();
-  return trimmed.includes("/") ? (trimmed.match(/\d+/g)?.pop() ?? "") : encodeURIComponent(trimmed);
+  if (!trimmed.includes("/")) return encodeURIComponent(trimmed);
+  const runs = trimmed.match(/\d+/g);
+  return runs ? runs.reduce((a, b) => (b.length > a.length ? b : a)) : "";
 }
 
 export type LeagueType = "redraft" | "keeper" | "dynasty";

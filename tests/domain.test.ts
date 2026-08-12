@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, legalAuctionPurchase, teamAuctionValue, wonPlayersWithinTeams } from "../lib/auction";
+import { auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, isValidWonPlayer, legalAuctionPurchase, teamAuctionValue, wonPlayersWithinTeams } from "../lib/auction";
 import {
   assignRoster, chooseCpuPick, gradeLetter, gradePick, keeperAdjustedAdp, keeperValue, ownerForPick,
   pickNumberForSlot, positionalRun, rosterSlots, seededRandom, survivalEstimate,
@@ -151,6 +151,13 @@ describe("auction legality and inflation", () => {
     ]);
     expect(wonPlayersWithinTeams(wonPlayers, 12)).toEqual(wonPlayers);
     expect(wonPlayersWithinTeams([], 8)).toEqual([]);
+  });
+
+  it("rejects a won-player price above MAX_BUDGET_PER_TEAM but accepts a normal price", () => {
+    // A tampered localStorage entry (e.g. price: 999999999) must not validate —
+    // it would otherwise drive a team's displayed budget deeply negative.
+    expect(isValidWonPlayer({ playerId: "p", teamIndex: 0, price: 999999999 })).toBe(false);
+    expect(isValidWonPlayer({ playerId: "p", teamIndex: 0, price: 50 })).toBe(true);
   });
 });
 

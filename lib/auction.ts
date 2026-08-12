@@ -122,14 +122,15 @@ export function isValidWonPlayer(value: unknown): value is WonPlayer {
   return (
     typeof record.playerId === "string" && record.playerId.length > 0 &&
     typeof record.teamIndex === "number" && Number.isInteger(record.teamIndex) && record.teamIndex >= 0 && record.teamIndex < MAX_TEAMS &&
-    typeof record.price === "number" && Number.isInteger(record.price) && record.price >= 1
+    typeof record.price === "number" && Number.isInteger(record.price) && record.price >= 1 && record.price <= MAX_BUDGET_PER_TEAM
   );
 }
 
 /** Validator for the persisted "won players" auction state — an array of
  * records, each with a non-empty string player id, an integer teamIndex in
- * range, and an integer price of at least $1. Pass this to useLocalStorage's
- * optional `validate` predicate wherever this shape is loaded. */
+ * range, and an integer price between $1 and MAX_BUDGET_PER_TEAM. Pass this
+ * to useLocalStorage's optional `validate` predicate wherever this shape is
+ * loaded. */
 export function isValidWonPlayers(value: unknown): value is WonPlayer[] {
   return Array.isArray(value) && value.every(isValidWonPlayer);
 }
