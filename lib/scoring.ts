@@ -3,12 +3,18 @@ import type { Player, ScoringConfig } from "./types";
 /** Projected fantasy points for a player under a given scoring config.
  * Computed from raw stat projections so any scoring system works. */
 export function fantasyPoints(p: Player, s: ScoringConfig): number {
-  // K and DEF don't have per-stat breakdowns — Sleeper precomputes pts_std.
-  if (p.position === "K" || p.position === "DEF") {
-    return Math.round((p.stats.pts_std ?? 0) * 10) / 10;
-  }
+  return fantasyPointsForStats(p.position, p.stats, s);
+}
 
-  const st = p.stats;
+export function fantasyPointsForStats(
+  position: Player["position"],
+  st: Player["stats"],
+  s: ScoringConfig,
+): number {
+  // K and DEF don't have per-stat breakdowns — Sleeper precomputes pts_std.
+  if (position === "K" || position === "DEF") {
+    return Math.round((st.pts_std ?? 0) * 10) / 10;
+  }
   let pts = 0;
 
   pts += (st.pass_yd ?? 0) * s.passYd;
@@ -23,7 +29,7 @@ export function fantasyPoints(p: Player, s: ScoringConfig): number {
   pts += (st.rec ?? 0) * s.rec;
 
   // TE premium: extra points per reception for tight ends.
-  if (p.position === "TE") pts += (st.rec ?? 0) * s.teRecBonus;
+  if (position === "TE") pts += (st.rec ?? 0) * s.teRecBonus;
 
   pts += (st.fum_lost ?? 0) * s.fumLost;
 

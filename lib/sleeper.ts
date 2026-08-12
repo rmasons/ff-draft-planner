@@ -101,16 +101,20 @@ function normalize(rec: SleeperRecord): Player | null {
       superflex: s.adp_2qb ?? 999,
       espn: 999, // filled in server-side by /api/players after ESPN fetch
     },
+    actualStats2025: null,
     actualPts2025: null, // filled in server-side by /api/players after stats fetch
   };
 }
 
-// The raw Sleeper response is ~3.9MB (over Next's 2MB fetch-cache limit), so we
-// fetch uncached and memoize the much smaller normalized result in-module.
-const TTL_MS = 60 * 60 * 12 * 1000; // 12h
-let memo: { at: number; data: Player[] } | null = null;
-
-async function fetchAndNormalize(): Promise<Player[]> {
+// The raw Sleeper response is ~3.9MB (over Next's 2MB fetch-cache limit), so
+// we fetch uncached (cache: "no-store") and let the caller's own durable
+// cache (see app/api/players/route.ts, which wraps this in unstable_cache)
+// persist the much smaller normalized result. This fetch is not itself
+// double-cached: it runs fresh each time the outer cache actually invokes it
+// (Next's fetch `no-store` fetches the resource from the remote server every
+// time it's called, regardless of the surrounding cache/revalidate context —
+// see node_modules/next/dist/docs/01-app/03-api-reference/04-functions/fetch.md).
+async function fetchPlayersOnce(): Promise<Player[]> {
   const res = await fetch(SLEEPER_URL, {
     cache: "no-store",
     headers: { accept: "application/json" },
@@ -132,35 +136,35 @@ async function fetchAndNormalize(): Promise<Player[]> {
   return players;
 }
 
-/** Fetch + normalize the draftable player pool, memoized for 12h. */
+/**
+ * Fetch + normalize the draftable player pool. This is the required source:
+ * a caller (app/api/players/route.ts) is expected to let a failure here
+ * propagate rather than fall back to an empty pool. Retries once on failure,
+ * then lets the rejection propagate — mirrors fetch2025ActualStats below (and
+ * fetchEspnAdp in lib/espn.ts), which the caching-strategy comment in
+ * app/api/players/route.ts relies on for every source.
+ */
 export async function fetchPlayers(): Promise<Player[]> {
-  const now = Date.now();
-  if (memo && now - memo.at < TTL_MS) return memo.data;
-  const data = await fetchAndNormalize();
-  memo = { at: now, data };
-  return data;
+  try {
+    return await fetchPlayersOnce();
+  } catch {
+    return await fetchPlayersOnce();
+  }
 }
 
 // ── 2025 season actuals ────────────────────────────────────────────────────────
 
 // One bulk request covering all fantasy positions. The stats response is the
 // same size class as projections (~3MB+), so it also exceeds Next's 2MB
-// fetch-cache limit — use cache:"no-store" + in-module memo.
+// fetch-cache limit — use cache:"no-store" (see fetchPlayersOnce above for
+// why that doesn't mean "uncached": the caller's unstable_cache layer is the
+// durable cache for the normalized result).
 const STATS_2025_URL =
   `https://api.sleeper.com/stats/nfl/2025` +
   `?season_type=regular&order_by=pts_ppr` +
   ALL_POSITIONS.map((p) => `&position[]=${p}`).join("");
 
-let statsMemo: { at: number; data: Map<string, number> } | null = null;
-
-/**
- * Returns a map of player_id → 2025 PPR season total.
- * Falls back to pts_std for positions that have no pts_ppr value.
- */
-export async function fetch2025ActualPts(): Promise<Map<string, number>> {
-  const now = Date.now();
-  if (statsMemo && now - statsMemo.at < TTL_MS) return statsMemo.data;
-
+async function fetch2025ActualStatsOnce(): Promise<Map<string, RawStats>> {
   const res = await fetch(STATS_2025_URL, {
     cache: "no-store",
     headers: { accept: "application/json" },
@@ -176,14 +180,29 @@ export async function fetch2025ActualPts(): Promise<Map<string, number>> {
     stats: Record<string, number | undefined>;
   }> = await res.json();
 
-  const data = new Map<string, number>();
+  const data = new Map<string, RawStats>();
   for (const r of records) {
-    const pts = r.stats?.pts_ppr ?? r.stats?.pts_std;
-    if (typeof pts === "number" && pts > 0) {
-      data.set(r.player_id, pts);
+    const stats: RawStats = {};
+    for (const key of STAT_KEYS) {
+      const value = r.stats?.[key];
+      if (typeof value === "number") stats[key] = value;
     }
+    if (Object.keys(stats).length) data.set(r.player_id, stats);
   }
 
-  statsMemo = { at: now, data };
   return data;
+}
+
+/**
+ * Returns raw historical stats so the client can apply active league scoring.
+ * This is an optional source: retries once on failure, then lets the
+ * rejection propagate so the caller's own caching layer can decide whether
+ * to keep serving last-known-good data (see app/api/players/route.ts).
+ */
+export async function fetch2025ActualStats(): Promise<Map<string, RawStats>> {
+  try {
+    return await fetch2025ActualStatsOnce();
+  } catch {
+    return await fetch2025ActualStatsOnce();
+  }
 }

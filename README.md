@@ -1,75 +1,55 @@
 # DraftBoard — Fantasy Football Draft Planner
 
-A configurable pre-draft cheat sheet (à la Walter Picks), plus mock and auction
-draft simulators. Pulls live player projections from Sleeper's free API,
-enriches them with ESPN ADP and prior-season actuals, and computes **fantasy
-points, VBD (value over replacement), and tiers** for *your* exact scoring and
-roster settings.
+DraftBoard is a configurable 2026 cheat sheet, snake/mock/live-draft assistant, and auction planner. It combines Sleeper projections and format-specific ADP with optional ESPN PPR ADP, then computes league-scored projections, first-undrafted replacement value, tiers, and explainable recommendations.
 
-## Run it
+## Run and verify
 
 ```bash
 npm install
-npm run dev      # http://localhost:3000 (or next open port)
+npm run dev
+npm test
+npm run lint
+npm run build
+npm run release:check
 ```
 
-## What it does
+`release:check` runs lint, offline unit tests, a production build, starts the production server on a temporary port, validates `/api/players`, and stops the server. Deployment is intentionally separate.
 
-- **Configurable scoring** — PPR / Half / Standard / TE-Premium presets, plus
-  every stat value editable. Points are computed from raw stat projections, so
-  any scoring system works.
-- **Configurable roster** — teams, starters, FLEX, **SUPERFLEX**, bench.
-- **K / DEF** — included using Sleeper's precomputed points (`pts_std`), since
-  their scoring (FG distance, points-allowed tiers) doesn't fit the
-  stat-based engine.
-- **VBD done right** — replacement levels use greedy slot assignment, so FLEX
-  and SUPERFLEX shift baselines correctly (QBs become premium in superflex; TEs
-  rise in TE-premium). This is the part naive cheat sheets get wrong.
-- **Tiers** — gap-based clustering per position.
-- **Bye weeks** — 2026 team bye map baked in; shown inline per player.
-- **ADP enrichment** — Sleeper ADP averaged with ESPN ADP for a consensus value
-  column vs. rank; 7-day trend indicators (rising/falling) from a local ADP
-  snapshot; a 2025 actual-points column alongside the projection.
-- **Risk scores** — heuristic from injury status/notes and experience,
-  sortable.
-- **Player comparison modal** and a **Sleeper league import** (pulls a real
-  league's scoring/roster settings, plus keeper/dynasty keep-lists, into the
-  config).
-- **Mock Draft tab** — CPU, manual, or live-sync (real Sleeper draft) modes;
-  keepers, traded picks, custom team names, a post-draft letter grade vs. ADP,
-  a watchlist, a full board grid view, a positional scarcity chart, CSV export.
-- **Auction tab** — nomination/bidding flow with a suggested-bid tracker
-  against remaining budget.
-- **Draft tracker** — cross players off as they're taken; settings + drafted
-  list persist in `localStorage`.
+## Features
+
+- Custom PPR/Half/Standard/TE-premium scoring and configurable FLEX/SUPERFLEX rosters.
+- VOLS/VORP rankings with one consistent definition: replacement is the first undrafted player.
+- Format-safe market values: Sleeper's selected format is authoritative; ESPN supplements PPR only.
+- Snake/mock drafts with true snake keepers, traded-pick ownership, roster-valid seeded CPU teams, pick-cost grades, persistent targets/avoids/notes, tier cliffs, runs, and next-pick survival context.
+- A full draft board grid view and a positional scarcity chart, plus a side-by-side player comparison modal.
+- Read-only Sleeper live sync through documented REST polling. There is no unofficial streaming protocol.
+- Auction planning with $1-per-open-slot reserves, hard maximum bids, roster capacity checks, team-specific inflation, and dollars-per-slot guidance.
+- Raw 2025 historical stats scored with the active league settings.
+- Versioned browser-storage envelopes and shared server/CDN caching for normalized player responses.
 
 ## Architecture
 
-| File | Role |
-|------|------|
-| `lib/sleeper.ts` | Fetch + normalize Sleeper projections (memoized 12h); `SEASON` constant |
-| `lib/sleeper-league.ts` | Sleeper user/league lookup; maps league scoring + roster settings onto our config; keeper/dynasty keep-list |
-| `lib/espn.ts` | Fetch + normalize ESPN ADP (memoized 12h), fuzzy name matching |
-| `lib/byes.ts` | 2026 team → bye week map |
-| `lib/scoring.ts` | Raw stats → fantasy points for a scoring config |
-| `lib/vbd.ts` | Greedy replacement levels, VBD, tiers, ranking |
-| `lib/presets.ts` | Scoring/roster presets |
-| `lib/types.ts` | Domain types: `Player`, `ScoringConfig`, `RosterConfig`, `RankedPlayer` |
-| `app/api/players/route.ts` | Serves the normalized, enriched player pool (Sleeper + ESPN ADP + 2025 actuals) |
-| `components/AppShell.tsx` | Tab switcher: Cheat Sheet / Mock Draft / Auction |
-| `components/DraftBoard.tsx` | Cheat sheet: config-driven recompute, filters, cross-off, trends, risk, value-vs-ADP |
-| `components/ConfigPanel.tsx` | Scoring/roster/VBD-method controls |
-| `components/LeagueImport.tsx` | Sleeper league lookup UI, feeds `mapLeagueToConfig` |
-| `components/PlayerCompare.tsx` | Side-by-side player comparison modal |
-| `components/MockDraft.tsx` | Mock draft: CPU/manual/live modes, Sleeper draft import, keepers, traded picks, grading, CSV export |
-| `components/DraftBoardGrid.tsx` | Full draft board grid view (round × team) |
-| `components/ScarcityChart.tsx` | Positional scarcity chart used in the mock draft |
-| `components/AuctionDraft.tsx` | Auction draft: nomination/bidding with suggested-bid tracker |
-| `components/useLocalStorage.ts` | SSR-safe persisted state hook |
+| Area | Files |
+| --- | --- |
+| Ranking/scoring | `lib/scoring.ts`, `lib/vbd.ts`, `lib/market.ts`, `lib/risk.ts` |
+| Draft domain | `lib/draft.ts`, `components/MockDraft.tsx`, `components/DraftBoardGrid.tsx`, `components/ScarcityChart.tsx` |
+| Auction domain | `lib/auction.ts`, `components/AuctionDraft.tsx` |
+| Persistence/input | `lib/persistence.ts`, `lib/validation.ts`, `lib/annotations.ts`, `components/useLocalStorage.ts` |
+| Player data | `lib/sleeper.ts`, `lib/espn.ts`, `app/api/players/route.ts` |
+| Shared UI | `lib/ui.ts`, `components/PlayerCompare.tsx` |
+| Regression suite | `tests/domain.test.ts` |
 
-Data sources: Sleeper (`https://api.sleeper.com/projections/nfl/<season>` for
-projections, `https://api.sleeper.app/v1` for users/leagues/drafts) and ESPN
-(ADP). Season is set in `lib/sleeper.ts` (`SEASON`).
+The raw Sleeper responses exceed Next's fetch-cache item limit, so they are normalized first. The API payload is cached in the Next Data Cache and returned with explicit shared CDN freshness/staleness headers. Optional ESPN/history failures degrade independently.
+
+See [METHODOLOGY.md](METHODOLOGY.md) for formulas, examples, and limitations, and [ROADMAP.md](ROADMAP.md) for the implementation history and acceptance gates.
+
+## Browser storage
+
+Current `ffdp.*` values are stored in a versioned `{ version, data }` envelope. Legacy unversioned values migrate on read. Player annotations are keyed by season and player ID so they do not leak into a later player pool.
+
+## Known approximations
+
+CPU behavior, survival probability, auction inflation, tiers, recommendations, and risk are decision aids—not forecasts. Each uses deterministic inputs and exposes the factors available in the UI. Bye weeks remain a season-maintained static data source.
 
 ## Branching / CI
 

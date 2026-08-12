@@ -7,20 +7,15 @@ import { rankPlayers, type BaselineMethod } from "@/lib/vbd";
 import { DEFAULT_ROSTER, DEFAULT_SCORING } from "@/lib/presets";
 import { POS_BADGE } from "@/lib/ui";
 import { useLocalStorage } from "./useLocalStorage";
+import {
+  auctionBudget, auctionPriceFromPool, auctionValuePool, averageAuctionBudget, clampAuctionSetupInput,
+  isValidAuctionSetup, isValidWonPlayers, legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
+  unionLegalPositions, wonPlayersWithinTeams, type AuctionSetup, type WonPlayer,
+} from "@/lib/auction";
+import { rosterSlots } from "@/lib/draft";
+import { validRoster, validScoring } from "@/lib/validation";
 
 type Filter = "ALL" | Position;
-
-interface WonPlayer {
-  playerId: string;
-  teamIndex: number;
-  price: number;
-}
-
-interface AuctionSetup {
-  numTeams: number;
-  budgetPerTeam: number;
-  started: boolean;
-}
 
 const DEFAULT_SETUP: AuctionSetup = {
   numTeams: 12,
@@ -34,18 +29,22 @@ export default function AuctionDraft() {
   const [error, setError] = useState<string | null>(null);
 
   // Inherit the same config as DraftBoard so rankings match
-  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING);
-  const [rosterCfg] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER);
+  const [scoring] = useLocalStorage("ffdp.scoring", DEFAULT_SCORING, validScoring);
+  const [rosterCfg] = useLocalStorage("ffdp.roster", DEFAULT_ROSTER, validRoster);
   const [method] = useLocalStorage<BaselineMethod>("ffdp.method", "VOLS");
 
-  // Auction-specific persisted state
+  // Auction-specific persisted state. Validated on load so malformed
+  // localStorage (e.g. a non-numeric price) can't flow into budget math and
+  // silently defeat the max-bid gate (see lib/auction.ts).
   const [wonPlayers, setWonPlayers] = useLocalStorage<WonPlayer[]>(
     "ffdp.auction.wonPlayers",
-    []
+    [],
+    isValidWonPlayers
   );
   const [setup, setSetup, setupHydrated] = useLocalStorage<AuctionSetup>(
     "ffdp.auction.setup",
-    DEFAULT_SETUP
+    DEFAULT_SETUP,
+    isValidAuctionSetup
   );
 
   // Local draft of the setup form (pre-Start); syncs once localStorage hydrates
@@ -53,9 +52,11 @@ export default function AuctionDraft() {
     numTeams: DEFAULT_SETUP.numTeams,
     budgetPerTeam: DEFAULT_SETUP.budgetPerTeam,
   });
+  const [setupMessage, setSetupMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (setupHydrated) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate editable form draft from persisted setup
       setSetupDraft({
         numTeams: setup.numTeams,
         budgetPerTeam: setup.budgetPerTeam,
@@ -73,6 +74,10 @@ export default function AuctionDraft() {
   const [nomineeWinner, setNomineeWinner] = useState(0);
   const [nomineeBid, setNomineeBid] = useState("");
   const [bidError, setBidError] = useState<string | null>(null);
+  // Tracks whether the user has hand-edited the bid for the current
+  // nomination. Once true, changing the winning-team dropdown must not
+  // overwrite a price the user already typed.
+  const [bidTouched, setBidTouched] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,9 +99,18 @@ export default function AuctionDraft() {
     return rankPlayers(players, scoring, rosterCfg, method).players;
   }, [players, scoring, rosterCfg, method]);
 
+  // See wonPlayersWithinTeams in lib/auction.ts: drops any persisted
+  // wonPlayers entry whose teamIndex falls outside the live team count, so
+  // it can't stay marked "taken" via wonSet while being invisible to every
+  // team's budget/roster derivation below.
+  const validWonPlayers = useMemo(
+    () => wonPlayersWithinTeams(wonPlayers, setup.numTeams),
+    [wonPlayers, setup.numTeams]
+  );
+
   const wonSet = useMemo(
-    () => new Set(wonPlayers.map((w) => w.playerId)),
-    [wonPlayers]
+    () => new Set(validWonPlayers.map((w) => w.playerId)),
+    [validWonPlayers]
   );
 
   // Available = ranked players not yet won
@@ -111,87 +125,60 @@ export default function AuctionDraft() {
       { length: setup.numTeams },
       () => setup.budgetPerTeam
     );
-    for (const w of wonPlayers) {
+    for (const w of validWonPlayers) {
       if (w.teamIndex >= 0 && w.teamIndex < arr.length) {
         arr[w.teamIndex] -= w.price;
       }
     }
     return arr;
-  }, [wonPlayers, setup.numTeams, setup.budgetPerTeam]);
+  }, [validWonPlayers, setup.numTeams, setup.budgetPerTeam]);
 
-  // Roster size per team, approximated from the roster config used for VBD
-  // (qb + rb + wr + te + flex + superflex + bench). This doesn't count K/DEF
-  // since those aren't modeled in rosterCfg, but it's close enough to know
-  // how many more players a team must still buy.
-  const rosterSize =
-    rosterCfg.qb +
-    rosterCfg.rb +
-    rosterCfg.wr +
-    rosterCfg.te +
-    rosterCfg.flex +
-    rosterCfg.superflex +
-    rosterCfg.bench;
+  const slots = useMemo(() => rosterSlots(rosterCfg), [rosterCfg]);
+  const teamPlayers = useMemo(() => Array.from({ length: setup.numTeams }, (_, teamIndex) => validWonPlayers
+    .filter((win) => win.teamIndex === teamIndex)
+    .flatMap((win) => {
+      const player = ranked.find((item) => item.id === win.playerId);
+      return player ? [{ id: player.id, position: player.position }] : [];
+    })), [setup.numTeams, validWonPlayers, ranked]);
+  const budgetGuidance = useMemo(() => budgets.map((remaining, teamIndex) => auctionBudget(
+    setup.budgetPerTeam,
+    setup.budgetPerTeam - remaining,
+    slots.length,
+    teamPlayers[teamIndex]?.length ?? 0,
+  )), [budgets, setup.budgetPerTeam, slots.length, teamPlayers]);
+  const remainingTotalBudget = useMemo(() => budgets.reduce((sum, budget) => sum + budget, 0), [budgets]);
 
-  // How many players each team has already won.
-  const wonCountByTeam = useMemo(() => {
-    const counts = Array.from({ length: setup.numTeams }, () => 0);
-    for (const w of wonPlayers) {
-      if (w.teamIndex >= 0 && w.teamIndex < counts.length) {
-        counts[w.teamIndex] += 1;
-      }
-    }
-    return counts;
-  }, [wonPlayers, setup.numTeams]);
-
-  // Unfilled roster slots per team, floored at 0 (a team could already have
-  // more players than rosterSize if the user over-drafted manually).
-  const unfilledSlotsByTeam = useMemo(
-    () => wonCountByTeam.map((count) => Math.max(0, rosterSize - count)),
-    [wonCountByTeam, rosterSize]
+  // Per-team legal-position set, computed once per team (not once per
+  // visible player row). Legality of a $1 nomination only depends on the
+  // team's roster + budget + the candidate's position, never on which
+  // specific player is asked about, so this tests the ~6 known positions
+  // instead of running legalAuctionPurchase (and its backtracking
+  // assignRoster solve) for every available player on every row render.
+  // NOTE: this only hoists the assignRoster probe out of the per-row path —
+  // it says nothing about the O(available.length) VBD-pool sum inside
+  // teamAuctionValue, which is hoisted separately below (marketPool).
+  const teamLegalPositions = useMemo(
+    () => budgetGuidance.map((budget, teamIndex) => legalPositionsForTeam(budget, teamPlayers[teamIndex] ?? [], slots)),
+    [budgetGuidance, teamPlayers, slots]
   );
 
-  // Total unfilled slots across the whole league — every one of these needs
-  // at least $1, so that money isn't "discretionary" (biddable above the floor).
-  const totalUnfilledSlots = useMemo(
-    () => unfilledSlotsByTeam.reduce((a, b) => a + b, 0),
-    [unfilledSlotsByTeam]
-  );
+  // Team-agnostic market price for the board-wide "Sug. Bid" column. Must not
+  // depend on the nominee-winner dropdown (that would silently rewrite every
+  // row's price whenever the dropdown changes) and must not collapse to $0
+  // just because one arbitrary team's roster happens to be full — so this
+  // unions legal positions across every team and averages their budgets,
+  // rather than reading a single team's numbers. Computed once per render
+  // (not once per row) since every row prices against the same pool.
+  const marketLegalPositions = useMemo(() => unionLegalPositions(teamLegalPositions), [teamLegalPositions]);
+  const marketBudget = useMemo(() => averageAuctionBudget(budgetGuidance), [budgetGuidance]);
+  const marketPool = useMemo(() => auctionValuePool(available, marketLegalPositions), [available, marketLegalPositions]);
 
-  // Suggested bid formula: (player.vbd / positiveVorPool) × discretionaryTotal, plus
-  // the $1 floor. Denominator (VOR pool) is over *available* players only, capped to
-  // the top `numTeams × rosterSize` of them by VOR — that's the most that will ever
-  // actually get rostered, so undraftable tail players shouldn't dilute the pool.
-  const positiveVorPool = useMemo(() => {
-    const rosterableCount = setup.numTeams * rosterSize;
-    const topByVor = [...available]
-      .sort((a, b) => b.vbd - a.vbd)
-      .slice(0, rosterableCount);
-    return topByVor.reduce((sum, p) => (p.vbd > 0 ? sum + p.vbd : sum), 0);
-  }, [available, setup.numTeams, rosterSize]);
-  const remainingTotalBudget = useMemo(
-    () => budgets.reduce((a, b) => a + b, 0),
-    [budgets]
-  );
-  // Discretionary pool = money left over once every unfilled slot reserves its $1.
-  const discretionaryTotal = Math.max(
-    0,
-    remainingTotalBudget - totalUnfilledSlots
-  );
-
-  function suggestedBid(p: RankedPlayer): number {
-    if (p.vbd <= 0 || positiveVorPool <= 0) return 1;
-    return Math.max(
-      1,
-      Math.round((p.vbd / positiveVorPool) * discretionaryTotal) + 1
-    );
-  }
-
-  // Max legal bid for a team: its remaining budget minus $1 reserved for each
-  // *other* unfilled slot it still has to fill (this bid fills one of them).
-  function maxBidForTeam(teamIndex: number): number {
-    if (teamIndex < 0 || teamIndex >= budgets.length) return 0;
-    const otherUnfilled = Math.max(0, unfilledSlotsByTeam[teamIndex] - 1);
-    return Math.max(0, budgets[teamIndex] - otherUnfilled);
+  // Team-specific price for the nomination panel, where the team is explicit
+  // (either the team the dropdown is currently set to, or a caller-supplied
+  // one) — unlike the board column, this one legitimately depends on teamIndex.
+  function suggestedBid(p: RankedPlayer, teamIndex: number): number {
+    const legalPositions = teamLegalPositions[teamIndex] ?? new Set<Position>();
+    return teamAuctionValue(p, available, budgetGuidance[teamIndex], legalPositions);
   }
 
   const visibleRows = useMemo(() => {
@@ -209,33 +196,50 @@ export default function AuctionDraft() {
   }, [available, filter, query]);
 
   function handleStart() {
-    const n = Math.max(2, setupDraft.numTeams || 12);
-    const b = Math.max(1, setupDraft.budgetPerTeam || 200);
-    setSetup({ numTeams: n, budgetPerTeam: b, started: true });
+    const minimumRoster = slots.length;
+    const clamped = clampAuctionSetupInput(setupDraft.numTeams, setupDraft.budgetPerTeam, minimumRoster);
+    if (clamped.adjusted) {
+      // Clamp to the nearest bound and show what changed, instead of
+      // silently substituting a fallback default (e.g. 33 teams -> 32, not a
+      // silent 12-team default). Require a second Start click to confirm.
+      setSetupDraft({ numTeams: clamped.numTeams, budgetPerTeam: clamped.budgetPerTeam });
+      setSetupMessage(clamped.messages.join(" "));
+      return;
+    }
+    setSetupMessage(null);
+    setSetup({ numTeams: clamped.numTeams, budgetPerTeam: clamped.budgetPerTeam, started: true });
     setWonPlayers([]);
+    // Clear any open nomination so a re-start with a different team count
+    // can't leave a stale nomineeWinner index pointing past a shorter
+    // budgetGuidance array.
+    setNomineeId(null);
+    setNomineeWinner(0);
+    setNomineeBid("");
+    setBidError(null);
+    setBidTouched(false);
   }
 
   function handleNominate(p: RankedPlayer) {
     setNomineeId(p.id);
     setNomineeWinner(0);
-    setNomineeBid(String(suggestedBid(p)));
+    setNomineeBid(String(suggestedBid(p, 0)));
     setBidError(null);
+    // Fresh nomination: auto-suggest again until the user edits the bid.
+    setBidTouched(false);
   }
 
   function handleConfirmWin() {
     if (!nomineeId) return;
     const price = parseInt(nomineeBid, 10);
-    if (isNaN(price) || price < 1) {
-      setBidError("Enter a bid of at least $1.");
-      return;
-    }
-    const maxBid = maxBidForTeam(nomineeWinner);
-    if (price > maxBid) {
-      setBidError(
-        `${teamLabel(nomineeWinner)} can bid at most $${maxBid} (must save $1 for each remaining roster slot).`
-      );
-      return;
-    }
+    const nominee = ranked.find((player) => player.id === nomineeId);
+    if (!nominee) return;
+    // Guard against a stale nomineeWinner index (e.g. left over from a
+    // reset while a nomination panel was open, then a restart with fewer
+    // teams) indexing past the current budgetGuidance array.
+    const budget = budgetGuidance[nomineeWinner];
+    if (!budget) { setBidError("That team is no longer part of the auction — re-nominate the player."); return; }
+    const validation = legalAuctionPurchase(price, budget, teamPlayers[nomineeWinner] ?? [], nominee, slots);
+    if (!validation.legal) { setBidError(validation.reason); return; }
     setWonPlayers((prev) => [
       ...prev,
       { playerId: nomineeId, teamIndex: nomineeWinner, price },
@@ -244,25 +248,34 @@ export default function AuctionDraft() {
     setNomineeBid("");
     setNomineeWinner(0);
     setBidError(null);
+    setBidTouched(false);
   }
 
   function handleReset() {
     if (!window.confirm("Reset the auction? All bids will be cleared.")) return;
     setWonPlayers([]);
     setSetup({ ...setup, started: false });
+    // Clear any open nomination so a restart can't inherit a stale
+    // nomineeWinner index that later falls out of bounds if the auction
+    // restarts with fewer teams.
+    setNomineeId(null);
+    setNomineeWinner(0);
+    setNomineeBid("");
+    setBidError(null);
+    setBidTouched(false);
   }
 
   // Rosters for the right panel
   const teamRosters = useMemo(() => {
     return Array.from({ length: setup.numTeams }, (_, i) =>
-      wonPlayers
+      validWonPlayers
         .filter((w) => w.teamIndex === i)
         .map((w) => ({
           ...w,
           player: ranked.find((r) => r.id === w.playerId),
         }))
     );
-  }, [wonPlayers, ranked, setup.numTeams]);
+  }, [validWonPlayers, ranked, setup.numTeams]);
 
   function teamLabel(i: number) {
     return i === 0 ? "You" : `Team ${i + 1}`;
@@ -309,6 +322,11 @@ export default function AuctionDraft() {
               className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-zinc-100 focus:border-emerald-500 focus:outline-none"
             />
           </div>
+          {setupMessage && (
+            <p role="alert" className="mb-4 text-xs text-rose-400">
+              {setupMessage}
+            </p>
+          )}
           <button
             onClick={handleStart}
             className="w-full rounded-lg bg-emerald-500 py-2.5 font-semibold text-zinc-950 transition hover:bg-emerald-400"
@@ -322,7 +340,7 @@ export default function AuctionDraft() {
 
   // ---- Main screen ----
   return (
-    <div className="flex gap-4">
+    <div className="flex flex-col gap-4 xl:flex-row">
       {/* Left panel — available players */}
       <div className="min-w-0 flex-1">
         <div className="mb-3 flex flex-wrap items-center gap-3">
@@ -370,8 +388,8 @@ export default function AuctionDraft() {
         )}
 
         {players && (
-          <div className="overflow-hidden rounded-xl border border-zinc-800">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl border border-zinc-800" tabIndex={0} aria-label="Auction player values">
+            <table className="min-w-[700px] w-full text-sm">
               <thead className="bg-zinc-900/80 text-xs uppercase tracking-wide">
                 <tr>
                   <th className="px-3 py-2 text-left font-medium text-zinc-500">
@@ -398,7 +416,7 @@ export default function AuctionDraft() {
               <tbody>
                 {visibleRows.map((p) => {
                   const isNominated = nomineeId === p.id;
-                  const bid = suggestedBid(p);
+                  const bid = auctionPriceFromPool(p, marketPool, marketBudget);
                   return (
                     <Fragment key={p.id}>
                       <tr
@@ -466,7 +484,13 @@ export default function AuctionDraft() {
                               <select
                                 value={nomineeWinner}
                                 onChange={(e) => {
-                                  setNomineeWinner(parseInt(e.target.value, 10));
+                                  const winner = parseInt(e.target.value, 10);
+                                  setNomineeWinner(winner);
+                                  // Only auto-fill the suggested bid while the
+                                  // user hasn't hand-edited it — otherwise
+                                  // switching the winning team clobbers a
+                                  // price they already typed.
+                                  if (!bidTouched) setNomineeBid(String(suggestedBid(p, winner)));
                                   setBidError(null);
                                 }}
                                 className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
@@ -481,7 +505,7 @@ export default function AuctionDraft() {
                                 )}
                               </select>
                               <span className="text-sm text-zinc-400">
-                                (max ${maxBidForTeam(nomineeWinner)})
+                                (max ${budgetGuidance[nomineeWinner]?.maxBid})
                               </span>
                               <span className="text-sm text-zinc-400">at</span>
                               <div className="flex items-center gap-1">
@@ -489,12 +513,11 @@ export default function AuctionDraft() {
                                 <input
                                   type="number"
                                   min={1}
-                                  max={maxBidForTeam(nomineeWinner)}
+                                  max={budgetGuidance[nomineeWinner]?.maxBid}
                                   value={nomineeBid}
-                                  onChange={(e) => {
-                                    setNomineeBid(e.target.value);
-                                    setBidError(null);
-                                  }}
+                                  onChange={(e) =>
+                                    { setNomineeBid(e.target.value); setBidError(null); setBidTouched(true); }
+                                  }
                                   className="w-20 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                                 />
                               </div>
@@ -510,6 +533,9 @@ export default function AuctionDraft() {
                                 </span>
                               )}
                             </div>
+                            <p className="mt-2 text-xs text-zinc-500">
+                              {teamLabel(nomineeWinner)}: ${budgetGuidance[nomineeWinner]?.remaining} left · ${budgetGuidance[nomineeWinner]?.reservedMinimum} reserved · ${budgetGuidance[nomineeWinner]?.maxBid} max
+                            </p>
                           </td>
                         </tr>
                       )}
@@ -533,14 +559,14 @@ export default function AuctionDraft() {
 
         {players && (
           <p className="mt-3 text-xs text-zinc-600">
-            {available.length} players available · {wonPlayers.length} won ·
+            {available.length} players available · {validWonPlayers.length} won ·
             ${remainingTotalBudget} remaining across all teams
           </p>
         )}
       </div>
 
       {/* Right panel — rosters */}
-      <div className="w-56 shrink-0">
+      <div className="w-full shrink-0 xl:w-64">
         <h3 className="mb-2 text-xs uppercase tracking-widest text-zinc-500">
           Rosters
         </h3>
@@ -571,9 +597,16 @@ export default function AuctionDraft() {
                 </span>
               </div>
               <div className="mb-1.5 text-[11px] text-zinc-600">
-                max bid ${maxBidForTeam(i)}
+                max bid ${budgetGuidance[i].maxBid}
               </div>
               <div className="space-y-0.5">
+                <div className="mb-2 grid grid-cols-2 gap-x-2 text-[10px] text-zinc-500">
+                  <span>{budgetGuidance[i].openSlots} slots</span>
+                  <span className="text-right">${budgetGuidance[i].dollarsPerSlot.toFixed(1)}/slot</span>
+                  <span>${budgetGuidance[i].reservedMinimum} reserved</span>
+                  <span className="text-right">${budgetGuidance[i].maxBid} max</span>
+                  <span className="col-span-2">${budgetGuidance[i].spendable} spendable above min</span>
+                </div>
                 {teamRoster.map((w) => (
                   <div
                     key={w.playerId}

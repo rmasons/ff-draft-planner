@@ -15,12 +15,18 @@ const MODE_LABELS: Record<Mode, string> = {
 
 export default function AppShell() {
   const [mode, setMode] = useState<Mode>("cheat-sheet");
+  const [draftActive, setDraftActive] = useState(false);
 
   function handleModeChange(next: Mode) {
     if (next === mode) return;
-    // Mock drafts persist to sessionStorage and restore on remount (see
-    // MockDraft), so switching tabs no longer loses in-progress draft state —
-    // no confirmation needed here anymore.
+    if (
+      draftActive &&
+      !window.confirm(
+        "Leave this draft? A live draft connection would need to be reconnected. (In-progress mock drafts are saved and restored.)"
+      )
+    ) {
+      return;
+    }
     setMode(next);
   }
 
@@ -55,7 +61,7 @@ export default function AppShell() {
       {mode === "cheat-sheet" ? (
         <DraftBoard />
       ) : mode === "mock-draft" ? (
-        <MockDraft />
+        <MockDraft onActiveChange={setDraftActive} />
       ) : (
         <AuctionDraft />
       )}
