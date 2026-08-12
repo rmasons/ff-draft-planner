@@ -316,10 +316,14 @@ export default function DraftBoard() {
           (filter !== "ALL"
             ? !prev || prev.tier !== p.tier
             : !!prev && prev.position === p.position && prev.tier !== p.tier);
+        // replRank is the replacement player's OWN 1-based positional rank
+        // (baselines[filter].rank), so the divider must break AT that rank —
+        // the replacement player is the first row below the line — not one
+        // row later. Using `> replRank` here drew the line one player too late.
         const replBreak =
           replRank !== null &&
-          p.posRank > replRank &&
-          (!prev || prev.posRank <= replRank);
+          p.posRank >= replRank &&
+          (!prev || prev.posRank < replRank);
         const market = marketReference(p, scoring, roster);
         // valueVsMarket returns null for K/DEF (forced to the bottom of the
         // board by design, see rankPlayers in lib/vbd.ts) and for players
