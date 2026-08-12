@@ -159,13 +159,15 @@ export async function fetchPlayers(): Promise<Player[]> {
 // fetch-cache limit — use cache:"no-store" (see fetchPlayersOnce above for
 // why that doesn't mean "uncached": the caller's unstable_cache layer is the
 // durable cache for the normalized result).
-const STATS_2025_URL =
-  `https://api.sleeper.com/stats/nfl/2025` +
+// Tracks the prior completed season (seasonYear - 1), mirroring SEASON above,
+// so this doesn't go stale once the app rolls into a new season.
+const PRIOR_STATS_URL =
+  `https://api.sleeper.com/stats/nfl/${seasonYear - 1}` +
   `?season_type=regular&order_by=pts_ppr` +
   ALL_POSITIONS.map((p) => `&position[]=${p}`).join("");
 
 async function fetch2025ActualStatsOnce(): Promise<Map<string, RawStats>> {
-  const res = await fetch(STATS_2025_URL, {
+  const res = await fetch(PRIOR_STATS_URL, {
     cache: "no-store",
     headers: { accept: "application/json" },
   });
