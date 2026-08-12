@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auctionBudget, legalAuctionPurchase, teamAuctionValue } from "../lib/auction";
+import { auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, legalAuctionPurchase, teamAuctionValue } from "../lib/auction";
 import {
   assignRoster, chooseCpuPick, gradeLetter, gradePick, keeperAdjustedAdp, keeperValue, ownerForPick,
   pickNumberForSlot, positionalRun, rosterSlots, seededRandom, survivalEstimate,
@@ -118,6 +118,21 @@ describe("auction legality and inflation", () => {
     const poorer = teamAuctionValue(p, [p], auctionBudget(200, 180, 5, 2), new Set(["RB"]));
     expect(richer).toBeGreaterThan(poorer);
     expect(poorer).toBeLessThanOrEqual(18);
+  });
+
+  it("rejects a fractional budgetPerTeam but accepts a valid integer setup", () => {
+    expect(isValidAuctionSetup({ numTeams: 12, budgetPerTeam: 199.99, started: true })).toBe(false);
+    expect(isValidAuctionSetup({ numTeams: 12, budgetPerTeam: 200, started: true })).toBe(true);
+  });
+
+  it("clamps a non-finite budget to minBudget, not a bare 200, when minBudget exceeds 200", () => {
+    // minimumRosterSize isn't range-checked inside clampAuctionSetupInput itself
+    // (callers bound it via roster slot count, typically well under 200), so we
+    // pass a large value directly through the public signature to push minBudget
+    // above 200 and exercise the fallback branch being fixed.
+    const result = clampAuctionSetupInput(12, NaN, 250);
+    expect(result.budgetPerTeam).toBeGreaterThanOrEqual(250);
+    expect(result.budgetPerTeam).toBeLessThanOrEqual(10000);
   });
 });
 

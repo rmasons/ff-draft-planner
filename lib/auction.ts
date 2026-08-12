@@ -143,7 +143,7 @@ export function isValidAuctionSetup(value: unknown): value is AuctionSetup {
   const record = value as Record<string, unknown>;
   return (
     typeof record.numTeams === "number" && Number.isInteger(record.numTeams) && record.numTeams >= MIN_TEAMS && record.numTeams <= MAX_TEAMS &&
-    typeof record.budgetPerTeam === "number" && Number.isFinite(record.budgetPerTeam) && record.budgetPerTeam >= 1 && record.budgetPerTeam <= MAX_BUDGET_PER_TEAM &&
+    typeof record.budgetPerTeam === "number" && Number.isFinite(record.budgetPerTeam) && Number.isInteger(record.budgetPerTeam) && record.budgetPerTeam >= 1 && record.budgetPerTeam <= MAX_BUDGET_PER_TEAM &&
     typeof record.started === "boolean"
   );
 }
@@ -163,7 +163,7 @@ export function clampAuctionSetupInput(numTeams: number, budgetPerTeam: number, 
 
   const minBudget = Math.max(1, minimumRosterSize);
   const budgetValid = Number.isInteger(budgetPerTeam) && budgetPerTeam >= minBudget && budgetPerTeam <= MAX_BUDGET_PER_TEAM;
-  const b = Number.isFinite(budgetPerTeam) ? Math.min(MAX_BUDGET_PER_TEAM, Math.max(minBudget, Math.round(budgetPerTeam))) : 200;
+  const b = Number.isFinite(budgetPerTeam) ? Math.min(MAX_BUDGET_PER_TEAM, Math.max(minBudget, Math.round(budgetPerTeam))) : Math.min(MAX_BUDGET_PER_TEAM, Math.max(minBudget, 200));
   if (!budgetValid) messages.push(`Budget per team adjusted to $${b} (allowed range $${minBudget}-$${MAX_BUDGET_PER_TEAM}).`);
 
   return { numTeams: n, budgetPerTeam: b, adjusted: messages.length > 0, messages };

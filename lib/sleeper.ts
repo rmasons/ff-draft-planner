@@ -114,7 +114,7 @@ function normalize(rec: SleeperRecord): Player | null {
 // (Next's fetch `no-store` fetches the resource from the remote server every
 // time it's called, regardless of the surrounding cache/revalidate context —
 // see node_modules/next/dist/docs/01-app/03-api-reference/04-functions/fetch.md).
-async function fetchAndNormalize(): Promise<Player[]> {
+async function fetchPlayersOnce(): Promise<Player[]> {
   const res = await fetch(SLEEPER_URL, {
     cache: "no-store",
     headers: { accept: "application/json" },
@@ -139,17 +139,24 @@ async function fetchAndNormalize(): Promise<Player[]> {
 /**
  * Fetch + normalize the draftable player pool. This is the required source:
  * a caller (app/api/players/route.ts) is expected to let a failure here
- * propagate rather than fall back to an empty pool.
+ * propagate rather than fall back to an empty pool. Retries once on failure,
+ * then lets the rejection propagate — mirrors fetch2025ActualStats below (and
+ * fetchEspnAdp in lib/espn.ts), which the caching-strategy comment in
+ * app/api/players/route.ts relies on for every source.
  */
 export async function fetchPlayers(): Promise<Player[]> {
-  return fetchAndNormalize();
+  try {
+    return await fetchPlayersOnce();
+  } catch {
+    return await fetchPlayersOnce();
+  }
 }
 
 // ── 2025 season actuals ────────────────────────────────────────────────────────
 
 // One bulk request covering all fantasy positions. The stats response is the
 // same size class as projections (~3MB+), so it also exceeds Next's 2MB
-// fetch-cache limit — use cache:"no-store" (see fetchAndNormalize above for
+// fetch-cache limit — use cache:"no-store" (see fetchPlayersOnce above for
 // why that doesn't mean "uncached": the caller's unstable_cache layer is the
 // durable cache for the normalized result).
 const STATS_2025_URL =

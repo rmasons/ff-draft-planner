@@ -138,6 +138,9 @@ function assignRoster(
 
 const DRAFT_SETUP_KEY = "ffdp.draft-setup";
 const KEEPER_SETUP_KEY = "ffdp.pending-keepers";
+// Snapshot of an in-progress draft (after "started" becomes true), so a
+// refresh mid-draft doesn't throw away everything.
+const ACTIVE_DRAFT_KEY = "ffdp.draft-active";
 
 /** Renders inferred keeper rounds for the import status line, e.g. "round 14"
  *  for a single round or "rounds 13–14" (en dash) for a contiguous range.
@@ -268,6 +271,42 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
         if (Array.isArray(ks)) setPendingKeepers(ks);
       } catch { /* ignore */ }
     }
+    // Restore an in-progress draft, if one was left running. This runs after
+    // the DRAFT_SETUP_KEY restore above so its `setPicks`/`setUserSlot` calls
+    // win for a draft that had already started (the setup snapshot only ever
+    // reflects the pre-start import step).
+    const rawActive = sessionStorage.getItem(ACTIVE_DRAFT_KEY);
+    if (rawActive) {
+      try {
+        const a = parseStored<Record<string, unknown>>(rawActive, {}).value as {
+          picks?: MockPick[]; userSlot?: number; draftId?: string;
+          draftMode?: "cpu" | "manual" | "live"; started?: boolean;
+        };
+        if (Array.isArray(a.picks)) setPicks(a.picks);
+        if (typeof a.userSlot === "number") setUserSlot(a.userSlot);
+        // Redundant with DRAFT_SETUP_KEY (handleImport writes draftId there
+        // too) but kept here so the active-draft snapshot is self-contained
+        // and this restore doesn't have to depend on the other one running.
+        if (a.draftId) setDraftId(a.draftId);
+        if (a.draftMode === "live") {
+          // Live mode holds no real connection across a refresh — land back
+          // on the setup screen (picks are restored) so the user has to hit
+          // Connect again rather than sitting in a "live" state that isn't.
+          // `started` is derived from draftStatus below, and draftStatus's
+          // default ("setup") is simply left untouched here.
+          setDraftMode("live");
+        } else if (a.draftMode === "cpu" || a.draftMode === "manual") {
+          setDraftMode(a.draftMode);
+          // `started` has no setter of its own — it's derived from
+          // draftStatus (a useReducer below), so drive it through the same
+          // READY -> START sequence startDraft() uses.
+          if (a.started) {
+            sendDraftEvent({ type: "READY" });
+            sendDraftEvent({ type: "START" });
+          }
+        }
+      } catch { /* ignore malformed storage */ }
+    }
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
@@ -279,6 +318,27 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
       sessionStorage.removeItem(KEEPER_SETUP_KEY);
     }
   }, [pendingKeepers]);
+
+  // Persist the in-progress draft so a refresh mid-draft doesn't lose it.
+  // Guarded on `started` so this doesn't fire (and clobber the snapshot with
+  // empty initial state) before the mount-restore effect above has run —
+  // `started` is false on first render, so this simply no-ops until either
+  // the restore effect or the user starts a draft. Only resetDraft() clears
+  // the stored snapshot; we deliberately never remove it here.
+  useEffect(() => {
+    if (!started) return;
+    sessionStorage.setItem(
+      ACTIVE_DRAFT_KEY,
+      encodeStored({
+        picks,
+        started,
+        draftMode,
+        userSlot,
+        // Only meaningful for draftMode === "live" (see restore effect above)
+        draftId,
+      }, SEASON)
+    );
+  }, [started, picks, draftMode, userSlot, draftId]);
 
   // Fetch player projections
   useEffect(() => {
@@ -788,6 +848,7 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
     setLeagueRosterPositions([]);
     sessionStorage.removeItem(DRAFT_SETUP_KEY);
     sessionStorage.removeItem(KEEPER_SETUP_KEY);
+    sessionStorage.removeItem(ACTIVE_DRAFT_KEY);
   }
 
   function exportCsv() {

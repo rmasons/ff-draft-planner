@@ -19,28 +19,47 @@ export const SLEEPER_SLOT_PRIORITY: Record<string, number> = {
   WRRB_FLEX: 6, REC_FLEX: 7, FLEX: 8, SUPER_FLEX: 9, BN: 10,
 };
 
-/**
- * Greedy lineup fill. Returns, per slot, the index of the player assigned to
- * it (or null). Slots are filled most-restrictive first; within a slot the
- * first unused eligible player wins, so `positions` should be in whatever
- * order the caller wants to prefer (draft order, for a roster display).
- */
 export function fillLineupSlots(slotTypes: string[], positions: string[]): (number | null)[] {
-  const used = new Set<number>();
-  const assigned: (number | null)[] = slotTypes.map(() => null);
+  // Specific slots before flexible ones, matched by augmenting paths — Kuhn's
+  // algorithm — not greedily. Greedy silently under-fills when eligibility
+  // sets overlap without nesting (Sleeper's WRRB_FLEX + REC_FLEX); see
+  // assignRoster for the full rationale.
   const order = slotTypes
     .map((_, i) => i)
     .sort((a, b) => (SLEEPER_SLOT_PRIORITY[slotTypes[a]] ?? 99) - (SLEEPER_SLOT_PRIORITY[slotTypes[b]] ?? 99));
-  for (const si of order) {
-    const eligible = new Set<string>(SLEEPER_SLOT_ELIGIBLE[slotTypes[si]] ?? []);
-    for (let pi = 0; pi < positions.length; pi++) {
-      if (!used.has(pi) && eligible.has(positions[pi])) {
-        assigned[si] = pi;
-        used.add(pi);
-        break;
+
+  const eligible = (si: number, pi: number): boolean =>
+    (SLEEPER_SLOT_ELIGIBLE[slotTypes[si]] as string[] | undefined ?? []).includes(positions[pi]);
+
+  const slotForPlayer = new Array<number>(positions.length).fill(-1);
+
+  const seat = (slotIndex: number, tried: boolean[]): boolean => {
+    for (let p = 0; p < positions.length; p++) {
+      if (tried[p] || slotForPlayer[p] !== -1) continue;
+      if (!eligible(slotIndex, p)) continue;
+      tried[p] = true;
+      slotForPlayer[p] = slotIndex;
+      return true;
+    }
+    for (let p = 0; p < positions.length; p++) {
+      if (tried[p] || !eligible(slotIndex, p)) continue;
+      tried[p] = true;
+      if (seat(slotForPlayer[p], tried)) {
+        slotForPlayer[p] = slotIndex;
+        return true;
       }
     }
+    return false;
+  };
+
+  let seated = 0;
+  for (const slotIndex of order) {
+    if (seated === positions.length) break;
+    if (seat(slotIndex, new Array<boolean>(positions.length).fill(false))) seated++;
   }
+
+  const assigned: (number | null)[] = slotTypes.map(() => null);
+  slotForPlayer.forEach((slotIndex, p) => { if (slotIndex !== -1) assigned[slotIndex] = p; });
   return assigned;
 }
 
@@ -186,7 +205,14 @@ export function depthCapacityByPosition(lineupSlotTypes: string[]): Record<Posit
  */
 export function depthValueFactor(held: number, startable: number): number {
   if (startable <= 0) return 0; // can't field one at all
-  const beyondStarters = Math.max(0, held + 1 - startable);
+  // The first unheld player holds full value whenever the position is
+  // startable at all (startable > 0), even through a shared flex — a
+  // fractional startable (e.g. 1/3 for a TE reachable only via a 3-way FLEX)
+  // would otherwise put `held + 1` past `startable` and discount the very
+  // first player, contradicting "value holds at full while you could still
+  // start the player." SUPER_FLEX's QB=1 credit sidesteps the same issue for
+  // QBs by keeping their startable at a whole number.
+  const beyondStarters = held < 1 ? 0 : Math.max(0, held + 1 - startable);
   return Math.max(0, 1 - beyondStarters / (startable + 1));
 }
 
@@ -661,6 +687,12 @@ export function mergeImportedKeepers(
     };
     const existing = keepers.find((k) => k.playerId === candidate.playerId);
     if (existing && !existing.roundConfirmed && candidate.roundConfirmed) {
+      // The upgrade confirms a round, which introduces a real pickNumber that
+      // could collide — so it must clear the same keeperConflict gate a fresh
+      // add does. Exclude `existing` itself so its matching playerId doesn't
+      // self-trip the duplicate check.
+      const others = keepers.filter((k) => k !== existing);
+      if (keeperConflict(candidate, others, existingPicks, numTeams)) { skipped++; continue; }
       existing.teamSlot = candidate.teamSlot;
       existing.round = candidate.round;
       existing.roundConfirmed = true;
@@ -778,10 +810,17 @@ export function mergeKeepersNonDestructive<T extends { pickNumber: number; isKee
   const byPickNum = new Map(existing.map((p) => [p.pickNumber, p]));
   const accepted: T[] = [];
   const skipped: T[] = [];
+  // Pick numbers an incoming keeper has already claimed within this batch —
+  // `byPickNum` alone only sees keepers that were already in `existing`, so
+  // two incoming keepers sharing a pickNumber would otherwise both pass and
+  // the later one would silently clobber the earlier in the merge below.
+  const acceptedPickNums = new Set<number>();
   for (const kp of keeperPicks) {
     const current = byPickNum.get(kp.pickNumber);
-    if (current && !current.isKeeper) skipped.push(kp);
-    else accepted.push(kp);
+    if (current && !current.isKeeper) { skipped.push(kp); continue; }
+    if (acceptedPickNums.has(kp.pickNumber)) { skipped.push(kp); continue; } // another keeper in THIS batch already took this slot
+    accepted.push(kp);
+    acceptedPickNums.add(kp.pickNumber);
   }
   if (accepted.length === 0) return { merged: existing, accepted, skipped };
   const merged = new Map(existing.map((p) => [p.pickNumber, p]));

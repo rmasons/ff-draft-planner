@@ -63,11 +63,15 @@ function leagueType(raw: RawLeague): LeagueType {
 }
 
 function parseLeague(raw: RawLeague): SleeperLeague {
+  // total_rosters is authoritative; settings.num_teams is the fallback. Guard
+  // a literal 0 (or any non-positive count), not just null/undefined — a team
+  // count of 0 divides into Infinity round numbers downstream (same guard as
+  // fetchLeagueKeepers).
+  const rawTeams = raw.total_rosters ?? raw.settings?.num_teams;
   return {
     league_id: raw.league_id,
     name: raw.name,
-    // total_rosters is the authoritative field; settings.num_teams as fallback.
-    total_rosters: raw.total_rosters ?? raw.settings?.num_teams ?? 12,
+    total_rosters: rawTeams && rawTeams > 0 ? rawTeams : 12,
     status: raw.status,
     season: raw.season,
     type: leagueType(raw),

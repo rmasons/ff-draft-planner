@@ -93,6 +93,24 @@ describe("BUG 7 — keeper merge must not silently overwrite an existing pick", 
     expect(merged.find((p) => p.pickNumber === 7)?.playerId).toBe("fresh-keeper");
     expect(merged).toHaveLength(2);
   });
+
+  it("rejects a second incoming keeper that lands on a pickNumber another keeper in the same batch already claimed", () => {
+    // Neither pickNumber-4 keeper is in `existing`, so byPickNum alone
+    // wouldn't catch this — only tracking accepted pick numbers within the
+    // batch does. The second one must not silently clobber the first.
+    const existing: { pickNumber: number; teamSlot: number; playerId: string; isKeeper?: boolean }[] = [];
+    const keeperPicks = [
+      { pickNumber: 4, teamSlot: 1, playerId: "first-keeper", isKeeper: true as const },
+      { pickNumber: 4, teamSlot: 2, playerId: "second-keeper", isKeeper: true as const },
+    ];
+    const { merged, accepted, skipped } = mergeKeepersNonDestructive(existing, keeperPicks);
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0].playerId).toBe("first-keeper");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].playerId).toBe("second-keeper");
+    expect(merged.find((p) => p.pickNumber === 4)?.playerId).toBe("first-keeper");
+    expect(merged).toHaveLength(1);
+  });
 });
 
 describe("BUG 8 — live poll backoff", () => {

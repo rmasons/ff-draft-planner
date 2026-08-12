@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { espnAdpKey, fetchEspnAdp, normalizeName } from "../lib/espn";
-import { fetch2025ActualStats } from "../lib/sleeper";
+import { fetch2025ActualStats, fetchPlayers } from "../lib/sleeper";
 
 // Regression tests for:
 //  - BUG 9: ESPN ADP must be joined by name + position, not name alone.
 //    Real duplicate NFL names across positions/teams (e.g. two "Josh Allen"s)
 //    must not silently steal/share one ADP; a genuine name+position collision
 //    must drop the ambiguous ADP entirely and be counted in diagnostics.
-//  - BUG 10: an optional source (ESPN ADP, 2025 actual stats) that fails
-//    should retry once, and a failure that survives the retry must not
-//    poison the rest of the payload — the caller degrades that one source
-//    instead of throwing away everything.
+//  - BUG 10: every source (ESPN ADP, 2025 actual stats, and the required
+//    Sleeper player pool) that fails should retry once. For the optional
+//    sources, a failure that survives the retry must not poison the rest of
+//    the payload — the caller degrades that one source instead of throwing
+//    away everything. For the required source, a failure that survives the
+//    retry is expected to propagate (see app/api/players/route.ts).
 
 function jsonResponse(body: unknown, ok = true, status = 200): Response {
   return {
@@ -205,5 +207,35 @@ describe("fetch2025ActualStats — optional source retry (BUG 10)", () => {
     const stats = await fetch2025ActualStats().catch(() => new Map());
 
     expect(stats.size).toBe(0);
+  });
+});
+
+describe("fetchPlayers — required source retry (BUG 10)", () => {
+  const sleeperPlayerRecord = {
+    player_id: "p1",
+    stats: { pts_ppr: 12.3 },
+    player: { first_name: "Test", last_name: "Player", position: "RB" },
+  };
+
+  it("retries once on a failed request and returns data from the successful retry", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({}, false, 503))
+      .mockResolvedValueOnce(jsonResponse([sleeperPlayerRecord]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const players = await fetchPlayers();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(players).toHaveLength(1);
+    expect(players[0].id).toBe("p1");
+  });
+
+  it("propagates the error when both the initial attempt and the retry fail", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}, false, 500));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchPlayers()).rejects.toThrow(/Sleeper request failed/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

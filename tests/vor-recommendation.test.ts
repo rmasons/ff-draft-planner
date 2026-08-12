@@ -8,6 +8,7 @@ import {
   rosterSlots,
   selectSuggestedPick,
   depthCapacityByPosition,
+  SLEEPER_SLOT_ELIGIBLE,
 } from "../lib/draft";
 import { rankPlayers } from "../lib/vbd";
 import { adpKeyFor } from "../lib/presets";
@@ -271,6 +272,13 @@ describe("bench depth decays linearly with saturation", () => {
     expect(depthValueFactor(0, 0)).toBe(0);
   });
 
+  it("holds the first unheld player at full value even through a shared flex", () => {
+    // A TE reachable only via a 3-way FLEX has startable = 1/3. Before the
+    // fix, held+1 (1) already exceeded that fractional startable, so the
+    // very first TE was discounted to 0.5 — this asserts it now reads 1.
+    expect(depthValueFactor(0, 1 / 3)).toBe(1);
+  });
+
   it("discounts a backup without excluding it", () => {
     // The QB scores higher league-wide (30 vs 20), but as a second QB in a
     // 1-QB lineup he is worth half — 15, behind the receiver who is still
@@ -375,6 +383,32 @@ describe("fillLineupSlots / leagueOpenSlots", () => {
 
   it("ignores slots the app does not draft", () => {
     expect(leagueOpenSlots([], () => undefined, ["QB", "IDP_FLEX", "IR"], 1)).toEqual(["QB"]);
+  });
+
+  it("fills both WRRB_FLEX and REC_FLEX even though their eligibility overlaps without nesting", () => {
+    // Greedy assigns the WR to WRRB_FLEX first (it comes first in priority),
+    // leaving REC_FLEX (WR/TE only) unable to take the remaining RB — reported
+    // OPEN even though both slots are fillable via WRRB_FLEX<-RB, REC_FLEX<-WR.
+    // Matching finds that assignment instead.
+    const assigned = fillLineupSlots(["WRRB_FLEX", "REC_FLEX"], ["WR", "RB"]);
+    expect(assigned.every((x) => x !== null)).toBe(true);
+    assigned.forEach((playerIndex, slotIndex) => {
+      if (playerIndex === null) return;
+      const slotType = ["WRRB_FLEX", "REC_FLEX"][slotIndex];
+      const position = ["WR", "RB"][playerIndex];
+      expect(SLEEPER_SLOT_ELIGIBLE[slotType]).toContain(position);
+    });
+  });
+
+  it("still fills a nesting case (RB slot + FLEX)", () => {
+    const assigned = fillLineupSlots(["RB", "FLEX"], ["RB", "WR"]);
+    expect(assigned.every((x) => x !== null)).toBe(true);
+  });
+
+  it("leaves surplus players unseated when there are more players than slots", () => {
+    const assigned = fillLineupSlots(["RB"], ["RB", "RB"]);
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0]).not.toBeNull();
   });
 });
 

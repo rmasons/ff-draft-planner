@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchLeagueKeepers, inferKeeperRoundConvention } from "../lib/sleeper-league";
+import { fetchLeagueKeepers, fetchUserLeagues, inferKeeperRoundConvention } from "../lib/sleeper-league";
 import {
   assignKeeperRounds,
   keeperConflict,
   mergeImportedKeepers,
+  pickNumberForSlot,
   type ImportedKeeper,
   type KeeperCandidate,
 } from "../lib/draft";
@@ -270,6 +271,36 @@ describe("mergeImportedKeepers", () => {
     expect(keepers).toEqual([]);
   });
 
+  it("refuses an upgrade whose newly-confirmed pick number collides with another confirmed pending keeper", () => {
+    // B is already pending with a confirmed round/slot. A is pending but
+    // still a placeholder. The incoming board row for A supplies a real
+    // round/slot that happens to land on the exact same pickNumber as B —
+    // the upgrade must run through keeperConflict just like a fresh add,
+    // not overwrite A's placeholder unchecked.
+    const bRound = 3;
+    const bSlot = 5;
+    const bPickNumber = pickNumberForSlot(bRound, bSlot, numTeams);
+    // Any round/slot pair that computes to the same pickNumber works; reuse
+    // B's own round/slot so the collision is obvious by construction.
+    const aIncomingRound = bRound;
+    const aIncomingSlot = bSlot;
+    expect(pickNumberForSlot(aIncomingRound, aIncomingSlot, numTeams)).toBe(bPickNumber);
+
+    const pending: KeeperCandidate[] = [
+      { playerId: "a", teamSlot: 1, round: 1, roundConfirmed: false },
+      { playerId: "b", teamSlot: bSlot, round: bRound, roundConfirmed: true },
+    ];
+    const { keepers, added, upgraded, skipped } = mergeImportedKeepers(
+      pending,
+      [{ playerId: "a", teamSlot: aIncomingSlot, round: aIncomingRound }],
+      [],
+      numTeams
+    );
+    expect({ added, upgraded, skipped }).toEqual({ added: 0, upgraded: 0, skipped: 1 });
+    const a = keepers.find((k) => k.playerId === "a");
+    expect(a).toEqual({ playerId: "a", teamSlot: 1, round: 1, roundConfirmed: false });
+  });
+
   it("skips a confirmed row colliding on pick number with an earlier row in the same batch", () => {
     const incoming = [
       { playerId: "a", teamSlot: 3, round: 2 },
@@ -497,5 +528,34 @@ describe("inferKeeperRoundConvention", () => {
     });
 
     expect(await inferKeeperRoundConvention("cur7")).toBeNull();
+  });
+});
+
+describe("parseLeague (via fetchUserLeagues) — total_rosters guard", () => {
+  it("falls back to 12 teams when Sleeper returns a literal 0, not just null/undefined", async () => {
+    // An unprovisioned league can come back with total_rosters: 0. That's
+    // falsy but not nullish, so a bare `??` fallback lets it through and
+    // collapses RosterConfig.teams to 0 -- same failure mode already fixed in
+    // fetchLeagueKeepers.
+    stubFetch({
+      "/user/u1/leagues/nfl/2025": [
+        { league_id: "Lzero", name: "Unprovisioned", total_rosters: 0, status: "pre_draft", season: "2025" },
+      ],
+    });
+
+    const leagues = await fetchUserLeagues("u1", "2025");
+    expect(leagues).toHaveLength(1);
+    expect(leagues[0].total_rosters).toBe(12);
+  });
+
+  it("keeps a real total_rosters value untouched", async () => {
+    stubFetch({
+      "/user/u2/leagues/nfl/2025": [
+        { league_id: "Lten", name: "Ten Teams", total_rosters: 10, status: "in_season", season: "2025" },
+      ],
+    });
+
+    const leagues = await fetchUserLeagues("u2", "2025");
+    expect(leagues[0].total_rosters).toBe(10);
   });
 });
