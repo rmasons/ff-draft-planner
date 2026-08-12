@@ -240,7 +240,10 @@ export async function fetchLeagueKeepers(draftId: string): Promise<LeagueKeeperR
   });
   if (!draftRes.ok) throw new Error(`Draft not found (${draftRes.status})`);
   const draft: RawDraftForKeepers = await draftRes.json();
-  const teams = draft.settings?.teams ?? 12;
+  // Guard a literal 0 (or any non-positive value), not just null/undefined: a
+  // team count of 0 would divide into Infinity round numbers downstream.
+  const rawTeams = draft.settings?.teams;
+  const teams = rawTeams && rawTeams > 0 ? rawTeams : 12;
 
   // Board first: is_keeper picks carry a real round, so when any exist the
   // rosters endpoint is never even consulted (see doc comment above).
