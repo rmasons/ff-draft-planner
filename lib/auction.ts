@@ -134,6 +134,19 @@ export function isValidWonPlayers(value: unknown): value is WonPlayer[] {
   return Array.isArray(value) && value.every(isValidWonPlayer);
 }
 
+/** Drops persisted won-player entries whose teamIndex falls outside the live
+ * team count. isValidWonPlayer only bounds teamIndex against the hardcoded
+ * MAX_TEAMS (32), not setup.numTeams — so a persisted entry with teamIndex in
+ * [numTeams, 32) passes validation but would be excluded from every
+ * per-team budget/roster derivation (which all guard teamIndex <
+ * setup.numTeams) while still being marked taken, orphaning it (unavailable
+ * to nominate, owned by no visible team). Consumers must route wonSet AND
+ * every per-team derivation through this so an out-of-range entry is
+ * dropped consistently everywhere, not half-counted. */
+export function wonPlayersWithinTeams(wonPlayers: WonPlayer[], numTeams: number): WonPlayer[] {
+  return wonPlayers.filter((w) => w.teamIndex >= 0 && w.teamIndex < numTeams);
+}
+
 export interface AuctionSetup { numTeams: number; budgetPerTeam: number; started: boolean }
 
 /** Validator for the persisted auction setup (team count / budget / started

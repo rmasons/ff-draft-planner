@@ -239,7 +239,17 @@ export interface LeagueKeeperResult {
  * `slot_to_roster_id` map.
  */
 export async function fetchLeagueKeepers(draftId: string): Promise<LeagueKeeperResult> {
-  const draftRes = await fetch(`${BASE_URL}/draft/${draftId}`, {
+  // draftId is user-typed and may be pasted as a full Sleeper URL rather
+  // than a bare id. Sleeper draft ids are plain digit strings, so only when
+  // the input contains a "/" (and therefore can't be a single path
+  // segment/bare id) do we pull the last run of digits out of it; a bare id
+  // passes through untouched. This avoids a malformed request (a stray `/`
+  // corrupting the fetch URL) turning into a confusing generic error.
+  const trimmed = String(draftId).trim();
+  const id = trimmed.includes("/")
+    ? (trimmed.match(/\d+/g)?.pop() ?? "")
+    : encodeURIComponent(trimmed);
+  const draftRes = await fetch(`${BASE_URL}/draft/${id}`, {
     headers: { accept: "application/json" },
   });
   if (!draftRes.ok) throw new Error(`Draft not found (${draftRes.status})`);
@@ -253,7 +263,7 @@ export async function fetchLeagueKeepers(draftId: string): Promise<LeagueKeeperR
   // rosters endpoint is never even consulted (see doc comment above).
   let picks: RawDraftPick[] = [];
   try {
-    const picksRes = await fetch(`${BASE_URL}/draft/${draftId}/picks`, {
+    const picksRes = await fetch(`${BASE_URL}/draft/${id}/picks`, {
       headers: { accept: "application/json" },
     });
     if (picksRes.ok) {

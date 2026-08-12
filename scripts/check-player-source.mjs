@@ -22,7 +22,19 @@ try {
   }
   if (!response?.ok) throw lastError ?? new Error("Player API did not become ready");
   const payload = await response.json();
-  if (payload.season !== "2026") throw new Error(`Unexpected season ${payload.season}`);
+  // Expected season, derived the same way lib/sleeper.ts derives its SEASON
+  // export (a plain literal here would silently start failing every year
+  // once the season rolls over). This is a small, deliberate duplication —
+  // this .mjs script can't import a .ts module without a build step — so if
+  // the cutoff rule in lib/sleeper.ts's SEASON derivation ever changes, mirror
+  // the change here too.
+  const today = new Date();
+  const expectedSeason = String(
+    today.getMonth() >= 2 ? today.getFullYear() : today.getFullYear() - 1
+  );
+  if (payload.season !== expectedSeason) {
+    throw new Error(`Unexpected season ${payload.season} (expected ${expectedSeason})`);
+  }
   if (!payload.sources?.sleeper) throw new Error("Required Sleeper source is unhealthy");
   if (!Array.isArray(payload.players) || payload.players.length < 100) throw new Error("Player pool is unexpectedly small");
   const ids = new Set(payload.players.map((player) => player.id));

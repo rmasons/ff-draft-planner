@@ -10,7 +10,7 @@ import { useLocalStorage } from "./useLocalStorage";
 import {
   auctionBudget, auctionPriceFromPool, auctionValuePool, averageAuctionBudget, clampAuctionSetupInput,
   isValidAuctionSetup, isValidWonPlayers, legalAuctionPurchase, legalPositionsForTeam, teamAuctionValue,
-  unionLegalPositions, type AuctionSetup, type WonPlayer,
+  unionLegalPositions, wonPlayersWithinTeams, type AuctionSetup, type WonPlayer,
 } from "@/lib/auction";
 import { rosterSlots } from "@/lib/draft";
 import { validRoster, validScoring } from "@/lib/validation";
@@ -74,6 +74,10 @@ export default function AuctionDraft() {
   const [nomineeWinner, setNomineeWinner] = useState(0);
   const [nomineeBid, setNomineeBid] = useState("");
   const [bidError, setBidError] = useState<string | null>(null);
+  // Tracks whether the user has hand-edited the bid for the current
+  // nomination. Once true, changing the winning-team dropdown must not
+  // overwrite a price the user already typed.
+  const [bidTouched, setBidTouched] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,9 +99,18 @@ export default function AuctionDraft() {
     return rankPlayers(players, scoring, rosterCfg, method).players;
   }, [players, scoring, rosterCfg, method]);
 
+  // See wonPlayersWithinTeams in lib/auction.ts: drops any persisted
+  // wonPlayers entry whose teamIndex falls outside the live team count, so
+  // it can't stay marked "taken" via wonSet while being invisible to every
+  // team's budget/roster derivation below.
+  const validWonPlayers = useMemo(
+    () => wonPlayersWithinTeams(wonPlayers, setup.numTeams),
+    [wonPlayers, setup.numTeams]
+  );
+
   const wonSet = useMemo(
-    () => new Set(wonPlayers.map((w) => w.playerId)),
-    [wonPlayers]
+    () => new Set(validWonPlayers.map((w) => w.playerId)),
+    [validWonPlayers]
   );
 
   // Available = ranked players not yet won
@@ -112,21 +125,21 @@ export default function AuctionDraft() {
       { length: setup.numTeams },
       () => setup.budgetPerTeam
     );
-    for (const w of wonPlayers) {
+    for (const w of validWonPlayers) {
       if (w.teamIndex >= 0 && w.teamIndex < arr.length) {
         arr[w.teamIndex] -= w.price;
       }
     }
     return arr;
-  }, [wonPlayers, setup.numTeams, setup.budgetPerTeam]);
+  }, [validWonPlayers, setup.numTeams, setup.budgetPerTeam]);
 
   const slots = useMemo(() => rosterSlots(rosterCfg), [rosterCfg]);
-  const teamPlayers = useMemo(() => Array.from({ length: setup.numTeams }, (_, teamIndex) => wonPlayers
+  const teamPlayers = useMemo(() => Array.from({ length: setup.numTeams }, (_, teamIndex) => validWonPlayers
     .filter((win) => win.teamIndex === teamIndex)
     .flatMap((win) => {
       const player = ranked.find((item) => item.id === win.playerId);
       return player ? [{ id: player.id, position: player.position }] : [];
-    })), [setup.numTeams, wonPlayers, ranked]);
+    })), [setup.numTeams, validWonPlayers, ranked]);
   const budgetGuidance = useMemo(() => budgets.map((remaining, teamIndex) => auctionBudget(
     setup.budgetPerTeam,
     setup.budgetPerTeam - remaining,
@@ -203,6 +216,7 @@ export default function AuctionDraft() {
     setNomineeWinner(0);
     setNomineeBid("");
     setBidError(null);
+    setBidTouched(false);
   }
 
   function handleNominate(p: RankedPlayer) {
@@ -210,6 +224,8 @@ export default function AuctionDraft() {
     setNomineeWinner(0);
     setNomineeBid(String(suggestedBid(p, 0)));
     setBidError(null);
+    // Fresh nomination: auto-suggest again until the user edits the bid.
+    setBidTouched(false);
   }
 
   function handleConfirmWin() {
@@ -232,6 +248,7 @@ export default function AuctionDraft() {
     setNomineeBid("");
     setNomineeWinner(0);
     setBidError(null);
+    setBidTouched(false);
   }
 
   function handleReset() {
@@ -245,19 +262,20 @@ export default function AuctionDraft() {
     setNomineeWinner(0);
     setNomineeBid("");
     setBidError(null);
+    setBidTouched(false);
   }
 
   // Rosters for the right panel
   const teamRosters = useMemo(() => {
     return Array.from({ length: setup.numTeams }, (_, i) =>
-      wonPlayers
+      validWonPlayers
         .filter((w) => w.teamIndex === i)
         .map((w) => ({
           ...w,
           player: ranked.find((r) => r.id === w.playerId),
         }))
     );
-  }, [wonPlayers, ranked, setup.numTeams]);
+  }, [validWonPlayers, ranked, setup.numTeams]);
 
   function teamLabel(i: number) {
     return i === 0 ? "You" : `Team ${i + 1}`;
@@ -468,7 +486,11 @@ export default function AuctionDraft() {
                                 onChange={(e) => {
                                   const winner = parseInt(e.target.value, 10);
                                   setNomineeWinner(winner);
-                                  setNomineeBid(String(suggestedBid(p, winner)));
+                                  // Only auto-fill the suggested bid while the
+                                  // user hasn't hand-edited it — otherwise
+                                  // switching the winning team clobbers a
+                                  // price they already typed.
+                                  if (!bidTouched) setNomineeBid(String(suggestedBid(p, winner)));
                                   setBidError(null);
                                 }}
                                 className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
@@ -494,7 +516,7 @@ export default function AuctionDraft() {
                                   max={budgetGuidance[nomineeWinner]?.maxBid}
                                   value={nomineeBid}
                                   onChange={(e) =>
-                                    { setNomineeBid(e.target.value); setBidError(null); }
+                                    { setNomineeBid(e.target.value); setBidError(null); setBidTouched(true); }
                                   }
                                   className="w-20 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none"
                                 />
@@ -538,7 +560,7 @@ export default function AuctionDraft() {
 
         {players && (
           <p className="mt-3 text-xs text-zinc-600">
-            {available.length} players available · {wonPlayers.length} won ·
+            {available.length} players available · {validWonPlayers.length} won ·
             ${remainingTotalBudget} remaining across all teams
           </p>
         )}

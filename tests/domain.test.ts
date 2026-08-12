@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, legalAuctionPurchase, teamAuctionValue } from "../lib/auction";
+import { auctionBudget, clampAuctionSetupInput, isValidAuctionSetup, legalAuctionPurchase, teamAuctionValue, wonPlayersWithinTeams } from "../lib/auction";
 import {
   assignRoster, chooseCpuPick, gradeLetter, gradePick, keeperAdjustedAdp, keeperValue, ownerForPick,
   pickNumberForSlot, positionalRun, rosterSlots, seededRandom, survivalEstimate,
@@ -133,6 +133,24 @@ describe("auction legality and inflation", () => {
     const result = clampAuctionSetupInput(12, NaN, 250);
     expect(result.budgetPerTeam).toBeGreaterThanOrEqual(250);
     expect(result.budgetPerTeam).toBeLessThanOrEqual(10000);
+  });
+
+  it("drops won-player entries whose teamIndex falls outside the live team count", () => {
+    // isValidWonPlayer only bounds teamIndex against a hardcoded MAX_TEAMS
+    // (32), so a persisted entry from a larger past auction (teamIndex 10)
+    // can outlive a restart with fewer teams (numTeams 8) and must be
+    // dropped here rather than orphaned (taken but owned by no team).
+    const wonPlayers = [
+      { playerId: "in-range-low", teamIndex: 0, price: 5 },
+      { playerId: "in-range-high", teamIndex: 7, price: 5 },
+      { playerId: "out-of-range", teamIndex: 10, price: 5 },
+    ];
+    expect(wonPlayersWithinTeams(wonPlayers, 8)).toEqual([
+      { playerId: "in-range-low", teamIndex: 0, price: 5 },
+      { playerId: "in-range-high", teamIndex: 7, price: 5 },
+    ]);
+    expect(wonPlayersWithinTeams(wonPlayers, 12)).toEqual(wonPlayers);
+    expect(wonPlayersWithinTeams([], 8)).toEqual([]);
   });
 });
 

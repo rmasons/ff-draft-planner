@@ -658,7 +658,12 @@ export default function MockDraft({ onActiveChange }: { onActiveChange?: (active
   // is scored rather than taking the first eligible one.
   const bestPickSuggestion = useMemo(() => {
     if (!isUserTurn || draftMode !== "cpu" || !myRosterSlots) return null;
-    const available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
+    let available = ranked.filter((p) => !draftedIds.has(p.id) && !annotations[annotationKey(SEASON, p.id)]?.avoid);
+    // Mirror the CPU auto-pick fallback: if the user's avoid list filters out
+    // every remaining player, ignore it rather than hiding the recommendation.
+    if (available.length === 0) {
+      available = ranked.filter((p) => !draftedIds.has(p.id));
+    }
     return selectSuggestedPick(
       available,
       {
