@@ -196,6 +196,13 @@ export default function AuctionDraft() {
     setSetupMessage(null);
     setSetup({ numTeams: clamped.numTeams, budgetPerTeam: clamped.budgetPerTeam, started: true });
     setWonPlayers([]);
+    // Clear any open nomination so a re-start with a different team count
+    // can't leave a stale nomineeWinner index pointing past a shorter
+    // budgetGuidance array.
+    setNomineeId(null);
+    setNomineeWinner(0);
+    setNomineeBid("");
+    setBidError(null);
   }
 
   function handleNominate(p: RankedPlayer) {
@@ -210,7 +217,12 @@ export default function AuctionDraft() {
     const price = parseInt(nomineeBid, 10);
     const nominee = ranked.find((player) => player.id === nomineeId);
     if (!nominee) return;
-    const validation = legalAuctionPurchase(price, budgetGuidance[nomineeWinner], teamPlayers[nomineeWinner] ?? [], nominee, slots);
+    // Guard against a stale nomineeWinner index (e.g. left over from a
+    // reset while a nomination panel was open, then a restart with fewer
+    // teams) indexing past the current budgetGuidance array.
+    const budget = budgetGuidance[nomineeWinner];
+    if (!budget) { setBidError("That team is no longer part of the auction — re-nominate the player."); return; }
+    const validation = legalAuctionPurchase(price, budget, teamPlayers[nomineeWinner] ?? [], nominee, slots);
     if (!validation.legal) { setBidError(validation.reason); return; }
     setWonPlayers((prev) => [
       ...prev,
@@ -226,6 +238,13 @@ export default function AuctionDraft() {
     if (!window.confirm("Reset the auction? All bids will be cleared.")) return;
     setWonPlayers([]);
     setSetup({ ...setup, started: false });
+    // Clear any open nomination so a restart can't inherit a stale
+    // nomineeWinner index that later falls out of bounds if the auction
+    // restarts with fewer teams.
+    setNomineeId(null);
+    setNomineeWinner(0);
+    setNomineeBid("");
+    setBidError(null);
   }
 
   // Rosters for the right panel
