@@ -2,6 +2,15 @@ import type { RosterConfig, ScoringConfig } from "./types";
 
 const BASE_URL = "https://api.sleeper.app/v1";
 
+/** Normalize a user-typed Sleeper draft id: a pasted full URL is reduced to
+ *  its trailing run of digits; a bare id passes through (URL-encoded).
+ *  Shared by fetchLeagueKeepers and inferKeeperRoundConvention so a pasted
+ *  URL behaves identically in both. */
+function normalizeDraftId(draftId: string): string {
+  const trimmed = String(draftId).trim();
+  return trimmed.includes("/") ? (trimmed.match(/\d+/g)?.pop() ?? "") : encodeURIComponent(trimmed);
+}
+
 export type LeagueType = "redraft" | "keeper" | "dynasty";
 
 export interface SleeperUser {
@@ -240,15 +249,10 @@ export interface LeagueKeeperResult {
  */
 export async function fetchLeagueKeepers(draftId: string): Promise<LeagueKeeperResult> {
   // draftId is user-typed and may be pasted as a full Sleeper URL rather
-  // than a bare id. Sleeper draft ids are plain digit strings, so only when
-  // the input contains a "/" (and therefore can't be a single path
-  // segment/bare id) do we pull the last run of digits out of it; a bare id
-  // passes through untouched. This avoids a malformed request (a stray `/`
-  // corrupting the fetch URL) turning into a confusing generic error.
-  const trimmed = String(draftId).trim();
-  const id = trimmed.includes("/")
-    ? (trimmed.match(/\d+/g)?.pop() ?? "")
-    : encodeURIComponent(trimmed);
+  // than a bare id. See normalizeDraftId for the extraction rule; this
+  // avoids a malformed request (a stray `/` corrupting the fetch URL)
+  // turning into a confusing generic error.
+  const id = normalizeDraftId(draftId);
   const draftRes = await fetch(`${BASE_URL}/draft/${id}`, {
     headers: { accept: "application/json" },
   });
@@ -431,8 +435,9 @@ export async function inferKeeperRoundConvention(
 ): Promise<KeeperRoundConvention | null> {
   let currentRounds: number;
   let leagueId: string;
+  const id = normalizeDraftId(draftId);
   try {
-    const draft: RawDraftForConvention = await sleepFetch(`${BASE_URL}/draft/${draftId}`);
+    const draft: RawDraftForConvention = await sleepFetch(`${BASE_URL}/draft/${id}`);
     if (!draft.league_id || !draft.settings?.rounds) return null;
     leagueId = draft.league_id;
     currentRounds = draft.settings.rounds;

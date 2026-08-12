@@ -536,7 +536,6 @@ export default function AuctionDraft() {
                             <p className="mt-2 text-xs text-zinc-500">
                               {teamLabel(nomineeWinner)}: ${budgetGuidance[nomineeWinner]?.remaining} left · ${budgetGuidance[nomineeWinner]?.reservedMinimum} reserved · ${budgetGuidance[nomineeWinner]?.maxBid} max
                             </p>
-                            {bidError && <p role="alert" className="mt-1 text-xs text-rose-400">{bidError}</p>}
                           </td>
                         </tr>
                       )}
